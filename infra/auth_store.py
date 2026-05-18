@@ -1,0 +1,410 @@
+"""
+ArQuant v1.0 — Auth & Credential Store (사장 피드백 2026-05-16)
+
+Cloudflare Access 제거 → 앱 자체 로그인. 인증/세션 로직은 HYFE_IQC 의 월드퀀트
+계정 로그인 방식을 참조한다:
+  - SQLite + cryptography.Fernet 대칭 암호화 (비밀번호 해시 X — 복호 후 평문 비교)
+  - 불투명 세션 토큰 secrets.token_urlsafe(32), 7일 TTL, 만료 시 자동 삭제
+
+사장 피드백 2026-05-16 (2차): 로그인 정체성을 **사용자가 정한 아이디/비밀번호**로 변경.
+  - 등록: 아이디(중복 불가) + 비밀번호(10자 이상·특수문자 1개 이상) + API 키들
+  - 로그인: 아이디 + 비밀번호만
+  - KIS App Key/Secret·OpenRouter·DART·계좌번호/Base URL 은 '저장되는 자격증명'
+    (정체성이 아님 — 시스템 구동에 사용)
+
+여러 계정 등록 가능(멀티). 스왐은 단일 프로세스라 로그인한 계정이 봇을 장악.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import secrets
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from cryptography.fernet import Fernet, InvalidToken
+
+logger = logging.getLogger("AUTH")
+
+_DATA_DIR = Path(__file__).parent.parent / "data"
+_DATA_DIR.mkdir(exist_ok=True)
+_DB_PATH = _DATA_DIR / "arquant_auth.db"
+_FERNET_KEY_PATH = _DATA_DIR / ".fernet.key"
+
+SESSION_COOKIE = "arquant_session"
+SESSION_TTL_SEC = 7 * 24 * 60 * 60  # 7일
+
+_DB_LOCK = threading.RLock()
+_FERNET: Optional[Fernet] = None
+
+# 비밀번호 정책 (사장 피드백 2026-05-16 2차)
+PW_MIN_LEN = 10
+
+# 사장 피드백 2026-05-18: 멀티테넌트 안전 — '코드 변경'은 전체 유저 공유 소스에
+# 영향을 주므로 ADMIN 계정만 실제 소스 수정+재시작(전체 반영) 권한을 가진다.
+# 비관리자 계정은 ops_support_worker가 샌드박스 모드로 동작(프로필 한정 오버라이드).
+# .env 시드 계정도 부팅 시 자동으로 ADMIN 으로 표시된다(bootstrap_from_env).
+ADMIN_USERNAMES = frozenset({"hh09080"})
+
+
+def password_policy_error(pw: str) -> Optional[str]:
+    """정책 위반 시 사람이 읽을 메시지, 통과면 None.
+    규칙: 10자 이상 + 특수문자(영숫자 아닌 문자) 1개 이상."""
+    pw = pw or ""
+    if len(pw) < PW_MIN_LEN:
+        return f"비밀번호는 최소 {PW_MIN_LEN}자 이상이어야 합니다."
+    if not any((not c.isalnum()) and (not c.isspace()) for c in pw):
+        return "비밀번호에 특수문자를 1개 이상 포함해야 합니다."
+    return None
+
+
+class FernetKeyLost(RuntimeError):
+    """data/.fernet.key 가 사라졌는데 이미 등록 계정이 있는 위험 상태.
+    새 키를 만들면 **모든 유저**의 암호화 자격증명이 영구 복호 불능이 되므로
+    절대 자동 재생성하지 않고 운영자에게 키 복구를 요구한다 (멀티유저 계정 보호)."""
+
+
+def _existing_user_count() -> int:
+    """Fernet 없이도 안전하게 호출 가능한 가벼운 카운트 (encrypt/decrypt 미사용)."""
+    if not _DB_PATH.exists():
+        return 0
+    try:
+        c = sqlite3.connect(_DB_PATH, timeout=5)
+        try:
+            row = c.execute("SELECT COUNT(*) FROM users").fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return 0  # users 테이블 자체가 없으면 신규 상태로 간주
+
+
+# ─── Fernet ───────────────────────────────────────────────────────────────────
+def _ensure_fernet() -> None:
+    global _FERNET
+    if _FERNET is not None:
+        return
+    key = (os.environ.get("ARQUANT_FERNET_KEY", "").strip() or "").encode("utf-8") or None
+    if not key:
+        if _FERNET_KEY_PATH.exists():
+            key = _FERNET_KEY_PATH.read_bytes().strip()
+        else:
+            # 사장 피드백 2026-05-16 (3차): 멀티유저 계정 내구성 — 키가 사라졌는데
+            # 이미 계정이 있으면 재생성 금지 (재생성 시 전 유저 자격증명 복호 불능).
+            n = _existing_user_count()
+            if n > 0:
+                logger.critical(
+                    "FERNET 키 분실: %s 없음 + 등록 계정 %d개 존재 → 자동 재생성 거부. "
+                    "백업된 data/.fernet.key 를 복구하거나 ARQUANT_FERNET_KEY 로 주입하십시오. "
+                    "(새 키 생성 시 모든 유저 계정이 영구 복호 불능)",
+                    _FERNET_KEY_PATH, n)
+                raise FernetKeyLost(
+                    f"암호화 키(data/.fernet.key) 분실 — 등록 계정 {n}개 보호를 위해 "
+                    f"자동 재생성을 거부했습니다. 키 백업을 복구한 뒤 재시작하세요.")
+            key = Fernet.generate_key()
+            _FERNET_KEY_PATH.write_bytes(key)
+            os.chmod(_FERNET_KEY_PATH, 0o600)
+            logger.info("Fernet 키 신규 생성(신규 환경): %s (0600)", _FERNET_KEY_PATH)
+    _FERNET = Fernet(key)
+
+
+def encrypt(text: str) -> str:
+    _ensure_fernet()
+    return _FERNET.encrypt((text or "").encode("utf-8")).decode("ascii")
+
+
+def decrypt(token: str) -> str:
+    _ensure_fernet()
+    if not token:
+        return ""
+    try:
+        return _FERNET.decrypt(token.encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError) as e:
+        logger.warning("Fernet 복호 실패(%s) — 빈 문자열 반환", type(e).__name__)
+        return ""
+
+
+# ─── DB ───────────────────────────────────────────────────────────────────────
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+_INITED = False
+
+
+def init() -> None:
+    global _INITED
+    if _INITED:
+        return
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_enc TEXT NOT NULL,
+                kis_app_key_enc TEXT NOT NULL,
+                kis_app_secret_enc TEXT NOT NULL,
+                openrouter_key_enc TEXT NOT NULL,
+                kis_account_no_enc TEXT NOT NULL,
+                kis_base_url TEXT NOT NULL,
+                dart_key_enc TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                last_login_at REAL NOT NULL,
+                last_validated_at REAL NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )"""
+        )
+        # ── 마이그레이션: is_admin 컬럼 (사장 피드백 2026-05-18) ──
+        # CREATE TABLE IF NOT EXISTS 는 기존 DB에 컬럼을 추가하지 못하므로 ALTER 로 보강.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "is_admin" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+            logger.info("auth_store 마이그레이션: users.is_admin 컬럼 추가")
+        if ADMIN_USERNAMES:
+            qs = ",".join("?" * len(ADMIN_USERNAMES))
+            conn.execute(f"UPDATE users SET is_admin=1 WHERE username IN ({qs})",
+                         tuple(ADMIN_USERNAMES))
+    _INITED = True
+
+
+# ─── User CRUD ────────────────────────────────────────────────────────────────
+def username_exists(username: str) -> bool:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute("SELECT 1 FROM users WHERE username=?",
+                           ((username or "").strip(),)).fetchone()
+    return row is not None
+
+
+def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: str,
+                openrouter_key: str, kis_account_no: str, kis_base_url: str,
+                dart_key: str = "", label: str = "", is_admin: bool = False) -> int:
+    """username 기준 upsert. 신규면 생성, 기존이면 자격증명·비밀번호 갱신. user_id 반환.
+
+    is_admin: 신규 생성 시에만 적용. 기존 계정의 ADMIN 권한은 절대 강등하지 않는다
+    (init() 마이그레이션이 ADMIN_USERNAMES 를 매번 재승격하므로 표시는 항상 일관)."""
+    init()
+    now = time.time()
+    username = (username or "").strip()
+    base_url = (kis_base_url or "https://openapi.koreainvestment.com:9443").strip()
+    label = (label or username).strip()
+    vals = dict(
+        password_enc=encrypt(password),
+        kis_app_key_enc=encrypt(kis_app_key),
+        kis_app_secret_enc=encrypt(kis_app_secret),
+        openrouter_key_enc=encrypt(openrouter_key),
+        kis_account_no_enc=encrypt(kis_account_no),
+        kis_base_url=base_url,
+        dart_key_enc=encrypt(dart_key) if (dart_key or "").strip() else "",
+        label=label,
+    )
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if row:
+            uid = int(row["id"])
+            conn.execute(
+                """UPDATE users SET password_enc=?, kis_app_key_enc=?, kis_app_secret_enc=?,
+                   openrouter_key_enc=?, kis_account_no_enc=?, kis_base_url=?, dart_key_enc=?,
+                   label=?, last_login_at=?, last_validated_at=? WHERE id=?""",
+                (vals["password_enc"], vals["kis_app_key_enc"], vals["kis_app_secret_enc"],
+                 vals["openrouter_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
+                 vals["dart_key_enc"], vals["label"], now, now, uid),
+            )
+            return uid
+        adm = 1 if (is_admin or username in ADMIN_USERNAMES) else 0
+        cur = conn.execute(
+            """INSERT INTO users (username, password_enc, kis_app_key_enc, kis_app_secret_enc,
+               openrouter_key_enc, kis_account_no_enc, kis_base_url, dart_key_enc, label,
+               is_admin, created_at, last_login_at, last_validated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (username, vals["password_enc"], vals["kis_app_key_enc"], vals["kis_app_secret_enc"],
+             vals["openrouter_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
+             vals["dart_key_enc"], vals["label"], adm, now, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def _row_to_creds(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "username": row["username"],
+        "password": decrypt(row["password_enc"]),
+        "kis_app_key": decrypt(row["kis_app_key_enc"]),
+        "kis_app_secret": decrypt(row["kis_app_secret_enc"]),
+        "openrouter_key": decrypt(row["openrouter_key_enc"]),
+        "kis_account_no": decrypt(row["kis_account_no_enc"]),
+        "kis_base_url": row["kis_base_url"],
+        "dart_key": decrypt(row["dart_key_enc"]) if row["dart_key_enc"] else "",
+        "label": row["label"],
+        "is_admin": bool(row["is_admin"]) if "is_admin" in row.keys() else False,
+    }
+
+
+def find_user_by_username(username: str) -> Optional[Dict[str, Any]]:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username=?",
+                           ((username or "").strip(),)).fetchone()
+    return _row_to_creds(row) if row else None
+
+
+def get_user_credentials(user_id: int) -> Optional[Dict[str, Any]]:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id=?", (int(user_id),)).fetchone()
+    return _row_to_creds(row) if row else None
+
+
+def is_admin(user_id: Optional[int]) -> bool:
+    """ADMIN 계정 여부. 미상/없음/오류는 모두 False (안전한 기본값 — 비관리자 취급).
+
+    이 한 줄이 멀티테넌트 안전의 핵심: 판단 불가 시 절대 전체 소스 변경 권한을
+    부여하지 않는다(default-deny)."""
+    if user_id is None:
+        return False
+    try:
+        init()
+        with _DB_LOCK, _connect() as conn:
+            row = conn.execute("SELECT is_admin FROM users WHERE id=?",
+                               (int(user_id),)).fetchone()
+        return bool(row and row["is_admin"])
+    except Exception as e:
+        logger.warning("is_admin 조회 실패(user_id=%s): %s — 비관리자로 처리", user_id, e)
+        return False
+
+
+def verify_password(username: str, password: str) -> Optional[Dict[str, Any]]:
+    """HYFE 패턴 — 복호 후 평문 비교. 일치하면 자격증명 dict, 아니면 None."""
+    u = find_user_by_username(username)
+    if not u:
+        return None
+    if u["password"] != (password or ""):
+        return None
+    return u
+
+
+def touch_login(user_id: int) -> None:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("UPDATE users SET last_login_at=? WHERE id=?", (time.time(), int(user_id)))
+
+
+def _mask(s: str, keep: int = 4) -> str:
+    s = s or ""
+    return (s[:keep] + "…" + s[-2:]) if len(s) > keep + 2 else "…"
+
+
+def list_accounts() -> List[Dict[str, Any]]:
+    """등록된 계정 목록 (민감값 마스킹) — 계정 전환 UI용. 아이디는 그대로 노출(식별용)."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, username, kis_account_no_enc, label, last_login_at, is_admin "
+            "FROM users ORDER BY last_login_at DESC"
+        ).fetchall()
+    return [{
+        "id": int(r["id"]),
+        "username": r["username"],
+        "label": r["label"],
+        "kis_account_no_masked": _mask(decrypt(r["kis_account_no_enc"]), keep=4),
+        "last_login_at": r["last_login_at"],
+        "is_admin": bool(r["is_admin"]),
+    } for r in rows]
+
+
+# ─── Sessions ─────────────────────────────────────────────────────────────────
+def create_session(user_id: int) -> str:
+    init()
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?,?,?,?)",
+            (token, int(user_id), now, now + SESSION_TTL_SEC),
+        )
+    return token
+
+
+def lookup_session(token: str) -> Optional[int]:
+    if not token:
+        return None
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute("SELECT user_id, expires_at FROM sessions WHERE token=?",
+                           (token,)).fetchone()
+        if not row:
+            return None
+        if float(row["expires_at"]) < time.time():
+            conn.execute("DELETE FROM sessions WHERE token=?", (token,))
+            return None
+    return int(row["user_id"])
+
+
+def delete_session(token: str) -> None:
+    if not token:
+        return
+    init()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE token=?", (token,))
+
+
+def purge_expired_sessions() -> int:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
+        return cur.rowcount or 0
+
+
+# ─── Bootstrap from .env (사장 피드백 2026-05-16) ───────────────────────────────
+def bootstrap_from_env() -> Optional[int]:
+    """등록 계정이 없고 .env 에 API 키 + ARQUANT_BOOTSTRAP_USER/PASS 가 있으면
+    사장님 프로필 1개를 생성. 비밀번호는 .env(=gitignore)에만 두어 소스/깃에 노출 안 함.
+    이미 계정이 있으면 None."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        n = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    if n:
+        return None
+    try:
+        from config import (KIS_APP_KEY, KIS_APP_SECRET, KIS_ACCOUNT_NO,
+                            KIS_BASE_URL, OPENROUTER_API_KEY, OPENDART_API_KEY)
+    except Exception as e:
+        logger.warning("bootstrap_from_env: config 로드 실패 %s", e)
+        return None
+    bu = os.getenv("ARQUANT_BOOTSTRAP_USER", "").strip()
+    bp = os.getenv("ARQUANT_BOOTSTRAP_PASS", "").strip()
+    if not (bu and bp):
+        logger.warning("bootstrap_from_env: ARQUANT_BOOTSTRAP_USER/PASS 미설정 — 시드 생략 "
+                       "(로그인 아이디/비밀번호는 사용자가 정해야 함)")
+        return None
+    if not (KIS_APP_KEY and KIS_APP_SECRET and OPENROUTER_API_KEY and KIS_ACCOUNT_NO):
+        logger.warning("bootstrap_from_env: .env 필수 API 키 누락 — 시드 생략")
+        return None
+    perr = password_policy_error(bp)
+    if perr:
+        logger.warning("bootstrap_from_env: ARQUANT_BOOTSTRAP_PASS 정책 위반 — %s", perr)
+        return None
+    uid = upsert_user(
+        username=bu, password=bp,
+        kis_app_key=KIS_APP_KEY, kis_app_secret=KIS_APP_SECRET,
+        openrouter_key=OPENROUTER_API_KEY, kis_account_no=KIS_ACCOUNT_NO,
+        kis_base_url=KIS_BASE_URL, dart_key=OPENDART_API_KEY or "",
+        label="사장님 (.env 시드 · ADMIN)", is_admin=True,
+    )
+    logger.info("bootstrap_from_env: .env 기준 ADMIN 프로필 생성 user_id=%s username=%s", uid, bu)
+    return uid

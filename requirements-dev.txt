@@ -1,0 +1,3 @@
+# 개발/CI 전용 — 런타임에는 불필요
+-r requirements.txt
+pytest==9.0.3
