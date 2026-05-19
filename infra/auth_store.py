@@ -17,6 +17,7 @@ Cloudflare Access 제거 → 앱 자체 로그인. 인증/세션 로직은 HYFE_
 """
 from __future__ import annotations
 
+import json as _json
 import logging
 import os
 import secrets
@@ -40,6 +41,7 @@ _DATA_DIR = Path(__file__).parent.parent / "data"
 _DATA_DIR.mkdir(exist_ok=True)
 _DB_PATH = _DATA_DIR / "arquant_auth.db"
 _FERNET_KEY_PATH = _DATA_DIR / ".fernet.key"
+_AUDIT_PATH = _DATA_DIR / "auth_audit.log"   # *.log → .gitignore 로 추적 제외
 
 SESSION_COOKIE = "arquant_session"
 SESSION_TTL_SEC = 7 * 24 * 60 * 60  # 7일
@@ -162,6 +164,18 @@ def bidx(value: str) -> str:
     """결정론적 블라인드 인덱스(HMAC-SHA256 hex) — 평문 노출 없이 동치 조회용."""
     return _hmac.new(_bidx_key(), _norm(value).encode("utf-8"),
                      hashlib.sha256).hexdigest()
+
+
+def audit(event: str, *, username: Optional[str], ip: str,
+          outcome: str, detail: str = "") -> None:
+    """인증 감사 로그(JSONL). 절대 키/자격증명 값을 detail 에 넣지 말 것."""
+    try:
+        rec = {"ts": time.time(), "event": event, "username": username or "",
+               "ip": ip or "", "outcome": outcome, "detail": detail}
+        with open(_AUDIT_PATH, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.warning("auth audit 기록 실패(event=%s)", event)
 
 
 _PH = PasswordHasher()  # argon2id, library defaults (tune later if needed)

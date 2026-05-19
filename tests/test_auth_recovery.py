@@ -1,3 +1,4 @@
+import json
 import pytest
 from infra import auth_store as A
 
@@ -27,3 +28,12 @@ def test_reset_password_by_factors(fresh_auth):
         "fred", "AK2", "AS2", "BAD", "Another1!") is False
     with pytest.raises(ValueError):
         fresh_auth.reset_password_by_factors("fred", "AK2", "AS2", "OR2", "weak")
+
+def test_audit_appends_jsonl_and_never_logs_secrets(fresh_auth):
+    fresh_auth.audit("recover_id", username="erin", ip="1.2.3.4",
+                     outcome="fail", detail="no-match")
+    lines = (fresh_auth._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()
+    rec = json.loads(lines[-1])
+    assert rec["event"] == "recover_id" and rec["outcome"] == "fail"
+    assert rec["username"] == "erin" and rec["ip"] == "1.2.3.4"
+    assert "detail" in rec and "ts" in rec
