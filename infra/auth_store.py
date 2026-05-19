@@ -587,6 +587,7 @@ def delete_user(user_id: int) -> bool:
 
 
 def _is_mock_url(url: str) -> bool:
+    # NOTE: 모의/실전 판별 규칙은 infra/kis_broker.py 의 is_mock 과 동일 — 한쪽 변경 시 양쪽 동기화 필요
     u = url or ""
     return ("openapivts" in u) or (":29443" in u)
 
