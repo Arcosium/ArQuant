@@ -37,3 +37,24 @@ def test_audit_appends_jsonl_and_never_logs_secrets(fresh_auth):
     assert rec["event"] == "recover_id" and rec["outcome"] == "fail"
     assert rec["username"] == "erin" and rec["ip"] == "1.2.3.4"
     assert "detail" in rec and "ts" in rec
+
+def test_audit_is_best_effort_never_raises(fresh_auth, monkeypatch):
+    # make the underlying write fail; audit() must swallow it (auth path must not break)
+    import builtins
+    real_open = builtins.open
+    def boom(*a, **k):
+        if str(a[0]).endswith("auth_audit.log"):
+            raise OSError("disk full")
+        return real_open(*a, **k)
+    monkeypatch.setattr(builtins, "open", boom)
+    fresh_auth.audit("login", username="x", ip="1.1.1.1", outcome="ok")  # must NOT raise
+
+def test_audit_ts_is_iso8601_utc(fresh_auth):
+    fresh_auth.audit("login", username="x", ip=None, outcome="ok")
+    import json as _j
+    rec = _j.loads((fresh_auth._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()[-1])
+    # ISO-8601 UTC, parseable, ends with +00:00
+    from datetime import datetime
+    parsed = datetime.fromisoformat(rec["ts"])
+    assert parsed.tzinfo is not None
+    assert rec["ip"] == ""   # None ip normalized to ""

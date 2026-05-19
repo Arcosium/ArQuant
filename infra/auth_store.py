@@ -26,6 +26,7 @@ import hashlib
 import hmac as _hmac
 import threading
 import time
+from datetime import datetime as _dt, timezone as _tz
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -166,12 +167,13 @@ def bidx(value: str) -> str:
                      hashlib.sha256).hexdigest()
 
 
-def audit(event: str, *, username: Optional[str], ip: str,
+def audit(event: str, *, username: Optional[str], ip: Optional[str],
           outcome: str, detail: str = "") -> None:
     """인증 감사 로그(JSONL). 절대 키/자격증명 값을 detail 에 넣지 말 것."""
     try:
-        rec = {"ts": time.time(), "event": event, "username": username or "",
-               "ip": ip or "", "outcome": outcome, "detail": detail}
+        rec = {"ts": _dt.now(tz=_tz.utc).isoformat(), "event": event,
+               "username": username or "", "ip": ip or "", "outcome": outcome,
+               "detail": detail}
         with open(_AUDIT_PATH, "a", encoding="utf-8") as f:
             f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:

@@ -956,6 +956,27 @@ def test_audit_appends_jsonl_and_never_logs_secrets(fresh_auth):
     assert rec["event"] == "recover_id" and rec["outcome"] == "fail"
     assert rec["username"] == "erin" and rec["ip"] == "1.2.3.4"
     assert "detail" in rec and "ts" in rec
+
+def test_audit_is_best_effort_never_raises(fresh_auth, monkeypatch):
+    # make the underlying write fail; audit() must swallow it (auth path must not break)
+    import builtins
+    real_open = builtins.open
+    def boom(*a, **k):
+        if str(a[0]).endswith("auth_audit.log"):
+            raise OSError("disk full")
+        return real_open(*a, **k)
+    monkeypatch.setattr(builtins, "open", boom)
+    fresh_auth.audit("login", username="x", ip="1.1.1.1", outcome="ok")  # must NOT raise
+
+def test_audit_ts_is_iso8601_utc(fresh_auth):
+    fresh_auth.audit("login", username="x", ip=None, outcome="ok")
+    import json as _j
+    rec = _j.loads((fresh_auth._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()[-1])
+    # ISO-8601 UTC, parseable, ends with +00:00
+    from datetime import datetime
+    parsed = datetime.fromisoformat(rec["ts"])
+    assert parsed.tzinfo is not None
+    assert rec["ip"] == ""   # None ip normalized to ""
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -965,7 +986,7 @@ Expected: FAIL — no attribute `audit` / `_AUDIT_PATH`
 
 - [ ] **Step 3: Implement**
 
-Add `import json as _json` to the stdlib imports in `infra/auth_store.py`. Add near the other path constants (after `_FERNET_KEY_PATH`, ~line 35):
+Add `import json as _json` to the stdlib imports in `infra/auth_store.py`. Add `from datetime import datetime as _dt, timezone as _tz` next to the `import time` line. Add near the other path constants (after `_FERNET_KEY_PATH`, ~line 35):
 
 ```python
 _AUDIT_PATH = _DATA_DIR / "auth_audit.log"   # *.log → .gitignore 로 추적 제외
@@ -974,28 +995,31 @@ _AUDIT_PATH = _DATA_DIR / "auth_audit.log"   # *.log → .gitignore 로 추적 �
 Add after `bidx()` helpers:
 
 ```python
-def audit(event: str, *, username: Optional[str], ip: str,
+def audit(event: str, *, username: Optional[str], ip: Optional[str],
           outcome: str, detail: str = "") -> None:
     """인증 감사 로그(JSONL). 절대 키/자격증명 값을 detail 에 넣지 말 것."""
     try:
-        rec = {"ts": time.time(), "event": event, "username": username or "",
-               "ip": ip or "", "outcome": outcome, "detail": detail}
+        rec = {"ts": _dt.now(tz=_tz.utc).isoformat(), "event": event,
+               "username": username or "", "ip": ip or "", "outcome": outcome,
+               "detail": detail}
         with open(_AUDIT_PATH, "a", encoding="utf-8") as f:
             f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         logger.warning("auth audit 기록 실패(event=%s)", event)
 ```
 
+Notes: `ts` is ISO-8601 UTC (e.g. `2026-05-19T12:34:56.789012+00:00`) — human-readable for incident response. `ip: Optional[str]` matches the actual call sites where `ip` may be `None`; the body normalises it to `""` either way.
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3.11 -m pytest tests/test_auth_recovery.py -v`
-Expected: PASS (all)
+Expected: PASS (all, including the two new tests below)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add infra/auth_store.py tests/test_auth_recovery.py
-git commit -m "feat(auth): JSONL audit log helper"
+git commit -m "refactor(auth): ISO-8601 audit ts + Optional ip; lock best-effort contract"
 ```
 
 ---
