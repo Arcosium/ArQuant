@@ -6,6 +6,27 @@ Each agent has a carefully crafted system prompt and bound tools.
 from agents.base_agent import BaseAgent
 
 
+# ── Coresight 도구 노출 게이트 (Implementation.md §3.2) ───────────────────────
+# Coresight RAG 는 Admin(hh09080) 전용 지식원이다.
+# 비관리자 세션에서는 도구 자체를 프롬프트에서 제거해 존재를 비공개로 한다.
+# (정보 누출·열거 방지 — commit a21a06a 보안 사고방식과 일관)
+# 런타임 query_coresight() 자체도 비관리자 호출 시 빈 결과로 fail-soft 반환하므로
+# 이중 방어(defense-in-depth).
+def _coresight_tool_line(description: str) -> str:
+    """활성 계정이 admin이면 Coresight 도구 설명 줄 반환, 아니면 빈 문자열.
+    실패(계정 불명 포함) 시 deny-by-default — 빈 문자열 반환(fail-soft).
+    에이전트 생성 루프를 절대 크래시하지 않는다."""
+    try:
+        from infra import credentials as _creds
+        from infra.auth_store import is_admin
+        uid = _creds.current().get("user_id")
+        if uid is not None and is_admin(uid):
+            return f"\n- query_coresight: {description}"
+    except Exception:
+        pass  # fail-soft: deny
+    return ""
+
+
 def create_macro_analyst() -> BaseAgent:
     """전략리서치팀 (Macro Analyst)"""
     return BaseAgent(
@@ -48,8 +69,8 @@ def create_macro_analyst() -> BaseAgent:
 ## 사용 가능 도구 (모두 사이클에 자동 호출됨, 직접 호출 불필요)
 - `tools.global_search.deep_research`: 매 매크로 분석 직전 자동 종합 리서치 (위 컨텍스트 주입됨, 가격 X)
 - `tools.news_monitor`: 네이버 금융 증권 속보 (10분 주기 크롤, KR/US/BOTH 자동 분류 — alibaba)
-- `tools.dart_disclosure`: KR 공시 + 직전연도 요약재무
-- `query_coresight`: 과거 전략 기록""",
+- `tools.dart_disclosure`: KR 공시 + 직전연도 요약재무"""
+        + _coresight_tool_line("과거 전략 기록"),
     )
 
 
@@ -180,8 +201,8 @@ def create_news_analyst() -> BaseAgent:
 같은 사이클에서 반대편 시장 전용 종목을 다루면 안 됩니다. 공통 테마는 명시적으로 "(공통)"이라 표기하십시오.
 
 ## 사용 가능 도구
-- naver_realtime_search: 네이버 실시간 뉴스 스크래핑
-- query_coresight: 과거 뉴스 분석 기록 조회""",
+- naver_realtime_search: 네이버 실시간 뉴스 스크래핑"""
+        + _coresight_tool_line("과거 뉴스 분석 기록 조회"),
     )
 
 
@@ -217,7 +238,8 @@ def create_trader() -> BaseAgent:
 2. **❌ `**굵게**` 강조 금지**, ❌ ` ``` ` 코드펜스 금지 — 채팅 UI에서 깨져 보입니다.
 3. 받은 정보를 그대로 인용하되, 어색한 영어/숫자 번역은 다듬으십시오 (예: `$33.06` → "약 33달러", `005430` → "005430(한국공항)").
 4. 체결 안 된 주문이 있으면 그 사실을 분명히 짚으십시오 — "체결 확인됨"과 "접수만 완료"를 헷갈리지 마십시오.
-5. 새 주문이 한 건도 없으면 그 사유(예산 초과·잔고 부족·후보 모두 부적합 등)를 한 줄로 설명하십시오.""",
+5. 새 주문이 한 건도 없으면 그 사유(예산 초과·잔고 부족·후보 모두 부적합 등)를 한 줄로 설명하십시오.
+6. **보유·포지션 상태를 추측으로 단정하지 마십시오 (사장 지시 2026-05-19).** 보유 수량·매도 가능 여부·포지션 정리 여부는 오직 제공된 [컨텍스트]의 [국내 계좌잔고] 또는 실제 체결 결과에 근거해서만 진술합니다. 잔고/체결 데이터가 주어지지 않았으면 "현재 보유 현황을 확인할 수 없습니다"라고 답하고, 절대 "0주"·"이미 정리된 상태" 같은 단정·환각을 하지 마십시오. 컨텍스트의 잔고에 해당 종목이 있으면 그 수량을 사실대로 보고하십시오.""",
     )
 
 
@@ -260,8 +282,8 @@ def create_post_manager() -> BaseAgent:
 - 같은 시장 종목에 대해 직전 사이클이 매도였는데 신호가 그대로면 매도 유지가 자연스러우나, 신호가 약해졌으면 보유로 바꿔도 무방합니다.
 
 ## 사용 가능 도구
-- analyze_stock_technical: 보유 종목 기술적 분석
-- query_coresight: 과거 매도 판단 기록 조회""",
+- analyze_stock_technical: 보유 종목 기술적 분석"""
+        + _coresight_tool_line("과거 매도 판단 기록 조회"),
     )
 
 
@@ -274,7 +296,7 @@ def create_ops_support() -> BaseAgent:
         system_prompt="""당신은 ArQuant v1.0의 '운용지원실장(Operations Support)'입니다.
 
 ## 역할
-- 사장의 지시에 따라 ArQuant 소스코드를 안전하게 수정합니다.
+- 무엇이 문제이고 무엇이 정상 동작인지(수용 기준)를 진단·지시합니다 — *어떻게* 고칠지(코드)는 산하 팀장 워커가 직접 설계합니다.
 - 새로운 에이전트를 추가하거나 기존 에이전트를 제거합니다.
 - 모든 작업 후 서버 재시작을 수행합니다.
 

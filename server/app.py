@@ -466,6 +466,69 @@ async def ops_feedback_set(request: Request, req: dict):
         pass
     return {"enabled": bool(st.get("enabled", True)), "since": st.get("since")}
 
+
+# ── Coresight 수신함 — ADMIN(hh09080) 전용 (Implementation.md §3.3) ───────────
+# 비관리자 → 403. 이 경로는 _PUBLIC_PATHS 에 포함되지 않는다 (인증 미들웨어 통과 필요).
+# GET /api/coresight/pending   — 미처리 Coresight 제안 목록
+# POST /api/coresight/approve  — 명시 승인 → standing_directive 추가 (자동 체결 금지)
+# POST /api/coresight/reject   — 거부 → 큐 영구 제거
+
+def _uid_or_403(request: Request) -> int:
+    """request.state.user_id 반환. 인증 미들웨어가 먼저 설정한다."""
+    uid = getattr(request.state, "user_id", None)
+    if uid is None:
+        raise HTTPException(401, "로그인이 필요합니다.")
+    return uid
+
+
+def _admin_uid_or_403(request: Request) -> int:
+    """uid 를 꺼내고 ADMIN 확인. 아니면 403 raise."""
+    uid = _uid_or_403(request)
+    try:
+        _is_adm = auth_store.is_admin(uid)
+    except Exception:
+        _is_adm = False
+    if not _is_adm:
+        raise HTTPException(403, "Coresight 수신함은 ADMIN(hh09080) 전용입니다.")
+    return uid
+
+
+@app.get("/api/coresight/pending")
+async def coresight_pending(request: Request):
+    """미처리 Coresight 투자 신호 제안 목록 — ADMIN 전용."""
+    uid = _admin_uid_or_403(request)
+    from infra.coresight_inbox import list_pending
+    return {"pending": list_pending(uid)}
+
+
+class _CoresightItemReq(BaseModel):
+    item_id: str
+
+
+@app.post("/api/coresight/approve")
+async def coresight_approve(request: Request, req: _CoresightItemReq):
+    """Coresight 제안 명시 승인 → standing_directive 추가 — ADMIN 전용.
+    자동 체결 금지: standing_directive 는 LLM 프롬프트 주입 경로일 뿐이며
+    파이썬 리스크·guardrail 게이트를 우회하지 않는다."""
+    uid = _admin_uid_or_403(request)
+    from infra.coresight_inbox import approve
+    ok = approve(uid, req.item_id)
+    if not ok:
+        raise HTTPException(404, f"item_id={req.item_id} 없음 또는 이미 처리됨")
+    return {"ok": True, "item_id": req.item_id}
+
+
+@app.post("/api/coresight/reject")
+async def coresight_reject(request: Request, req: _CoresightItemReq):
+    """Coresight 제안 거부 → 큐 영구 제거 — ADMIN 전용."""
+    uid = _admin_uid_or_403(request)
+    from infra.coresight_inbox import reject
+    ok = reject(uid, req.item_id)
+    if not ok:
+        raise HTTPException(404, f"item_id={req.item_id} 없음")
+    return {"ok": True, "item_id": req.item_id}
+
+
 @app.get("/api/dart")
 async def dart_search(corp_name: str = "", days: int = 7):
     from tools.dart_disclosure import search_disclosures

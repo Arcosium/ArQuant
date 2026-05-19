@@ -77,9 +77,11 @@ def test_build_orchestrator_directive_block_present(isolated_profiles):
     uid = 10
     sd.append_directive(uid, "원화 자산 최소화")
     block = sd.build_orchestrator_directive_block(uid)
-    assert "사장님 상시 지시사항" in block
+    # TASK B: 헤더/푸터 문구가 완화된 형태로 업데이트됨
+    assert "사장님 상시 지침" in block
     assert "원화 자산 최소화" in block
-    assert "최우선 준수" in block
+    assert "균형 있게" in block
+    assert "파이썬 리스크·guardrail 게이트" in block
 
 
 def test_build_orchestrator_directive_block_empty_when_no_directives(isolated_profiles):

@@ -144,12 +144,12 @@ def build_orchestrator_directive_block(uid: Optional[int]) -> str:
     directives = load(uid)
     if not directives:
         return ""
-    lines = ["## 사장님 상시 지시사항 (당신 계정 한정 — 최우선 준수)"]
+    lines = ["## 사장님 상시 지침 (당신 계정 한정 — 참고 지침: 다른 신호·리스크 게이트와 균형 있게 반영)"]
     for i, d in enumerate(directives, 1):
         lines.append(f"[{i}] {d['text']}")
     lines.append(
-        "※ 위 지시사항은 이 계정 전용으로 매 사이클 자동 반영됩니다.\n"
-        "   신규 매수 종목 선정·자산 배분·리밸런싱 판단에서 최우선으로 준수하십시오."
+        "※ 위 지침은 이 계정 전용 참고사항입니다. 신규 매수·자산 배분·리밸런싱 시 다른 분석/리스크 신호와 균형 있게 고려하되,"
+        " 파이썬 리스크·guardrail 게이트가 항상 최종 우선합니다."
     )
     return "\n".join(lines)
 
