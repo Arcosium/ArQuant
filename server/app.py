@@ -300,6 +300,91 @@ async def me(request: Request):
             "is_admin": bool(c.get("is_admin")),  # 사장 피드백 2026-05-18: 코드변경 전체반영 권한 표시
             "active": creds_layer.current()}
 
+class PwChangeReq(BaseModel):
+    current: str
+    new: str
+
+class CredsReq(BaseModel):
+    openrouter_key: Optional[str] = None
+    kis_app_key: Optional[str] = None
+    kis_app_secret: Optional[str] = None
+    kis_account_no: Optional[str] = None
+    kis_base_url: Optional[str] = None
+
+class DirectiveReq(BaseModel):
+    text: str
+
+class DeleteAccountReq(BaseModel):
+    password: str
+
+@app.post("/api/profile/password")
+async def profile_password(req: PwChangeReq, request: Request):
+    uid = _uid_or_403(request)
+    try:
+        auth_store.change_password(uid, req.current, req.new)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+@app.post("/api/profile/credentials")
+async def profile_credentials(req: CredsReq, request: Request):
+    uid = _uid_or_403(request)
+    cur = auth_store.get_user_credentials(uid) or {}
+    ak = req.kis_app_key if req.kis_app_key is not None else cur.get("kis_app_key")
+    as_ = req.kis_app_secret if req.kis_app_secret is not None else cur.get("kis_app_secret")
+    bu = req.kis_base_url if req.kis_base_url is not None else cur.get("kis_base_url")
+    if req.kis_app_key is not None or req.kis_app_secret is not None or req.kis_base_url is not None:
+        ok, msg = await _validate_kis(ak, as_, bu)
+        if not ok:
+            raise HTTPException(400, msg)
+    if req.openrouter_key is not None:
+        ok, msg = await _validate_openrouter(req.openrouter_key)
+        if not ok:
+            raise HTTPException(400, msg)
+    auth_store.update_credentials(
+        uid, openrouter_key=req.openrouter_key, kis_app_key=req.kis_app_key,
+        kis_app_secret=req.kis_app_secret, kis_account_no=req.kis_account_no,
+        kis_base_url=req.kis_base_url)
+    if creds_layer.current().get("user_id") == uid:
+        await _activate_with_policy(uid)
+    return {"ok": True}
+
+@app.get("/api/profile/directives")
+async def profile_directives_list(request: Request):
+    uid = _uid_or_403(request)
+    from infra import standing_directives as sd
+    return {"directives": sd.load(uid)}
+
+@app.post("/api/profile/directives")
+async def profile_directives_add(req: DirectiveReq, request: Request):
+    uid = _uid_or_403(request)
+    from infra import standing_directives as sd
+    added = sd.append_directive(uid, req.text)
+    return {"ok": True, "added": added, "directives": sd.load(uid)}
+
+@app.delete("/api/profile/directives/{did}")
+async def profile_directives_del(did: str, request: Request):
+    uid = _uid_or_403(request)
+    from infra import standing_directives as sd
+    sd.remove_directive(uid, did)
+    return {"ok": True, "directives": sd.load(uid)}
+
+@app.post("/api/profile/delete_account")
+async def profile_delete_account(req: DeleteAccountReq, request: Request):
+    uid = _uid_or_403(request)
+    creds = auth_store.get_user_credentials(uid)
+    if not creds or not auth_store.verify_password(creds["username"], req.password or ""):
+        raise HTTPException(400, "비밀번호가 일치하지 않습니다.")
+    import shutil
+    from pathlib import Path
+    auth_store.delete_user(uid)
+    shutil.rmtree(Path(__file__).resolve().parent.parent / "data" /
+                  "profiles" / str(uid), ignore_errors=True)
+    resp = JSONResponse(content={"ok": True})
+    resp.delete_cookie(auth_store.SESSION_COOKIE, path="/",
+                       secure=_COOKIE_SECURE, httponly=True, samesite="lax")
+    return resp
+
 @app.get("/api/accounts")
 async def accounts():
     return {"accounts": auth_store.list_accounts(), "active": creds_layer.current()}
@@ -488,6 +573,13 @@ def _admin_uid_or_403(request: Request) -> int:
         _is_adm = False
     if not _is_adm:
         raise HTTPException(403, "Coresight 수신함은 ADMIN(hh09080) 전용입니다.")
+    return uid
+
+
+def _require_admin(request: Request) -> int:
+    uid = _uid_or_403(request)
+    if not auth_store.is_admin(uid):
+        raise HTTPException(403, "ADMIN(hh09080) 전용 기능입니다.")
     return uid
 
 
