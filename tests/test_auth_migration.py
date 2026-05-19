@@ -31,9 +31,9 @@ def test_one_shot_migration_is_idempotent(fresh_auth):
                 "WHERE id=?", (fresh_auth.encrypt("Migrate$99x"), uid))
     con.commit(); con.close()
     s1 = fresh_auth.migrate_passwords_and_bidx()
-    assert s1 == {"pw": 1, "bidx": 1}
+    assert s1 == {"pw": 1, "bidx": 1, "acct_bidx": 0}
     s2 = fresh_auth.migrate_passwords_and_bidx()          # idempotent
-    assert s2 == {"pw": 0, "bidx": 0}
+    assert s2 == {"pw": 0, "bidx": 0, "acct_bidx": 0}
     con = sqlite3.connect(fresh_auth._DB_PATH); con.row_factory = sqlite3.Row
     r = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone(); con.close()
     assert r["password_hash"].startswith("$argon2id$") and r["password_enc"] == ""
@@ -51,7 +51,7 @@ def test_migration_skips_row_with_corrupt_enc_no_data_loss(fresh_auth):
     con.commit(); con.close()
     stats = fresh_auth.migrate_passwords_and_bidx()
     # corrupt row must be skipped, NOT counted, NOT mutated
-    assert stats == {"pw": 0, "bidx": 0}
+    assert stats == {"pw": 0, "bidx": 0, "acct_bidx": 0}
     con = sqlite3.connect(fresh_auth._DB_PATH); con.row_factory = sqlite3.Row
     r = con.execute("SELECT password_hash, password_enc, kis_app_key_bidx "
                      "FROM users WHERE id=?", (uid,)).fetchone(); con.close()

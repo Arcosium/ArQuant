@@ -251,7 +251,8 @@ def init() -> None:
             conn.execute(f"UPDATE users SET is_admin=1 WHERE username IN ({qs})",
                          tuple(ADMIN_USERNAMES))
         for _c in ("password_hash", "kis_app_key_bidx",
-                   "kis_app_secret_bidx", "openrouter_key_bidx"):
+                   "kis_app_secret_bidx", "openrouter_key_bidx",
+                   "kis_account_no_bidx"):
             if _c not in cols:
                 conn.execute(
                     f"ALTER TABLE users ADD COLUMN {_c} TEXT NOT NULL DEFAULT ''")
@@ -292,6 +293,7 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
         kis_app_key_bidx=bidx(kis_app_key),
         kis_app_secret_bidx=bidx(kis_app_secret),
         openrouter_key_bidx=bidx(openrouter_key),
+        kis_account_no_bidx=bidx(kis_account_no),
     )
     with _DB_LOCK, _connect() as conn:
         row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
@@ -302,11 +304,13 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
                    kis_app_key_enc=?, kis_app_secret_enc=?, openrouter_key_enc=?,
                    kis_account_no_enc=?, kis_base_url=?, dart_key_enc=?, label=?,
                    kis_app_key_bidx=?, kis_app_secret_bidx=?, openrouter_key_bidx=?,
+                   kis_account_no_bidx=?,
                    last_login_at=?, last_validated_at=? WHERE id=?""",
                 (vals["password_hash"], vals["kis_app_key_enc"], vals["kis_app_secret_enc"],
                  vals["openrouter_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
                  vals["dart_key_enc"], vals["label"], vals["kis_app_key_bidx"],
-                 vals["kis_app_secret_bidx"], vals["openrouter_key_bidx"], now, now, uid),
+                 vals["kis_app_secret_bidx"], vals["openrouter_key_bidx"],
+                 vals["kis_account_no_bidx"], now, now, uid),
             )
             return uid
         adm = 1 if (is_admin or username in ADMIN_USERNAMES) else 0
@@ -315,13 +319,15 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
                kis_app_key_enc, kis_app_secret_enc, openrouter_key_enc,
                kis_account_no_enc, kis_base_url, dart_key_enc, label,
                kis_app_key_bidx, kis_app_secret_bidx, openrouter_key_bidx,
+               kis_account_no_bidx,
                is_admin, created_at, last_login_at, last_validated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (username, "", vals["password_hash"], vals["kis_app_key_enc"],
              vals["kis_app_secret_enc"], vals["openrouter_key_enc"],
              vals["kis_account_no_enc"], vals["kis_base_url"], vals["dart_key_enc"],
              vals["label"], vals["kis_app_key_bidx"], vals["kis_app_secret_bidx"],
-             vals["openrouter_key_bidx"], adm, now, now, now),
+             vals["openrouter_key_bidx"], vals["kis_account_no_bidx"],
+             adm, now, now, now),
         )
         return int(cur.lastrowid)
 
@@ -463,18 +469,20 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
     FernetKeyLost 는 _ensure_fernet 에서 루프 진입 전에 발생하므로 여기서 잡지 않음."""
     init()
     _ensure_fernet()  # 키 분실이면 여기서 FernetKeyLost — per-row except 에 삼켜지지 않게 선제 발생
-    stats = {"pw": 0, "bidx": 0}
+    stats = {"pw": 0, "bidx": 0, "acct_bidx": 0}
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             "SELECT id, password_enc, password_hash, "
             "kis_app_key_enc, kis_app_secret_enc, openrouter_key_enc, "
-            "kis_app_key_bidx, kis_app_secret_bidx, openrouter_key_bidx FROM users"
+            "kis_app_key_bidx, kis_app_secret_bidx, openrouter_key_bidx, "
+            "kis_account_no_enc, kis_account_no_bidx FROM users"
         ).fetchall()
         for r in rows:
             try:
                 updates: Dict[str, Any] = {}
                 did_pw = False
                 did_bidx = False
+                did_acct = False
 
                 # ── 비밀번호 승격 경로 ──────────────────────────────────────
                 if not (r["password_hash"] or "") and (r["password_enc"] or ""):
@@ -510,6 +518,14 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                         did_bidx = True
                     # enc 자체가 비어있는 경우(빈 enc) — bidx 백필 대상 아님, 통과
 
+                if not (r["kis_account_no_bidx"] or ""):
+                    enc_acct = r["kis_account_no_enc"] or ""
+                    if enc_acct:
+                        dec_acct = decrypt(enc_acct)
+                        if dec_acct:
+                            updates["kis_account_no_bidx"] = bidx(dec_acct)
+                            did_acct = True
+
                 # 여기까지 오면 updates 는 안전하게 쓸 수 있는 값들만 포함
                 if updates:
                     sets = ",".join(f"{k}=?" for k in updates)
@@ -519,14 +535,16 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                     stats["pw"] += 1
                 if did_bidx:
                     stats["bidx"] += 1
+                if did_acct:
+                    stats["acct_bidx"] += 1
             except Exception as e:
                 # FernetKeyLost 는 위 _ensure_fernet() 선제 호출에서 발생 — 여기 도달 안 함
                 logger.error(
                     "auth 마이그레이션 행 실패 user_id=%s: %s — 스킵", r["id"], e)
                 continue
-    if stats["pw"] or stats["bidx"]:
-        logger.info("auth 마이그레이션 완료: 해시승격 %d, bidx백필 %d",
-                    stats["pw"], stats["bidx"])
+    if stats["pw"] or stats["bidx"] or stats["acct_bidx"]:
+        logger.info("auth 마이그레이션 완료: 해시승격 %d, bidx백필 %d, 계좌bidx백필 %d",
+                    stats["pw"], stats["bidx"], stats["acct_bidx"])
     return stats
 
 
