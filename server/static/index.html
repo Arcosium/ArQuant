@@ -23,6 +23,8 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
 .badge-idle{background:#64748b20;color:#94a3b8}.badge-monitoring{background:#06b6d420;color:var(--acc);animation:pls 2s infinite}
 .badge-running{background:#f59e0b20;color:var(--amb);animation:pls 1.5s infinite}.badge-stopped{background:#ef444420;color:var(--red)}
 @keyframes pls{0%,100%{opacity:1}50%{opacity:.5}}
+/* 5-3: 모바일 배지 미러 — 데스크톱에서는 미러 숨김, 원본 표시 */
+#badgeMirror{display:none;margin-left:6px;vertical-align:middle}
 .hdr-btns{display:flex;gap:6px}
 
 .sidebar{background:var(--surface);border-right:1px solid var(--border);padding:12px 0;display:flex;flex-direction:column;min-height:0;overflow:hidden}
@@ -208,13 +210,18 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
   /* ⑧ 일반 글자 줄바꿈 — 한국어는 단어단위 유지, 긴 토큰만 줄바꿈 */
   .cm,.ni{word-break:keep-all;overflow-wrap:anywhere}
   /* 실행/중지/전송 — 모바일은 아이콘만 (가로폭 축소), 입력창은 같은 줄 오른쪽에 노출 */
-  .control-bar{padding:9px 10px;gap:6px;flex-wrap:nowrap}
+  /* 사장 지시 2026-05-19: viewport-fit=cover라 하단 입력바가 모바일 홈바(safe-area)에
+     가려짐 — 하단 패딩에 env(safe-area-inset-bottom)을 더해 입력창을 홈바 위로 띄운다. */
+  .control-bar{padding:9px 10px calc(9px + env(safe-area-inset-bottom,0px));gap:6px;flex-wrap:nowrap}
   .btn-lg{padding:10px 12px;font-size:13px}
   .btn-lbl{display:none}                        /* ▶/⏹/➤ 아이콘만 남김 */
   #startBtn,#stopBtn,.btn-send{flex:0 0 auto}
   .control-wrap{order:0;flex:1 1 auto;min-width:0}  /* 입력창 같은 줄에 보이게 */
   .dir-in{font-size:13px;min-width:0}
   canvas{max-width:100%}
+  /* 5-3: 모바일 — 원본 배지 숨김, 통신 로그 헤더 미러 표시 */
+  #badge{display:none!important}
+  #badgeMirror{display:inline-flex}
 }
 </style>
 </head>
@@ -226,7 +233,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
 <div id="loginOv" style="position:fixed;inset:0;z-index:9999;display:none;align-items:center;justify-content:center;background:#0b0f1af5">
   <div style="width:380px;max-width:92vw;max-height:92vh;overflow-y:auto;-webkit-overflow-scrolling:touch;background:#141a26;border:1px solid #2a3344;border-radius:14px;padding:24px 22px;box-shadow:0 20px 60px #000a">
     <div style="display:flex;align-items:center;gap:9px;margin-bottom:4px">
-      <div style="width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#6366f1,#06b6d4)"></div>
+      <div style="width:30px;height:30px;background:linear-gradient(135deg,#6366f1,#06b6d4);border-radius:9px;box-shadow:0 2px 10px #6366f155;display:flex;align-items:center;justify-content:center"><svg width='17' height='17' viewBox='0 0 24 24' fill='none' stroke='#fff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9.2' opacity='.35'/><path d='M5 16.5l4-5 3.2 3 4.3-6.2'/><circle cx='16.5' cy='8.3' r='1.6' fill='#fff' stroke='none'/></svg></div>
       <div><div style="font-weight:700;font-size:16px;color:#e8edf6">ArQuant</div><div style="font-size:10px;color:#7a869c">Multi-Asset AI Trading</div></div>
     </div>
     <div style="display:flex;gap:6px;margin:14px 0 12px">
@@ -241,18 +248,48 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <div class="regonly"><div class="fld"><label>OpenRouter API Key <span style="color:#7a869c">(필수)</span></label><input id="f_or" autocomplete="off"></div></div>
       <div class="regonly"><div class="fld"><label>한국투자증권 App Key</label><input id="f_appkey" autocomplete="off"></div></div>
       <div class="regonly"><div class="fld"><label>한국투자증권 App Secret</label><input id="f_appsecret" type="password" autocomplete="off"></div></div>
-      <div class="regonly"><div class="fld"><label>KIS 계좌번호 <span style="color:#7a869c">(예: 12345678-01)</span></label><input id="f_acct"></div></div>
+      <div class="regonly"><div class="fld"><label>한국투자증권 계좌번호 <span style="color:#7a869c">(예: 12345678-01)</span></label><input id="f_acct"></div></div>
       <div class="regonly"><div class="fld"><label>거래 환경</label>
         <select id="f_envmode" style="width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;border:1px solid #2a3344;background:#0e131d;color:#e8edf6;font-size:13px;outline:none">
           <option value="real" selected>실전투자 (실거래)</option>
           <option value="mock">모의투자 (페이퍼)</option>
         </select></div></div>
-      <div class="regonly"><div class="fld"><label>DART API Key <span style="color:#7a869c">(선택 — 없으면 공시 분석 생략)</span></label><input id="f_dart" autocomplete="off"></div></div>
-      <div class="regonly"><div class="fld"><label>계정 이름 <span style="color:#7a869c">(선택)</span></label><input id="f_label"></div></div>
       <label for="f_remember" style="display:flex;align-items:center;gap:8px;font-size:12px;color:#9fb0c9;margin:10px 0 14px;cursor:pointer;white-space:nowrap;line-height:1"><input type="checkbox" id="f_remember" checked style="width:16px;height:16px;margin:0;flex:none;accent-color:#6366f1;cursor:pointer"><span>이 기기에서 7일간 로그인 유지</span></label>
       <div id="authErr" style="display:none;font-size:12px;color:#f87171;background:#3b1a1a;border:1px solid #5b2626;border-radius:7px;padding:8px 10px;margin-bottom:10px"></div>
       <button id="authSubmit" type="submit" style="width:100%;padding:11px;border-radius:9px;border:0;background:linear-gradient(135deg,#6366f1,#06b6d4);color:#fff;font-weight:700;font-size:13px;cursor:pointer">로그인</button>
     </form>
+    <!-- 5-2: 아이디/비밀번호 찾기 (로그인 뷰에서만 표시) -->
+    <div id="recoverLink" style="text-align:center;margin-top:14px">
+      <button type="button" onclick="toggleRecover()" style="background:none;border:none;color:#7a869c;font-size:11px;cursor:pointer;text-decoration:underline;font-family:inherit;padding:0">아이디/비밀번호를 잊으셨나요?</button>
+    </div>
+    <div id="recoverPanel" style="display:none;margin-top:12px;border-top:1px solid #2a3344;padding-top:14px">
+      <!-- 복구 탭 -->
+      <div style="display:flex;gap:6px;margin-bottom:12px">
+        <button id="recTabId" type="button" onclick="setRecoverTab('id')" style="flex:1;padding:7px;border-radius:7px;border:1px solid #2a3344;background:#1e2636;color:#e8edf6;font-size:11px;cursor:pointer;font-family:inherit">아이디 찾기</button>
+        <button id="recTabPw" type="button" onclick="setRecoverTab('pw')" style="flex:1;padding:7px;border-radius:7px;border:1px solid #2a3344;background:#141a26;color:#7a869c;font-size:11px;cursor:pointer;font-family:inherit">비밀번호 재설정</button>
+      </div>
+      <!-- 아이디 찾기 폼 -->
+      <div id="recIdPanel">
+        <div class="fld"><label for="rec_id_appkey">한국투자증권 App Key</label><input id="rec_id_appkey" autocomplete="off" placeholder="KIS App Key"></div>
+        <div class="fld"><label for="rec_id_appsecret">한국투자증권 App Secret</label><input id="rec_id_appsecret" type="password" autocomplete="off" placeholder="KIS App Secret"></div>
+        <div class="fld"><label for="rec_id_orkey">OpenRouter API Key</label><input id="rec_id_orkey" autocomplete="off" placeholder="OpenRouter API Key"></div>
+        <div id="recIdErr" style="display:none;font-size:11px;color:#f87171;background:#3b1a1a;border:1px solid #5b2626;border-radius:7px;padding:7px 10px;margin-bottom:8px"></div>
+        <div id="recIdOk" style="display:none;font-size:12px;color:#34d399;background:#0c2a1e;border:1px solid #065f46;border-radius:7px;padding:8px 10px;margin-bottom:8px"></div>
+        <button type="button" onclick="doRecoverId()" style="width:100%;padding:10px;border-radius:9px;border:0;background:linear-gradient(135deg,#6366f1,#06b6d4);color:#fff;font-weight:700;font-size:12px;cursor:pointer;font-family:inherit">아이디 찾기</button>
+      </div>
+      <!-- 비밀번호 재설정 폼 -->
+      <div id="recPwPanel" style="display:none">
+        <div class="fld"><label for="rec_pw_user">아이디</label><input id="rec_pw_user" autocomplete="username" placeholder="등록된 아이디"></div>
+        <div class="fld"><label for="rec_pw_appkey">한국투자증권 App Key</label><input id="rec_pw_appkey" autocomplete="off" placeholder="KIS App Key"></div>
+        <div class="fld"><label for="rec_pw_appsecret">한국투자증권 App Secret</label><input id="rec_pw_appsecret" type="password" autocomplete="off" placeholder="KIS App Secret"></div>
+        <div class="fld"><label for="rec_pw_orkey">OpenRouter API Key</label><input id="rec_pw_orkey" autocomplete="off" placeholder="OpenRouter API Key"></div>
+        <div class="fld"><label for="rec_pw_newpw">새 비밀번호 <span style="color:#7a869c">(10자 이상 · 특수문자 1개 이상)</span></label><input id="rec_pw_newpw" type="password" autocomplete="new-password" placeholder="새 비밀번호"></div>
+        <div id="recPwHint" style="font-size:11px;margin:-6px 0 9px"></div>
+        <div id="recPwErr" style="display:none;font-size:11px;color:#f87171;background:#3b1a1a;border:1px solid #5b2626;border-radius:7px;padding:7px 10px;margin-bottom:8px"></div>
+        <div id="recPwOk" style="display:none;font-size:12px;color:#34d399;background:#0c2a1e;border:1px solid #065f46;border-radius:7px;padding:8px 10px;margin-bottom:8px"></div>
+        <button type="button" onclick="doRecoverPw()" style="width:100%;padding:10px;border-radius:9px;border:0;background:linear-gradient(135deg,#6366f1,#06b6d4);color:#fff;font-weight:700;font-size:12px;cursor:pointer;font-family:inherit">비밀번호 재설정</button>
+      </div>
+    </div>
   </div>
 </div>
 <style>
@@ -262,6 +299,10 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
   #loginOv input:not([type=checkbox]):focus{border-color:#6366f1}
   #loginOv.reg .regonly{display:block}
   #loginOv:not(.reg) .regonly{display:none}
+  /* 5-2: 아이디/비밀번호 찾기 — 로그인 모드에서만 표시 */
+  #loginOv.reg #recoverLink,#loginOv.reg #recoverPanel{display:none!important}
+  /* 5-4: 모바일 safe-area — 등록 폼 하단이 홈바에 안 가려지도록 */
+  #loginOv>div{padding-bottom:max(24px,calc(env(safe-area-inset-bottom,0px) + 28px))}
   #acctChip{font-size:11px;color:#fca5a5;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);border-radius:6px;padding:4px 11px;cursor:pointer;font-weight:600}
   #acctChip:hover{background:rgba(239,68,68,.2)}
 </style>
@@ -308,7 +349,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <button class="dash-more" id="dashMore" onclick="toggleDashMore()" type="button">
         <span id="dashMoreLabel">전체 상태 보기</span><span id="dashMoreArrow">▾</span>
       </button>
-      <div class="card grow"><div class="ch"><span class="ct">💬 에이전트 통신 로그</span><button class="btn btn-ghost" onclick="clearLog()">초기화</button></div>
+      <div class="card grow"><div class="ch"><span class="ct">💬 에이전트 통신 로그 <span id="badgeMirror" class="badge badge-idle">IDLE</span></span><button class="btn btn-ghost" onclick="clearLog()">초기화</button></div>
         <div class="chat-log" id="chatLog"><div class="cm system">감시를 시작하면 장 시간(KRX 08:50~15:50, US 22:30~05:00)에 맞춰 자동 거래합니다.</div></div>
       </div>
     </div>
@@ -492,6 +533,11 @@ document.addEventListener('DOMContentLoaded',()=>{
     pwH.textContent=fpw.value?(e?('✗ '+e):'✓ 사용 가능한 비밀번호'):'';
     pwH.style.color=e?'#f87171':'#34d399';
   });
+  // 5-2: 비밀번호 재설정 폼 실시간 힌트
+  const rPwIn=document.getElementById('rec_pw_newpw'),rPwH=document.getElementById('recPwHint');
+  if(rPwIn&&rPwH){rPwIn.addEventListener('input',()=>{const e=pwError(rPwIn.value);
+    rPwH.textContent=rPwIn.value?(e?('✗ '+e):'✓ 사용 가능한 비밀번호'):'';
+    rPwH.style.color=e?'#f87171':'#34d399';});}
   // 아이디 중복 확인 (디바운스)
   const fu=document.getElementById('f_username'), uH=document.getElementById('unameHint'); let _uT;
   fu.addEventListener('input',()=>{
@@ -522,7 +568,8 @@ document.addEventListener('DOMContentLoaded',()=>{
       body.kis_base_url=(document.getElementById('f_envmode').value==='mock'
         ?'https://openapivts.koreainvestment.com:29443'
         :'https://openapi.koreainvestment.com:9443');
-      body.dart_key=f_dart.value.trim();body.label=f_label.value.trim();}
+      // dart_key/label 제거 — 서버 소유 키로 전환됨 (5-5)
+    }
     try{
       const r=await fetch(API+(reg?'/api/register':'/api/login'),
         {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -643,10 +690,78 @@ function connectWS(){
   ws.onclose=()=>{ if(_authed) setTimeout(connectWS,3000); }}
 boot();  // 사장 피드백 2026-05-16: 인증 확인 후에만 앱 구동 (replayLog/connectWS)
 
-function updateBadge(s){const b=document.getElementById('badge');b.textContent=s;
-  b.className='badge badge-'+(s==='MONITORING'||s==='DATA_COLLECTION'?'monitoring':s==='STOPPED'?'stopped':['IDLE','COOLDOWN','OFF_HOURS'].includes(s)?'idle':'running')}
+// 5-2: 아이디/비밀번호 찾기 UI
+function toggleRecover(){
+  const p=document.getElementById('recoverPanel');
+  const show=p.style.display==='none'||p.style.display==='';
+  p.style.display=show?'block':'none';
+  if(show) setRecoverTab('id');
+}
+function setRecoverTab(tab){
+  const isId=tab==='id';
+  document.getElementById('recIdPanel').style.display=isId?'block':'none';
+  document.getElementById('recPwPanel').style.display=isId?'none':'block';
+  document.getElementById('recTabId').style.background=isId?'#1e2636':'#141a26';
+  document.getElementById('recTabId').style.color=isId?'#e8edf6':'#7a869c';
+  document.getElementById('recTabPw').style.background=isId?'#141a26':'#1e2636';
+  document.getElementById('recTabPw').style.color=isId?'#7a869c':'#e8edf6';
+  // 메시지 초기화
+  ['recIdErr','recIdOk','recPwErr','recPwOk'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none';});
+}
+function _recShowMsg(okId,errId,ok,msg){
+  const oEl=document.getElementById(okId),eEl=document.getElementById(errId);
+  oEl.style.display=ok?'block':'none'; if(ok)oEl.textContent=msg;
+  eEl.style.display=ok?'none':'block'; if(!ok)eEl.textContent=msg;
+}
+async function doRecoverId(){
+  const appkey=(document.getElementById('rec_id_appkey').value||'').trim();
+  const appsecret=(document.getElementById('rec_id_appsecret').value||'').trim();
+  const orkey=(document.getElementById('rec_id_orkey').value||'').trim();
+  if(!appkey||!appsecret||!orkey){_recShowMsg('recIdOk','recIdErr',false,'모든 항목을 입력해주세요.');return;}
+  const btn=document.querySelector('#recIdPanel button[type=button]');btn.disabled=true;btn.textContent='조회 중…';
+  try{
+    const r=await _origFetch(API+'/api/recover_id',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kis_app_key:appkey,kis_app_secret:appsecret,openrouter_key:orkey})});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok){_recShowMsg('recIdOk','recIdErr',true,'아이디: '+String(d.username||''));}
+    else{_recShowMsg('recIdOk','recIdErr',false,(d&&(d.detail||d.message))||('HTTP '+r.status));}
+  }catch(ex){_recShowMsg('recIdOk','recIdErr',false,'오류: '+ex.message);}
+  finally{btn.disabled=false;btn.textContent='아이디 찾기';}
+}
+async function doRecoverPw(){
+  const username=(document.getElementById('rec_pw_user').value||'').trim();
+  const appkey=(document.getElementById('rec_pw_appkey').value||'').trim();
+  const appsecret=(document.getElementById('rec_pw_appsecret').value||'').trim();
+  const orkey=(document.getElementById('rec_pw_orkey').value||'').trim();
+  const newpw=document.getElementById('rec_pw_newpw').value||'';
+  if(!username||!appkey||!appsecret||!orkey||!newpw){_recShowMsg('recPwOk','recPwErr',false,'모든 항목을 입력해주세요.');return;}
+  // 클라이언트 사전 정책 검사
+  if(newpw.length<10){_recShowMsg('recPwOk','recPwErr',false,'비밀번호: 10자 이상 필요');return;}
+  if(!/[^A-Za-z0-9\s]/.test(newpw)){_recShowMsg('recPwOk','recPwErr',false,'비밀번호: 특수문자 1개 이상 필요');return;}
+  const btn=document.querySelector('#recPwPanel button[type=button]');btn.disabled=true;btn.textContent='재설정 중…';
+  try{
+    const r=await _origFetch(API+'/api/recover_password',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username,kis_app_key:appkey,kis_app_secret:appsecret,openrouter_key:orkey,new_password:newpw})});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok){
+      _recShowMsg('recPwOk','recPwErr',true,'비밀번호가 재설정되었습니다. 새 비밀번호로 로그인하세요.');
+      // 3초 후 복구 패널 닫고 로그인 탭으로 돌아감
+      setTimeout(()=>{document.getElementById('recoverPanel').style.display='none';setAuthMode(false);},3000);
+    } else {
+      _recShowMsg('recPwOk','recPwErr',false,(d&&(d.detail||d.message))||('HTTP '+r.status));
+    }
+  }catch(ex){_recShowMsg('recPwOk','recPwErr',false,'오류: '+ex.message);}
+  finally{btn.disabled=false;btn.textContent='비밀번호 재설정';}
+}
+
+function updateBadge(s){const cls='badge badge-'+(s==='MONITORING'||s==='DATA_COLLECTION'?'monitoring':s==='STOPPED'?'stopped':['IDLE','COOLDOWN','OFF_HOURS'].includes(s)?'idle':'running');
+  // 원본 배지(헤더 우측, 데스크톱) + 미러 배지(통신 로그 헤더, 모바일) 동기화
+  [document.getElementById('badge'),document.getElementById('badgeMirror')].forEach(b=>{if(b){b.textContent=s;b.className=cls;}});}
 
 // 사장 피드백 2026-05-15 모바일 #3: 마크다운 잔여물(**bold**, ## 헤더, --- 구분선, | 표, ``` 코드)을 평문으로 정리.
+// 주의: 이 함수는 시스템/뉴스/ceo 메시지용 — 에이전트 메시지는 _renderAgentContent() 사용 (표 보존).
 function _cleanLog(t){
   return String(t==null?'':t)
     .replace(/```[^\n]*/g,'')              // 코드 블록 펜스 제거
@@ -658,6 +773,63 @@ function _cleanLog(t){
     .replace(/^\|.*\|\s*$/gm,'')           // 표 행 (UI 깨짐 방지)
     .replace(/`([^`]+)`/g,'$1')             // 인라인 코드 → 평문
     .replace(/[ \t]{3,}/g,'  ')
+}
+
+// Item 3: 에이전트 메시지 DOM 렌더 — 마크다운 표·다중행 내용을 가독성 있게 표시.
+// 보안: 모든 텍스트 노드/textContent 사용 — innerHTML 미사용, XSS 안전.
+function _escHtml(s){
+  return String(s==null?'':s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+function _isTableRow(line){return /^\s*\|.*\|\s*$/.test(line);}
+function _isSepRow(line){return /^\s*\|[\s\-:|]+\|\s*$/.test(line);}
+function _renderAgentContent(container, rawText){
+  // Split text into segments: markdown table blocks vs plain text blocks.
+  // A table block = consecutive lines starting and ending with |.
+  const lines = String(rawText==null?'':rawText).split('\n');
+  let i=0;
+  while(i<lines.length){
+    // Detect start of a markdown table (header row | ... |)
+    if(_isTableRow(lines[i])){
+      const tableLines=[];
+      while(i<lines.length&&_isTableRow(lines[i])){tableLines.push(lines[i]);i++;}
+      // Build <table> element
+      const tbl=document.createElement('table');
+      tbl.style.cssText='border-collapse:collapse;width:100%;margin:4px 0;font-size:10px;line-height:1.4';
+      let headerDone=false;
+      tableLines.forEach(row=>{
+        if(_isSepRow(row))return; // skip separator row
+        const cells=row.replace(/^\s*\|\s*/,'').replace(/\s*\|\s*$/,'').split(/\s*\|\s*/);
+        const tr=document.createElement('tr');
+        cells.forEach(cell=>{
+          const td=document.createElement(headerDone?'td':'th');
+          td.textContent=cell.trim();
+          td.style.cssText='border:1px solid #2a3344;padding:3px 7px;text-align:left;'+(headerDone?'':'font-weight:700;color:var(--acc);background:#1a1f2e;');
+          tr.appendChild(td);
+        });
+        tbl.appendChild(tr);
+        headerDone=true;
+      });
+      container.appendChild(tbl);
+    } else {
+      // Accumulate plain-text lines until next table
+      const textLines=[];
+      while(i<lines.length&&!_isTableRow(lines[i])){textLines.push(lines[i]);i++;}
+      const plainText=textLines.join('\n')
+        .replace(/```[^\n]*/g,'')
+        .replace(/\*\*+/g,'').replace(/__+/g,'')
+        .replace(/^#{1,6}\s*/gm,'').replace(/#{2,}\s?/g,'')
+        .replace(/^---+\s*$/gm,'')
+        .replace(/`([^`]+)`/g,'$1');
+      if(plainText.trim()){
+        const sp=document.createElement('span');
+        sp.style.cssText='white-space:pre-wrap;word-break:keep-all;overflow-wrap:anywhere';
+        sp.textContent=plainText;
+        container.appendChild(sp);
+      }
+    }
+  }
 }
 // 사장 지시 2026-05-14: KST 'YYYY-MM-DD HH:MM:SS' 포맷 (없으면 현재 시각)
 function _formatKstTs(ts){
@@ -679,9 +851,15 @@ function _formatKstTs(ts){
   const g=Object.fromEntries(f.map(p=>[p.type,p.value]));
   return `${g.year}-${g.month}-${g.day} ${g.hour}:${g.minute}:${g.second}`;
 }
-function addLog(type,text,name,color,ts){const log=document.getElementById('chatLog');const d=document.createElement('div');d.className='cm '+type;text=_cleanLog(text);
-  if(name){const tag=document.createElement('span');tag.className='tg';tag.style.color=color||'#06b6d4';tag.textContent=name;d.appendChild(tag);d.appendChild(document.createTextNode(text==null?'':String(text)));}
-  else d.textContent=text;
+function addLog(type,text,name,color,ts){const log=document.getElementById('chatLog');const d=document.createElement('div');d.className='cm '+type;
+  if(name){
+    // 에이전트 메시지: 태그 + 마크다운 표·다중행 내용 보존 렌더 (Item 3)
+    const tag=document.createElement('span');tag.className='tg';tag.style.color=color||'#06b6d4';tag.textContent=name;d.appendChild(tag);
+    _renderAgentContent(d, text);
+  } else {
+    // 시스템/ceo 메시지: 기존 평문 정리 유지
+    d.textContent=_cleanLog(text);
+  }
   const tsEl=document.createElement('span');tsEl.className='mts';tsEl.textContent=_formatKstTs(ts);d.appendChild(tsEl);
   log.appendChild(d);log.scrollTop=log.scrollHeight;if(log.children.length>300)log.removeChild(log.firstChild)}
 async function clearLog(){
