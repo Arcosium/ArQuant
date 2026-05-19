@@ -27,7 +27,8 @@ async def _fernet_lost_handler(request: Request, exc: auth_store.FernetKeyLost):
 # 사장 피드백 2026-05-16: Cloudflare Access 제거 → 앱 자체 로그인(세션 쿠키/X-Session).
 # 인증 불필요 경로 — SPA 셸(/)은 자체적으로 로그인 화면을 띄우므로 공개.
 _PUBLIC_PATHS = {"/health", "/api/health", "/", "/favicon.ico",
-                 "/api/login", "/api/register", "/api/auth_status", "/api/check_username"}
+                 "/api/login", "/api/register", "/api/auth_status",
+                 "/api/check_username", "/api/recover_id", "/api/recover_password"}
 _PUBLIC_PREFIXES = ("/static/",)
 
 
@@ -148,10 +149,35 @@ class LoginReq(BaseModel):
     username: str
     password: str
     remember: bool = True
+class RecoverIdReq(BaseModel):
+    kis_app_key: str
+    kis_app_secret: str
+    openrouter_key: str
+class RecoverPwReq(BaseModel):
+    username: str
+    kis_app_key: str
+    kis_app_secret: str
+    openrouter_key: str
+    new_password: str
 class SwitchReq(BaseModel):
     user_id: int
 
 _task: Optional[asyncio.Task] = None
+
+from infra.rate_limit import SlidingWindowLimiter
+_rl_login = SlidingWindowLimiter(max_hits=int(os.getenv("ARQUANT_RL_LOGIN_MAX", "8")),
+                                 window_sec=float(os.getenv("ARQUANT_RL_WIN", "900")))
+_rl_recover = SlidingWindowLimiter(max_hits=int(os.getenv("ARQUANT_RL_RECOVER_MAX", "5")),
+                                   window_sec=float(os.getenv("ARQUANT_RL_WIN", "900")))
+
+def _client_ip(request: Request) -> str:
+    xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    return xff or (request.client.host if request.client else "unknown")
+
+def _throttle(lim: SlidingWindowLimiter, key: str) -> None:
+    retry = lim.hit(key)
+    if retry is not None:
+        raise HTTPException(429, f"요청이 너무 많습니다. {int(retry)+1}초 후 다시 시도하세요.")
 
 # ─── 인증 엔드포인트 (HYFE app.py:160-282 패턴) ───────────────────────────────
 @app.get("/api/auth_status")
@@ -172,8 +198,10 @@ async def check_username(u: str = ""):
     return {"ok": True, "available": not auth_store.username_exists(u)}
 
 @app.post("/api/register")
-async def register(req: RegisterReq):
+async def register(req: RegisterReq, request: Request):
     """최초 등록 — 아이디(중복 불가) + 비밀번호(정책) + API 자격증명(실검증) 후 저장·활성화."""
+    ip = _client_ip(request)
+    _throttle(_rl_recover, f"register:{ip}")
     username = (req.username or "").strip()
     if not username or len(username) < 3:
         raise HTTPException(400, "아이디는 3자 이상이어야 합니다.")
@@ -193,21 +221,55 @@ async def register(req: RegisterReq):
         username=username, password=req.password,
         kis_app_key=req.kis_app_key.strip(), kis_app_secret=req.kis_app_secret.strip(),
         openrouter_key=req.openrouter_key.strip(), kis_account_no=req.kis_account_no.strip(),
-        kis_base_url=req.kis_base_url.strip(), dart_key=(req.dart_key or "").strip(),
-        label=(req.label or "").strip())
+        kis_base_url=req.kis_base_url.strip())
+    auth_store.audit("register", username=username, ip=ip, outcome="ok", detail="")
     await _activate_with_policy(uid)
     auth_store.touch_login(uid)
     return _issue_session(uid, req.remember)
 
 @app.post("/api/login")
-async def login(req: LoginReq):
-    """재로그인 — 아이디 + 비밀번호만 (HYFE m_login 패턴, 복호 후 평문 비교)."""
+async def login(req: LoginReq, request: Request):
+    """재로그인 — 아이디 + 비밀번호 (argon2 검증)."""
+    ip = _client_ip(request)
+    _throttle(_rl_login, f"login:{ip}")
+    _throttle(_rl_login, f"login:user:{(req.username or '').strip()}")
     u = auth_store.verify_password((req.username or "").strip(), req.password or "")
     if not u:
+        auth_store.audit("login", username=(req.username or "").strip(), ip=ip,
+                         outcome="fail", detail="")
         raise HTTPException(401, "아이디 또는 비밀번호가 일치하지 않습니다.")
+    auth_store.audit("login", username=u["username"], ip=ip, outcome="ok", detail="")
     await _activate_with_policy(u["id"])
     auth_store.touch_login(u["id"])
     return _issue_session(u["id"], req.remember)
+
+@app.post("/api/recover_id")
+async def recover_id(req: RecoverIdReq, request: Request):
+    ip = _client_ip(request)
+    _throttle(_rl_recover, f"recid:{ip}")
+    uname = auth_store.find_username_by_factors(
+        req.kis_app_key, req.kis_app_secret, req.openrouter_key)
+    auth_store.audit("recover_id", username=uname, ip=ip,
+                     outcome=("ok" if uname else "fail"), detail="")
+    if not uname:
+        raise HTTPException(404, "일치하는 계정을 찾을 수 없습니다.")
+    return {"username": uname}
+
+@app.post("/api/recover_password")
+async def recover_password(req: RecoverPwReq, request: Request):
+    ip = _client_ip(request)
+    _throttle(_rl_recover, f"recpw:{ip}")
+    try:
+        ok = auth_store.reset_password_by_factors(
+            (req.username or "").strip(), req.kis_app_key, req.kis_app_secret,
+            req.openrouter_key, req.new_password)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    auth_store.audit("recover_password", username=(req.username or "").strip(),
+                     ip=ip, outcome=("ok" if ok else "fail"), detail="")
+    if not ok:
+        raise HTTPException(404, "일치하는 계정을 찾을 수 없습니다.")
+    return {"ok": True}
 
 @app.post("/api/logout")
 async def logout(request: Request):
