@@ -1,4 +1,6 @@
+import pytest
 from infra import auth_store
+from infra import auth_store as A
 
 
 def test_hash_and_verify_roundtrip():
@@ -9,9 +11,6 @@ def test_hash_and_verify_roundtrip():
     assert auth_store.verify_pw_hash("", "anything") is False
     assert auth_store.verify_pw_hash("not-a-hash", "x") is False
 
-
-import pytest
-from infra import auth_store as A
 
 @pytest.fixture
 def fresh_auth(tmp_path, monkeypatch):
