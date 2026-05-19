@@ -342,6 +342,47 @@ def get_user_credentials(user_id: int) -> Optional[Dict[str, Any]]:
     return _row_to_creds(row) if row else None
 
 
+def find_username_by_factors(kis_app_key: str, kis_app_secret: str,
+                             openrouter_key: str) -> Optional[str]:
+    """세 자격증명이 모두 정확히 일치하는 단일 유저의 아이디 반환(없으면 None).
+    블라인드 인덱스 단일 인덱스 조회 — 전체 복호 없음."""
+    if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(openrouter_key)):
+        return None
+    init()
+    a, b, c = bidx(kis_app_key), bidx(kis_app_secret), bidx(openrouter_key)
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT username FROM users WHERE kis_app_key_bidx=? AND "
+            "kis_app_secret_bidx=? AND openrouter_key_bidx=?", (a, b, c)).fetchone()
+    return row["username"] if row else None
+
+
+def reset_password_by_factors(username: str, kis_app_key: str, kis_app_secret: str,
+                              openrouter_key: str, new_password: str) -> bool:
+    """아이디 + 세 자격증명이 모두 일치하면 새 비밀번호로 재설정. 정책 위반은
+    ValueError. 일치 실패 시 False(아무 것도 바꾸지 않음).
+
+    순서: 자격증명 검증 → 정책 검사 → 업데이트.
+    자격증명 불일치 시 새 비밀번호 정책은 검사하지 않고 즉시 False 반환."""
+    if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(openrouter_key)):
+        return False
+    init()
+    a, b, c = bidx(kis_app_key), bidx(kis_app_secret), bidx(openrouter_key)
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM users WHERE username=? AND kis_app_key_bidx=? AND "
+            "kis_app_secret_bidx=? AND openrouter_key_bidx=?",
+            (_norm(username), a, b, c)).fetchone()
+        if not row:
+            return False
+        perr = password_policy_error(new_password or "")
+        if perr:
+            raise ValueError(perr)
+        conn.execute("UPDATE users SET password_hash=?, password_enc='' WHERE id=?",
+                     (hash_password(new_password), int(row["id"])))
+    return True
+
+
 def is_admin(user_id: Optional[int]) -> bool:
     """ADMIN 계정 여부. 미상/없음/오류는 모두 False (안전한 기본값 — 비관리자 취급).
 
