@@ -860,10 +860,17 @@ def test_sliding_window_trips_and_recovers():
     retry = lim.hit("ip1")
     assert retry is not None and 0 < retry <= 0.3   # 4th blocked
     assert lim.hit("ip2") is None                   # other key independent
-    time.sleep(0.32)
+    time.sleep(0.40)
     assert lim.hit("ip1") is None                   # window slid → allowed
     lim.reset("ip1")
     assert lim.hit("ip1") is None
+
+def test_zero_max_hits_blocks_without_crashing():
+    lim = SlidingWindowLimiter(max_hits=0, window_sec=0.5)
+    r = lim.hit("k")
+    assert r is not None and 0 < r <= 0.5     # blocked, no IndexError
+    r2 = lim.hit("k")
+    assert r2 is not None and 0 < r2 <= 0.5
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -900,10 +907,12 @@ class SlidingWindowLimiter:
         with self._lock:
             dq = self._buckets[key]
             cutoff = now - self.win
+            # 만료 타임스탬프는 다음 hit() 때 지연 제거(의도된 설계 — 유휴 키 TTL 스윕 불필요).
             while dq and dq[0] <= cutoff:
                 dq.popleft()
             if len(dq) >= self.max:
-                return max(0.001, self.win - (now - dq[0]))
+                retry = (self.win - (now - dq[0])) if dq else self.win
+                return max(0.001, retry)
             dq.append(now)
             return None
 

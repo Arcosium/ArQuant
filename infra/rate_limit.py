@@ -23,10 +23,12 @@ class SlidingWindowLimiter:
         with self._lock:
             dq = self._buckets[key]
             cutoff = now - self.win
+            # 만료 타임스탬프는 다음 hit() 때 지연 제거(의도된 설계 — 유휴 키 TTL 스윕 불필요).
             while dq and dq[0] <= cutoff:
                 dq.popleft()
             if len(dq) >= self.max:
-                return max(0.001, self.win - (now - dq[0]))
+                retry = (self.win - (now - dq[0])) if dq else self.win
+                return max(0.001, retry)
             dq.append(now)
             return None
 
