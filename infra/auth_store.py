@@ -43,7 +43,7 @@ SESSION_TTL_SEC = 7 * 24 * 60 * 60  # 7일
 
 _DB_LOCK = threading.RLock()
 _FERNET: Optional[Fernet] = None
-_FERNET_RAW: Optional[bytes] = None
+_FERNET_RAW: Optional[bytes] = None  # _ensure_fernet 에서 _FERNET 와 함께 세팅 — 둘은 항상 동기 유지
 _BIDX_KEY: Optional[bytes] = None
 
 # 비밀번호 정책 (사장 피드백 2026-05-16 2차)
@@ -135,7 +135,9 @@ def decrypt(token: str) -> str:
 
 
 def _norm(v: str) -> str:
-    """복구 인자 정규화 — 등록 저장 시(.strip())와 반드시 동일해야 매칭됨."""
+    """블라인드 인덱스 정규화. 저장·조회 양쪽 모두 bidx()→_norm() 을 거치므로
+    정규화는 대칭적이다(매칭 보장은 이 대칭성에서 나온다 — upsert_user 가
+    개별 키를 strip 한다고 가정하지 말 것)."""
     return (v or "").strip()
 
 
