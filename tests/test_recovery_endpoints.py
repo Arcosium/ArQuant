@@ -29,3 +29,25 @@ def test_recover_password_endpoint(client):
     assert ok.status_code == 200 and ok.json()["ok"] is True
     assert client.post("/api/login", json={
         "username": "zoe", "password": "BrandN3w$pw"}).status_code == 200
+
+def test_recover_password_policy_fail_is_audited_and_400(client, tmp_path):
+    from infra import auth_store as A
+    r = client.post("/api/recover_password", json={
+        "username": "zoe", "kis_app_key": "AKz", "kis_app_secret": "ASz",
+        "openrouter_key": "ORz", "new_password": "weak"})
+    assert r.status_code == 400
+    import json as _j
+    lines = (A._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()
+    rec = _j.loads(lines[-1])
+    assert rec["event"] == "recover_password" and rec["outcome"] == "fail" and rec["detail"] == "policy"
+
+def test_client_ip_prefers_cf_connecting_ip(client):
+    # CF-Connecting-IP must win over X-Forwarded-For for throttle keying / audit
+    r = client.post("/api/recover_id",
+                     headers={"CF-Connecting-IP": "9.9.9.9", "X-Forwarded-For": "1.1.1.1"},
+                     json={"kis_app_key":"AKz","kis_app_secret":"ASz","openrouter_key":"ORz"})
+    assert r.status_code == 200
+    from infra import auth_store as A
+    import json as _j
+    rec = _j.loads((A._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["ip"] == "9.9.9.9"

@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from infra import auth_store, credentials as creds_layer
+from infra.rate_limit import SlidingWindowLimiter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 app = FastAPI(title="ArQuant v1.0", version="1.0.0")
@@ -149,28 +150,37 @@ class LoginReq(BaseModel):
     username: str
     password: str
     remember: bool = True
+
 class RecoverIdReq(BaseModel):
     kis_app_key: str
     kis_app_secret: str
     openrouter_key: str
+
 class RecoverPwReq(BaseModel):
     username: str
     kis_app_key: str
     kis_app_secret: str
     openrouter_key: str
     new_password: str
+
 class SwitchReq(BaseModel):
     user_id: int
 
 _task: Optional[asyncio.Task] = None
 
-from infra.rate_limit import SlidingWindowLimiter
 _rl_login = SlidingWindowLimiter(max_hits=int(os.getenv("ARQUANT_RL_LOGIN_MAX", "8")),
                                  window_sec=float(os.getenv("ARQUANT_RL_WIN", "900")))
+# register:{ip} / recid:{ip} / recpw:{ip} 는 prefix 가 달라 IP당 독립 5회 윈도우(상호 잠식 없음).
 _rl_recover = SlidingWindowLimiter(max_hits=int(os.getenv("ARQUANT_RL_RECOVER_MAX", "5")),
                                    window_sec=float(os.getenv("ARQUANT_RL_WIN", "900")))
 
 def _client_ip(request: Request) -> str:
+    # Cloudflare Tunnel 은 CF-Connecting-IP 에 실제 클라이언트 IP 를 넣는다(가장 신뢰 가능).
+    # 그다음 X-Forwarded-For 첫 홉, 마지막으로 소켓 peer. (포트 직결 우회 시 헤더 위조
+    # 가능 — 인프라에서 uvicorn --proxy-headers --forwarded-allow-ips 로 보강 권장.)
+    cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf:
+        return cf
     xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
     return xff or (request.client.host if request.client else "unknown")
 
@@ -264,6 +274,8 @@ async def recover_password(req: RecoverPwReq, request: Request):
             (req.username or "").strip(), req.kis_app_key, req.kis_app_secret,
             req.openrouter_key, req.new_password)
     except ValueError as e:
+        auth_store.audit("recover_password", username=(req.username or "").strip(),
+                         ip=ip, outcome="fail", detail="policy")
         raise HTTPException(400, str(e))
     auth_store.audit("recover_password", username=(req.username or "").strip(),
                      ip=ip, outcome=("ok" if ok else "fail"), detail="")

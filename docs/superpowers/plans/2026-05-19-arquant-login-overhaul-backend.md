@@ -1065,6 +1065,28 @@ def test_recover_password_endpoint(client):
     assert ok.status_code == 200 and ok.json()["ok"] is True
     assert client.post("/api/login", json={
         "username": "zoe", "password": "BrandN3w$pw"}).status_code == 200
+
+def test_recover_password_policy_fail_is_audited_and_400(client, tmp_path):
+    from infra import auth_store as A
+    r = client.post("/api/recover_password", json={
+        "username": "zoe", "kis_app_key": "AKz", "kis_app_secret": "ASz",
+        "openrouter_key": "ORz", "new_password": "weak"})
+    assert r.status_code == 400
+    import json as _j
+    lines = (A._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()
+    rec = _j.loads(lines[-1])
+    assert rec["event"] == "recover_password" and rec["outcome"] == "fail" and rec["detail"] == "policy"
+
+def test_client_ip_prefers_cf_connecting_ip(client):
+    # CF-Connecting-IP must win over X-Forwarded-For for throttle keying / audit
+    r = client.post("/api/recover_id",
+                     headers={"CF-Connecting-IP": "9.9.9.9", "X-Forwarded-For": "1.1.1.1"},
+                     json={"kis_app_key":"AKz","kis_app_secret":"ASz","openrouter_key":"ORz"})
+    assert r.status_code == 200
+    from infra import auth_store as A
+    import json as _j
+    rec = _j.loads((A._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["ip"] == "9.9.9.9"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1097,16 +1119,22 @@ class RecoverPwReq(BaseModel):
     new_password: str
 ```
 
-(c) After `_task: Optional[asyncio.Task] = None` (line 154) add:
+(c) Move `from infra.rate_limit import SlidingWindowLimiter` to the **top-of-file local-imports area**, immediately after `from infra import auth_store, credentials as creds_layer`. Then after `_task: Optional[asyncio.Task] = None` add:
 
 ```python
-from infra.rate_limit import SlidingWindowLimiter
 _rl_login = SlidingWindowLimiter(max_hits=int(os.getenv("ARQUANT_RL_LOGIN_MAX", "8")),
                                  window_sec=float(os.getenv("ARQUANT_RL_WIN", "900")))
+# register:{ip} / recid:{ip} / recpw:{ip} 는 prefix 가 달라 IP당 독립 5회 윈도우(상호 잠식 없음).
 _rl_recover = SlidingWindowLimiter(max_hits=int(os.getenv("ARQUANT_RL_RECOVER_MAX", "5")),
                                    window_sec=float(os.getenv("ARQUANT_RL_WIN", "900")))
 
 def _client_ip(request: Request) -> str:
+    # Cloudflare Tunnel 은 CF-Connecting-IP 에 실제 클라이언트 IP 를 넣는다(가장 신뢰 가능).
+    # 그다음 X-Forwarded-For 첫 홉, 마지막으로 소켓 peer. (포트 직결 우회 시 헤더 위조
+    # 가능 — 인프라에서 uvicorn --proxy-headers --forwarded-allow-ips 로 보강 권장.)
+    cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf:
+        return cf
     xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
     return xff or (request.client.host if request.client else "unknown")
 
@@ -1178,6 +1206,8 @@ async def recover_password(req: RecoverPwReq, request: Request):
             (req.username or "").strip(), req.kis_app_key, req.kis_app_secret,
             req.openrouter_key, req.new_password)
     except ValueError as e:
+        auth_store.audit("recover_password", username=(req.username or "").strip(),
+                         ip=ip, outcome="fail", detail="policy")
         raise HTTPException(400, str(e))
     auth_store.audit("recover_password", username=(req.username or "").strip(),
                      ip=ip, outcome=("ok" if ok else "fail"), detail="")
@@ -1261,6 +1291,8 @@ git commit -m "chore: backend login-overhaul plan complete (Plan 1/3)"
 ```
 
 - [ ] **Consolidate the duplicated `fresh_auth` fixture** into `tests/conftest.py` (currently copied in test_auth_bidx/migration/recovery/hashing). Move one canonical copy to conftest, delete the per-file duplicates, run `python3.11 -m pytest -q` to confirm all green.
+
+**DEPLOY HARDENING (infra, not code — deploy files are user-modified):** run uvicorn with `--proxy-headers --forwarded-allow-ips=127.0.0.1` (or rely on CF-Connecting-IP) so X-Forwarded-For can't be spoofed by a direct-to-:8500 connection bypassing the Cloudflare tunnel.
 
 ---
 
