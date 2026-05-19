@@ -3,7 +3,8 @@ ArQuant v1.0 — Auth & Credential Store (사장 피드백 2026-05-16)
 
 Cloudflare Access 제거 → 앱 자체 로그인. 인증/세션 로직은 HYFE_IQC 의 월드퀀트
 계정 로그인 방식을 참조한다:
-  - SQLite + cryptography.Fernet 대칭 암호화 (비밀번호 해시 X — 복호 후 평문 비교)
+  - SQLite + cryptography.Fernet 대칭 암호화 (KIS App Key/Secret·OpenRouter·DART·계좌번호 암호화)
+  - 비밀번호는 argon2id 해시로 저장 (password_hash); blind-index(HMAC) 컬럼으로 계정 복구 지원
   - 불투명 세션 토큰 secrets.token_urlsafe(32), 7일 TTL, 만료 시 자동 삭제
 
 사장 피드백 2026-05-16 (2차): 로그인 정체성을 **사용자가 정한 아이디/비밀번호**로 변경.
@@ -201,7 +202,7 @@ def init() -> None:
             """CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
-                password_enc TEXT NOT NULL,
+                password_enc TEXT NOT NULL,   -- DEPRECATED: 항상 '' (비밀번호는 password_hash=argon2id). 하위호환 위해 컬럼만 유지
                 kis_app_key_enc TEXT NOT NULL,
                 kis_app_secret_enc TEXT NOT NULL,
                 openrouter_key_enc TEXT NOT NULL,
