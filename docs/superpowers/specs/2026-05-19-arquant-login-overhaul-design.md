@@ -64,6 +64,17 @@ HMAC columns:
 attempt (IP, username-or-none, outcome — **never** the factor/key values); generic
 failure text (no "which field was wrong").
 
+**Recovery oracle closure (I1 — final-review fix):** `reset_password_by_factors`
+validates password policy **before** the factor match. A weak-password probe therefore
+returns 400 (policy) regardless of factor correctness — the attacker only learns that
+their own chosen password is weak, which reveals nothing about the account. Factor
+correctness is observable only via an actual policy-valid reset (200), which is a
+destructive + audited operation — the already-accepted "factors ⇒ takeover" trade-off,
+not a stealth non-destructive oracle. (The earlier "policy-after-factors" rationale
+— "don't leak policy compliance to unauthenticated callers" — was mis-grounded:
+password policy is public and the submitted password is attacker-chosen, so
+"your password is weak" carries zero account/factor information.)
+
 **Accepted trade-off (confirmed by owner):** possession of a user's KIS App
 Key+Secret + OpenRouter key ⇒ account takeover. Rate-limit + audit are the compensating
 controls. Documented, not mitigated further in this pass.

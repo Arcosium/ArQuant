@@ -766,12 +766,23 @@ def test_reset_password_by_factors(fresh_auth):
         "fred", "AK2", "AS2", "OR2", "N3wP@ssword!") is True
     assert fresh_auth.verify_password("fred", "N3wP@ssword!")["username"] == "fred"
     assert fresh_auth.verify_password("fred", "OldP@ss123") is None
-    # wrong factor → no reset
+    # wrong factor + policy-valid pw → no reset (False); policy-valid pw used so only
+    # factor correctness is tested here (oracle-closed: weak pw always raises, see below)
     assert fresh_auth.reset_password_by_factors(
-        "fred", "AK2", "AS2", "BAD", "Another1!") is False
-    # weak new pw → policy error
+        "fred", "AK2", "AS2", "BAD", "ValidPass9!") is False
+    # weak new pw → policy error (regardless of factors)
     with pytest.raises(ValueError):
         fresh_auth.reset_password_by_factors("fred", "AK2", "AS2", "OR2", "weak")
+
+def test_reset_password_policy_checked_before_factors_no_oracle(fresh_auth):
+    import pytest
+    fresh_auth.upsert_user("gus", "OldP@ss123", "AKg", "ASg", "ORg", "1-1", "", "", "")
+    # weak pw + WRONG factors → ValueError (NOT False) — same as weak pw + right factors,
+    # so a weak-pw probe cannot distinguish factor correctness (oracle closed)
+    with pytest.raises(ValueError):
+        fresh_auth.reset_password_by_factors("gus", "WRONG", "WRONG", "WRONG", "weak")
+    with pytest.raises(ValueError):
+        fresh_auth.reset_password_by_factors("gus", "AKg", "ASg", "ORg", "weak")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -799,11 +810,12 @@ def find_username_by_factors(kis_app_key: str, kis_app_secret: str,
 
 def reset_password_by_factors(username: str, kis_app_key: str, kis_app_secret: str,
                               openrouter_key: str, new_password: str) -> bool:
-    """아이디 + 세 자격증명이 모두 일치하면 새 비밀번호로 재설정. 정책 위반은
-    ValueError. 일치 실패 시 False(아무 것도 바꾸지 않음).
-
-    순서: 자격증명 검증 → 정책 검사 → 업데이트.
-    자격증명 불일치 시 새 비밀번호 정책은 검사하지 않고 즉시 False 반환."""
+    """비밀번호 정책을 먼저 검사(정책 위반 → ValueError, 팩터 정오와 무관 — 공격자가
+    고른 입력의 약함만 노출, 계정/팩터 정보 무누설: enum 오라클 차단). 그다음 아이디+3팩터
+    완전 일치 시에만 새 비밀번호로 재설정. 불일치 시 False(아무 것도 바꾸지 않음)."""
+    perr = password_policy_error(new_password or "")
+    if perr:
+        raise ValueError(perr)
     if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(openrouter_key)):
         return False
     init()
@@ -815,15 +827,12 @@ def reset_password_by_factors(username: str, kis_app_key: str, kis_app_secret: s
             (_norm(username), a, b, c)).fetchone()
         if not row:
             return False
-        perr = password_policy_error(new_password or "")
-        if perr:
-            raise ValueError(perr)
         conn.execute("UPDATE users SET password_hash=?, password_enc='' WHERE id=?",
                      (hash_password(new_password), int(row["id"])))
     return True
 ```
 
-보안 순서: 신원(아이디+3팩터) 일치 확인 후에만 비밀번호 정책을 검사한다(미인증 호출자에게 정책/팩터 유효성 누설 방지).
+보안 순서(정책-우선, I1 수정): 비밀번호 정책을 **먼저** 검사한다. 비밀번호 정책은 공개 정보이고 제출 비밀번호는 공격자 자신이 고른 값이므로, "당신의 비밀번호가 약합니다"는 계정/팩터에 대한 어떤 정보도 노출하지 않는다. 정책-우선 순서에서는 약한 비밀번호로 요청하면 팩터 정오와 무관하게 항상 ValueError(→400)가 반환되므로, 약한 비밀번호 프로브로 팩터 정확성을 구분하는 스텔스 오라클이 차단된다. 강한 비밀번호로 팩터 정확성을 확인하는 것은 실제 감사된 파괴적 재설정(200)을 요구하므로 — 이미 수용된 "팩터 → 계정 탈취" 트레이드오프이며, 비밀번호 정책 오라클과는 다르다. (이전 계획의 "팩터-우선" 이유인 "미인증 호출자에게 정책 누설 방지"는 위 이유로 재근거가 없음 — 정책-우선이 더 안전하다.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1076,6 +1085,23 @@ def test_recover_password_policy_fail_is_audited_and_400(client, tmp_path):
     lines = (A._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()
     rec = _j.loads(lines[-1])
     assert rec["event"] == "recover_password" and rec["outcome"] == "fail" and rec["detail"] == "policy"
+
+def test_recover_password_weak_pw_is_400_regardless_of_factors(client):
+    # wrong factors + weak pw → 400 (policy), SAME as right factors + weak pw → 400.
+    # No 400/404 split on factor correctness for a weak password ⇒ no stealth oracle.
+    bad = client.post("/api/recover_password", json={
+        "username": "zoe", "kis_app_key": "WRONG", "kis_app_secret": "WRONG",
+        "openrouter_key": "WRONG", "new_password": "weak"})
+    assert bad.status_code == 400
+    good_factors_weak = client.post("/api/recover_password", json={
+        "username": "zoe", "kis_app_key": "AKz", "kis_app_secret": "ASz",
+        "openrouter_key": "ORz", "new_password": "weak"})
+    assert good_factors_weak.status_code == 400
+    # strong pw + wrong factors → 404 generic (no reset happened)
+    strong_wrong = client.post("/api/recover_password", json={
+        "username": "zoe", "kis_app_key": "WRONG", "kis_app_secret": "WRONG",
+        "openrouter_key": "WRONG", "new_password": "BrandN3w$pw"})
+    assert strong_wrong.status_code == 404
 
 def test_client_ip_prefers_cf_connecting_ip(client):
     # CF-Connecting-IP must win over X-Forwarded-For for throttle keying / audit

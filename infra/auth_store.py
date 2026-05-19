@@ -375,11 +375,12 @@ def find_username_by_factors(kis_app_key: str, kis_app_secret: str,
 
 def reset_password_by_factors(username: str, kis_app_key: str, kis_app_secret: str,
                               openrouter_key: str, new_password: str) -> bool:
-    """아이디 + 세 자격증명이 모두 일치하면 새 비밀번호로 재설정. 정책 위반은
-    ValueError. 일치 실패 시 False(아무 것도 바꾸지 않음).
-
-    순서: 자격증명 검증 → 정책 검사 → 업데이트.
-    자격증명 불일치 시 새 비밀번호 정책은 검사하지 않고 즉시 False 반환."""
+    """비밀번호 정책을 먼저 검사(정책 위반 → ValueError, 팩터 정오와 무관 — 공격자가
+    고른 입력의 약함만 노출, 계정/팩터 정보 무누설: enum 오라클 차단). 그다음 아이디+3팩터
+    완전 일치 시에만 새 비밀번호로 재설정. 불일치 시 False(아무 것도 바꾸지 않음)."""
+    perr = password_policy_error(new_password or "")
+    if perr:
+        raise ValueError(perr)
     if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(openrouter_key)):
         return False
     init()
@@ -391,9 +392,6 @@ def reset_password_by_factors(username: str, kis_app_key: str, kis_app_secret: s
             (_norm(username), a, b, c)).fetchone()
         if not row:
             return False
-        perr = password_policy_error(new_password or "")
-        if perr:
-            raise ValueError(perr)
         conn.execute("UPDATE users SET password_hash=?, password_enc='' WHERE id=?",
                      (hash_password(new_password), int(row["id"])))
     return True

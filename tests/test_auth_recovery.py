@@ -15,7 +15,7 @@ def test_reset_password_by_factors(fresh_auth):
     assert fresh_auth.verify_password("fred", "N3wP@ssword!")["username"] == "fred"
     assert fresh_auth.verify_password("fred", "OldP@ss123") is None
     assert fresh_auth.reset_password_by_factors(
-        "fred", "AK2", "AS2", "BAD", "Another1!") is False
+        "fred", "AK2", "AS2", "BAD", "ValidPass9!") is False
     with pytest.raises(ValueError):
         fresh_auth.reset_password_by_factors("fred", "AK2", "AS2", "OR2", "weak")
 
@@ -48,3 +48,13 @@ def test_audit_ts_is_iso8601_utc(fresh_auth):
     parsed = datetime.fromisoformat(rec["ts"])
     assert parsed.tzinfo is not None
     assert rec["ip"] == ""   # None ip normalized to ""
+
+def test_reset_password_policy_checked_before_factors_no_oracle(fresh_auth):
+    import pytest
+    fresh_auth.upsert_user("gus", "OldP@ss123", "AKg", "ASg", "ORg", "1-1", "", "", "")
+    # weak pw + WRONG factors → ValueError (NOT False) — same as weak pw + right factors,
+    # so a weak-pw probe cannot distinguish factor correctness (oracle closed)
+    with pytest.raises(ValueError):
+        fresh_auth.reset_password_by_factors("gus", "WRONG", "WRONG", "WRONG", "weak")
+    with pytest.raises(ValueError):
+        fresh_auth.reset_password_by_factors("gus", "AKg", "ASg", "ORg", "weak")
