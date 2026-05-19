@@ -400,6 +400,37 @@ def _set_password_hash(user_id: int, new_hash: str, clear_enc: bool = True) -> N
                          (new_hash, int(user_id)))
 
 
+def migrate_passwords_and_bidx() -> Dict[str, int]:
+    """부팅 1회 실행(멱등). password_enc→argon2 해시 승격 + 누락된 블라인드
+    인덱스 백필. 이미 마이그레이션된 행은 건너뜀. {'pw':n,'bidx':m} 반환."""
+    init()
+    stats = {"pw": 0, "bidx": 0}
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, password_enc, password_hash, kis_app_key_enc, "
+            "kis_app_secret_enc, openrouter_key_enc, kis_app_key_bidx FROM users"
+        ).fetchall()
+        for r in rows:
+            updates: Dict[str, Any] = {}
+            if not (r["password_hash"] or "") and (r["password_enc"] or ""):
+                updates["password_hash"] = hash_password(decrypt(r["password_enc"]))
+                updates["password_enc"] = ""
+                stats["pw"] += 1
+            if not (r["kis_app_key_bidx"] or ""):
+                updates["kis_app_key_bidx"] = bidx(decrypt(r["kis_app_key_enc"]))
+                updates["kis_app_secret_bidx"] = bidx(decrypt(r["kis_app_secret_enc"]))
+                updates["openrouter_key_bidx"] = bidx(decrypt(r["openrouter_key_enc"]))
+                stats["bidx"] += 1
+            if updates:
+                sets = ",".join(f"{k}=?" for k in updates)
+                conn.execute(f"UPDATE users SET {sets} WHERE id=?",
+                             (*updates.values(), int(r["id"])))
+    if stats["pw"] or stats["bidx"]:
+        logger.info("auth 마이그레이션 완료: 해시승격 %d, bidx백필 %d",
+                    stats["pw"], stats["bidx"])
+    return stats
+
+
 def _mask(s: str, keep: int = 4) -> str:
     s = s or ""
     return (s[:keep] + "…" + s[-2:]) if len(s) > keep + 2 else "…"

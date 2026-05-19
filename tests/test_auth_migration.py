@@ -34,3 +34,21 @@ def test_upsert_stores_hash_and_bidx_not_plaintext(fresh_auth):
     assert r["kis_app_key_bidx"] == fresh_auth.bidx("AK")
     assert r["kis_app_secret_bidx"] == fresh_auth.bidx("AS")
     assert r["openrouter_key_bidx"] == fresh_auth.bidx("OR")
+
+def test_one_shot_migration_is_idempotent(fresh_auth):
+    uid = fresh_auth.upsert_user("dave", "Migrate$99x", "AK", "AS", "OR",
+                                 "1-1", "", "", "")
+    import sqlite3
+    con = sqlite3.connect(fresh_auth._DB_PATH)
+    con.execute("UPDATE users SET password_hash='', password_enc=?, "
+                "kis_app_key_bidx='', kis_app_secret_bidx='', openrouter_key_bidx='' "
+                "WHERE id=?", (fresh_auth.encrypt("Migrate$99x"), uid))
+    con.commit(); con.close()
+    s1 = fresh_auth.migrate_passwords_and_bidx()
+    assert s1 == {"pw": 1, "bidx": 1}
+    s2 = fresh_auth.migrate_passwords_and_bidx()          # idempotent
+    assert s2 == {"pw": 0, "bidx": 0}
+    con = sqlite3.connect(fresh_auth._DB_PATH); con.row_factory = sqlite3.Row
+    r = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone(); con.close()
+    assert r["password_hash"].startswith("$argon2id$") and r["password_enc"] == ""
+    assert r["kis_app_key_bidx"] == fresh_auth.bidx("AK")

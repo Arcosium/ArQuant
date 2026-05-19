@@ -557,6 +557,10 @@ if SD.exists(): app.mount("/static", StaticFiles(directory=str(SD)), name="stati
 @app.on_event("startup")
 async def _auth_bootstrap():
     try:
+        try:
+            auth_store.migrate_passwords_and_bidx()
+        except Exception as _e:
+            logging.getLogger("auth_store").error("부팅 마이그레이션 실패: %s", _e)
         seeded = auth_store.bootstrap_from_env()
         if seeded:
             logging.getLogger("AUTH").info("부팅 시드: .env → 프로필 user_id=%s", seeded)
