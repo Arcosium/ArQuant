@@ -560,7 +560,7 @@ git commit -m "feat(auth): argon2 verify_password with legacy migrate-on-login"
 - Modify: `server/app.py` — call it in the existing startup event (near line 557)
 - Test: `tests/test_auth_migration.py` (add)
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 Append to `tests/test_auth_migration.py`:
 
@@ -582,12 +582,33 @@ def test_one_shot_migration_is_idempotent(fresh_auth):
     r = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone(); con.close()
     assert r["password_hash"].startswith("$argon2id$") and r["password_enc"] == ""
     assert r["kis_app_key_bidx"] == fresh_auth.bidx("AK")
+
+def test_migration_skips_row_with_corrupt_enc_no_data_loss(fresh_auth):
+    uid = fresh_auth.upsert_user("eve", "Corrupt$pw9", "AK", "AS", "OR",
+                                 "1-1", "", "", "")
+    import sqlite3
+    con = sqlite3.connect(fresh_auth._DB_PATH)
+    # legacy + CORRUPT password_enc (not valid Fernet), bidx cleared
+    con.execute("UPDATE users SET password_hash='', password_enc='not-a-valid-fernet-token', "
+                "kis_app_key_bidx='', kis_app_secret_bidx='', openrouter_key_bidx='' "
+                "WHERE id=?", (uid,))
+    con.commit(); con.close()
+    stats = fresh_auth.migrate_passwords_and_bidx()
+    # corrupt row must be skipped, NOT counted, NOT mutated
+    assert stats == {"pw": 0, "bidx": 0}
+    con = sqlite3.connect(fresh_auth._DB_PATH); con.row_factory = sqlite3.Row
+    r = con.execute("SELECT password_hash, password_enc, kis_app_key_bidx "
+                     "FROM users WHERE id=?", (uid,)).fetchone(); con.close()
+    # password_enc preserved (NOT blanked), no bogus hash, no bogus bidx written
+    assert r["password_enc"] == "not-a-valid-fernet-token"
+    assert r["password_hash"] == ""
+    assert r["kis_app_key_bidx"] == ""
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python3.11 -m pytest tests/test_auth_migration.py::test_one_shot_migration_is_idempotent -v`
-Expected: FAIL — no attribute `migrate_passwords_and_bidx`
+Run: `python3.11 -m pytest tests/test_auth_migration.py::test_one_shot_migration_is_idempotent tests/test_auth_migration.py::test_migration_skips_row_with_corrupt_enc_no_data_loss -v`
+Expected: FAIL — no attribute `migrate_passwords_and_bidx` (first) / corrupt row gets counted (second)
 
 - [ ] **Step 3: Implement**
 
@@ -596,55 +617,101 @@ Add to `infra/auth_store.py` after `_set_password_hash`:
 ```python
 def migrate_passwords_and_bidx() -> Dict[str, int]:
     """부팅 1회 실행(멱등). password_enc→argon2 해시 승격 + 누락된 블라인드
-    인덱스 백필. 이미 마이그레이션된 행은 건너뜀. {'pw':n,'bidx':m} 반환."""
+    인덱스 백필. 이미 마이그레이션된 행은 건너뜀. {'pw':n,'bidx':m} 반환.
+
+    복호 실패(InvalidToken 또는 기타 예외) 시 해당 행을 건너뜀 — 데이터 훼손 방지.
+    FernetKeyLost 는 _ensure_fernet 에서 루프 진입 전에 발생하므로 여기서 잡지 않음."""
     init()
     stats = {"pw": 0, "bidx": 0}
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
-            "SELECT id, password_enc, password_hash, kis_app_key_enc, "
-            "kis_app_secret_enc, openrouter_key_enc, kis_app_key_bidx FROM users"
+            "SELECT id, password_enc, password_hash, "
+            "kis_app_key_enc, kis_app_secret_enc, openrouter_key_enc, "
+            "kis_app_key_bidx, kis_app_secret_bidx, openrouter_key_bidx FROM users"
         ).fetchall()
         for r in rows:
-            updates: Dict[str, Any] = {}
-            if not (r["password_hash"] or "") and (r["password_enc"] or ""):
-                updates["password_hash"] = hash_password(decrypt(r["password_enc"]))
-                updates["password_enc"] = ""
-                stats["pw"] += 1
-            if not (r["kis_app_key_bidx"] or ""):
-                updates["kis_app_key_bidx"] = bidx(decrypt(r["kis_app_key_enc"]))
-                updates["kis_app_secret_bidx"] = bidx(decrypt(r["kis_app_secret_enc"]))
-                updates["openrouter_key_bidx"] = bidx(decrypt(r["openrouter_key_enc"]))
-                stats["bidx"] += 1
-            if updates:
-                sets = ",".join(f"{k}=?" for k in updates)
-                conn.execute(f"UPDATE users SET {sets} WHERE id=?",
-                             (*updates.values(), int(r["id"])))
+            try:
+                updates: Dict[str, Any] = {}
+                did_pw = False
+                did_bidx = False
+
+                # ── 비밀번호 승격 경로 ──────────────────────────────────────
+                if not (r["password_hash"] or "") and (r["password_enc"] or ""):
+                    dec_pw = decrypt(r["password_enc"])
+                    if not dec_pw:
+                        # 복호 실패 — 행 보존, 스킵 (데이터 훼손 방지)
+                        logger.error(
+                            "auth 마이그레이션: user_id=%s password_enc 복호 실패 — 행 보존(스킵)",
+                            r["id"])
+                        continue
+                    updates["password_hash"] = hash_password(dec_pw)
+                    updates["password_enc"] = ""
+                    did_pw = True
+
+                # ── bidx 백필 경로 ─────────────────────────────────────────
+                if not (r["kis_app_key_bidx"] or ""):
+                    enc_key = r["kis_app_key_enc"] or ""
+                    enc_secret = r["kis_app_secret_enc"] or ""
+                    enc_or = r["openrouter_key_enc"] or ""
+                    if enc_key and enc_secret and enc_or:
+                        dec_key = decrypt(enc_key)
+                        dec_secret = decrypt(enc_secret)
+                        dec_or = decrypt(enc_or)
+                        if not (dec_key and dec_secret and dec_or):
+                            # 하나 이상 복호 실패 — 행 전체 업데이트 없음 (부분 쓰기 방지)
+                            logger.error(
+                                "auth 마이그레이션: user_id=%s *_enc 복호 실패 — bidx 백필 스킵",
+                                r["id"])
+                            continue
+                        updates["kis_app_key_bidx"] = bidx(dec_key)
+                        updates["kis_app_secret_bidx"] = bidx(dec_secret)
+                        updates["openrouter_key_bidx"] = bidx(dec_or)
+                        did_bidx = True
+                    # enc 자체가 비어있는 경우(빈 enc) — bidx 백필 대상 아님, 통과
+
+                # 여기까지 오면 updates 는 안전하게 쓸 수 있는 값들만 포함
+                if updates:
+                    sets = ",".join(f"{k}=?" for k in updates)
+                    conn.execute(f"UPDATE users SET {sets} WHERE id=?",
+                                 (*updates.values(), int(r["id"])))
+                if did_pw:
+                    stats["pw"] += 1
+                if did_bidx:
+                    stats["bidx"] += 1
+            except Exception as e:
+                logger.error(
+                    "auth 마이그레이션 행 실패 user_id=%s: %s — 스킵", r["id"], e)
+                continue
     if stats["pw"] or stats["bidx"]:
         logger.info("auth 마이그레이션 완료: 해시승격 %d, bidx백필 %d",
                     stats["pw"], stats["bidx"])
     return stats
 ```
 
-In `server/app.py`, find the startup event at line 557 (`@app.on_event("startup")` whose body calls `auth_store.bootstrap_from_env()`). Add `auth_store.migrate_passwords_and_bidx()` on the line immediately **before** the `seeded = auth_store.bootstrap_from_env()` call (line ~560), wrapped defensively:
+In `server/app.py`, find the startup event (`@app.on_event("startup")` whose body calls `auth_store.bootstrap_from_env()`). Add `auth_store.migrate_passwords_and_bidx()` immediately **before** the `seeded = auth_store.bootstrap_from_env()` call, with `FernetKeyLost` handled loudly (it signals total unrecoverability) and other exceptions swallowed:
 
 ```python
         try:
             auth_store.migrate_passwords_and_bidx()
-        except Exception as _e:
-            logging.getLogger("auth_store").error("부팅 마이그레이션 실패: %s", _e)
+        except auth_store.FernetKeyLost:
+            logging.getLogger("auth_store").critical(
+                "부팅 마이그레이션 중단 — Fernet 키 분실(전 계정 복호 불능). 키 복구 필요.")
+            raise
+        except Exception as e:
+            logging.getLogger("auth_store").error("부팅 마이그레이션 실패(계속): %s", e)
         seeded = auth_store.bootstrap_from_env()
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 4: Run tests to verify they pass**
 
 Run: `python3.11 -m pytest tests/test_auth_migration.py -v`
-Expected: PASS (all)
+Expected: PASS (all 4)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add infra/auth_store.py server/app.py tests/test_auth_migration.py
-git commit -m "feat(auth): one-shot idempotent startup hash+bidx migration"
+git commit -m "fix(auth): migration must not corrupt rows on decrypt failure; surface FernetKeyLost"
 ```
 
 ---

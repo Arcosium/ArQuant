@@ -559,8 +559,12 @@ async def _auth_bootstrap():
     try:
         try:
             auth_store.migrate_passwords_and_bidx()
-        except Exception as _e:
-            logging.getLogger("auth_store").error("부팅 마이그레이션 실패: %s", _e)
+        except auth_store.FernetKeyLost:
+            logging.getLogger("auth_store").critical(
+                "부팅 마이그레이션 중단 — Fernet 키 분실(전 계정 복호 불능). 키 복구 필요.")
+            raise
+        except Exception as e:
+            logging.getLogger("auth_store").error("부팅 마이그레이션 실패(계속): %s", e)
         seeded = auth_store.bootstrap_from_env()
         if seeded:
             logging.getLogger("AUTH").info("부팅 시드: .env → 프로필 user_id=%s", seeded)

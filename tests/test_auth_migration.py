@@ -52,3 +52,24 @@ def test_one_shot_migration_is_idempotent(fresh_auth):
     r = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone(); con.close()
     assert r["password_hash"].startswith("$argon2id$") and r["password_enc"] == ""
     assert r["kis_app_key_bidx"] == fresh_auth.bidx("AK")
+
+def test_migration_skips_row_with_corrupt_enc_no_data_loss(fresh_auth):
+    uid = fresh_auth.upsert_user("eve", "Corrupt$pw9", "AK", "AS", "OR",
+                                 "1-1", "", "", "")
+    import sqlite3
+    con = sqlite3.connect(fresh_auth._DB_PATH)
+    # legacy + CORRUPT password_enc (not valid Fernet), bidx cleared
+    con.execute("UPDATE users SET password_hash='', password_enc='not-a-valid-fernet-token', "
+                "kis_app_key_bidx='', kis_app_secret_bidx='', openrouter_key_bidx='' "
+                "WHERE id=?", (uid,))
+    con.commit(); con.close()
+    stats = fresh_auth.migrate_passwords_and_bidx()
+    # corrupt row must be skipped, NOT counted, NOT mutated
+    assert stats == {"pw": 0, "bidx": 0}
+    con = sqlite3.connect(fresh_auth._DB_PATH); con.row_factory = sqlite3.Row
+    r = con.execute("SELECT password_hash, password_enc, kis_app_key_bidx "
+                     "FROM users WHERE id=?", (uid,)).fetchone(); con.close()
+    # password_enc preserved (NOT blanked), no bogus hash, no bogus bidx written
+    assert r["password_enc"] == "not-a-valid-fernet-token"
+    assert r["password_hash"] == ""
+    assert r["kis_app_key_bidx"] == ""

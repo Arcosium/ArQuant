@@ -402,29 +402,71 @@ def _set_password_hash(user_id: int, new_hash: str, clear_enc: bool = True) -> N
 
 def migrate_passwords_and_bidx() -> Dict[str, int]:
     """부팅 1회 실행(멱등). password_enc→argon2 해시 승격 + 누락된 블라인드
-    인덱스 백필. 이미 마이그레이션된 행은 건너뜀. {'pw':n,'bidx':m} 반환."""
+    인덱스 백필. 이미 마이그레이션된 행은 건너뜀. {'pw':n,'bidx':m} 반환.
+
+    복호 실패(InvalidToken 또는 기타 예외) 시 해당 행을 건너뜀 — 데이터 훼손 방지.
+    FernetKeyLost 는 _ensure_fernet 에서 루프 진입 전에 발생하므로 여기서 잡지 않음."""
     init()
     stats = {"pw": 0, "bidx": 0}
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
-            "SELECT id, password_enc, password_hash, kis_app_key_enc, "
-            "kis_app_secret_enc, openrouter_key_enc, kis_app_key_bidx FROM users"
+            "SELECT id, password_enc, password_hash, "
+            "kis_app_key_enc, kis_app_secret_enc, openrouter_key_enc, "
+            "kis_app_key_bidx, kis_app_secret_bidx, openrouter_key_bidx FROM users"
         ).fetchall()
         for r in rows:
-            updates: Dict[str, Any] = {}
-            if not (r["password_hash"] or "") and (r["password_enc"] or ""):
-                updates["password_hash"] = hash_password(decrypt(r["password_enc"]))
-                updates["password_enc"] = ""
-                stats["pw"] += 1
-            if not (r["kis_app_key_bidx"] or ""):
-                updates["kis_app_key_bidx"] = bidx(decrypt(r["kis_app_key_enc"]))
-                updates["kis_app_secret_bidx"] = bidx(decrypt(r["kis_app_secret_enc"]))
-                updates["openrouter_key_bidx"] = bidx(decrypt(r["openrouter_key_enc"]))
-                stats["bidx"] += 1
-            if updates:
-                sets = ",".join(f"{k}=?" for k in updates)
-                conn.execute(f"UPDATE users SET {sets} WHERE id=?",
-                             (*updates.values(), int(r["id"])))
+            try:
+                updates: Dict[str, Any] = {}
+                did_pw = False
+                did_bidx = False
+
+                # ── 비밀번호 승격 경로 ──────────────────────────────────────
+                if not (r["password_hash"] or "") and (r["password_enc"] or ""):
+                    dec_pw = decrypt(r["password_enc"])
+                    if not dec_pw:
+                        # 복호 실패 — 행 보존, 스킵 (데이터 훼손 방지)
+                        logger.error(
+                            "auth 마이그레이션: user_id=%s password_enc 복호 실패 — 행 보존(스킵)",
+                            r["id"])
+                        continue
+                    updates["password_hash"] = hash_password(dec_pw)
+                    updates["password_enc"] = ""
+                    did_pw = True
+
+                # ── bidx 백필 경로 ─────────────────────────────────────────
+                if not (r["kis_app_key_bidx"] or ""):
+                    enc_key = r["kis_app_key_enc"] or ""
+                    enc_secret = r["kis_app_secret_enc"] or ""
+                    enc_or = r["openrouter_key_enc"] or ""
+                    if enc_key and enc_secret and enc_or:
+                        dec_key = decrypt(enc_key)
+                        dec_secret = decrypt(enc_secret)
+                        dec_or = decrypt(enc_or)
+                        if not (dec_key and dec_secret and dec_or):
+                            # 하나 이상 복호 실패 — 행 전체 업데이트 없음 (부분 쓰기 방지)
+                            logger.error(
+                                "auth 마이그레이션: user_id=%s *_enc 복호 실패 — bidx 백필 스킵",
+                                r["id"])
+                            continue
+                        updates["kis_app_key_bidx"] = bidx(dec_key)
+                        updates["kis_app_secret_bidx"] = bidx(dec_secret)
+                        updates["openrouter_key_bidx"] = bidx(dec_or)
+                        did_bidx = True
+                    # enc 자체가 비어있는 경우(빈 enc) — bidx 백필 대상 아님, 통과
+
+                # 여기까지 오면 updates 는 안전하게 쓸 수 있는 값들만 포함
+                if updates:
+                    sets = ",".join(f"{k}=?" for k in updates)
+                    conn.execute(f"UPDATE users SET {sets} WHERE id=?",
+                                 (*updates.values(), int(r["id"])))
+                if did_pw:
+                    stats["pw"] += 1
+                if did_bidx:
+                    stats["bidx"] += 1
+            except Exception as e:
+                logger.error(
+                    "auth 마이그레이션 행 실패 user_id=%s: %s — 스킵", r["id"], e)
+                continue
     if stats["pw"] or stats["bidx"]:
         logger.info("auth 마이그레이션 완료: 해시승격 %d, bidx백필 %d",
                     stats["pw"], stats["bidx"])
