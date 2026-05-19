@@ -23,8 +23,8 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
 .badge-idle{background:#64748b20;color:#94a3b8}.badge-monitoring{background:#06b6d420;color:var(--acc);animation:pls 2s infinite}
 .badge-running{background:#f59e0b20;color:var(--amb);animation:pls 1.5s infinite}.badge-stopped{background:#ef444420;color:var(--red)}
 @keyframes pls{0%,100%{opacity:1}50%{opacity:.5}}
-/* 5-3: 모바일 배지 미러 — 데스크톱에서는 미러 숨김, 원본 표시 */
-#badgeMirror{display:none;margin-left:6px;vertical-align:middle}
+/* 5-3: 배지는 통신 로그 헤더(badgeMirror)에만 표시 — 원본(#badge)은 헤더에서 제거됨 */
+#badgeMirror{display:inline-flex;margin-left:6px;vertical-align:middle}
 .hdr-btns{display:flex;gap:6px}
 
 .sidebar{background:var(--surface);border-right:1px solid var(--border);padding:12px 0;display:flex;flex-direction:column;min-height:0;overflow:hidden}
@@ -219,9 +219,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
   .control-wrap{order:0;flex:1 1 auto;min-width:0}  /* 입력창 같은 줄에 보이게 */
   .dir-in{font-size:13px;min-width:0}
   canvas{max-width:100%}
-  /* 5-3: 모바일 — 원본 배지 숨김, 통신 로그 헤더 미러 표시 */
-  #badge{display:none!important}
-  #badgeMirror{display:inline-flex}
+  /* 5-3: 원본 #badge 는 헤더에서 제거됨 — 미러는 항상 표시 (CSS 위에서 설정됨) */
 }
 </style>
 </head>
@@ -270,9 +268,8 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       </div>
       <!-- 아이디 찾기 폼 -->
       <div id="recIdPanel">
-        <div class="fld"><label for="rec_id_appkey">한국투자증권 App Key</label><input id="rec_id_appkey" autocomplete="off" placeholder="KIS App Key"></div>
+        <div class="fld"><label for="rec_id_acctno">한국투자증권 계좌번호</label><input id="rec_id_acctno" autocomplete="off" placeholder="예: 12345678-01"></div>
         <div class="fld"><label for="rec_id_appsecret">한국투자증권 App Secret</label><input id="rec_id_appsecret" type="password" autocomplete="off" placeholder="KIS App Secret"></div>
-        <div class="fld"><label for="rec_id_orkey">OpenRouter API Key</label><input id="rec_id_orkey" autocomplete="off" placeholder="OpenRouter API Key"></div>
         <div id="recIdErr" style="display:none;font-size:11px;color:#f87171;background:#3b1a1a;border:1px solid #5b2626;border-radius:7px;padding:7px 10px;margin-bottom:8px"></div>
         <div id="recIdOk" style="display:none;font-size:12px;color:#34d399;background:#0c2a1e;border:1px solid #065f46;border-radius:7px;padding:8px 10px;margin-bottom:8px"></div>
         <button type="button" onclick="doRecoverId()" style="width:100%;padding:10px;border-radius:9px;border:0;background:linear-gradient(135deg,#6366f1,#06b6d4);color:#fff;font-weight:700;font-size:12px;cursor:pointer;font-family:inherit">아이디 찾기</button>
@@ -280,9 +277,8 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <!-- 비밀번호 재설정 폼 -->
       <div id="recPwPanel" style="display:none">
         <div class="fld"><label for="rec_pw_user">아이디</label><input id="rec_pw_user" autocomplete="username" placeholder="등록된 아이디"></div>
-        <div class="fld"><label for="rec_pw_appkey">한국투자증권 App Key</label><input id="rec_pw_appkey" autocomplete="off" placeholder="KIS App Key"></div>
+        <div class="fld"><label for="rec_pw_acctno">한국투자증권 계좌번호</label><input id="rec_pw_acctno" autocomplete="off" placeholder="예: 12345678-01"></div>
         <div class="fld"><label for="rec_pw_appsecret">한국투자증권 App Secret</label><input id="rec_pw_appsecret" type="password" autocomplete="off" placeholder="KIS App Secret"></div>
-        <div class="fld"><label for="rec_pw_orkey">OpenRouter API Key</label><input id="rec_pw_orkey" autocomplete="off" placeholder="OpenRouter API Key"></div>
         <div class="fld"><label for="rec_pw_newpw">새 비밀번호 <span style="color:#7a869c">(10자 이상 · 특수문자 1개 이상)</span></label><input id="rec_pw_newpw" type="password" autocomplete="new-password" placeholder="새 비밀번호"></div>
         <div id="recPwHint" style="font-size:11px;margin:-6px 0 9px"></div>
         <div id="recPwErr" style="display:none;font-size:11px;color:#f87171;background:#3b1a1a;border:1px solid #5b2626;border-radius:7px;padding:7px 10px;margin-bottom:8px"></div>
@@ -290,6 +286,20 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
         <button type="button" onclick="doRecoverPw()" style="width:100%;padding:10px;border-radius:9px;border:0;background:linear-gradient(135deg,#6366f1,#06b6d4);color:#fff;font-weight:700;font-size:12px;cursor:pointer;font-family:inherit">비밀번호 재설정</button>
       </div>
     </div>
+  </div>
+</div>
+<div id="profileOv" style="position:fixed;inset:0;z-index:9998;display:none;align-items:center;justify-content:center;background:#0b0f1af5">
+  <div style="background:#11161f;border:1px solid #2a3344;border-radius:14px;padding:22px;width:min(440px,92vw);max-height:88vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <div><b id="pf_user"></b> <span id="pf_admin" style="display:none;font-size:10px;color:#fbbf24;border:1px solid #fbbf24;border-radius:5px;padding:1px 6px;margin-left:6px">ADMIN</span></div>
+      <button onclick="closeProfile()" class="btn btn-ghost">✕</button>
+    </div>
+    <div class="pf-sec"><button class="btn" onclick="pfLogout()">로그아웃</button></div>
+    <div class="pf-sec"><b>비밀번호 변경</b><input id="pf_cur" type="password" placeholder="현재 비밀번호"><input id="pf_new" type="password" placeholder="새 비밀번호(10자+특수문자)"><button class="btn" onclick="pfChangePw()">변경</button> <span id="pf_pwmsg"></span></div>
+    <div class="pf-sec"><b>정보 변경</b><input id="pf_or" placeholder="OpenRouter Key(미입력=유지)"><input id="pf_ak" placeholder="KIS App Key"><input id="pf_as" placeholder="KIS App Secret"><input id="pf_acct2" placeholder="한국투자증권 계좌번호"><input id="pf_url" placeholder="KIS Base URL"><button class="btn" onclick="pfSaveCreds()">저장</button> <span id="pf_cmsg"></span></div>
+    <div class="pf-sec"><b>사장님 상시 지시사항</b><div id="pf_dirs"></div><input id="pf_dir" placeholder="새 지시사항"><button class="btn" onclick="pfAddDir()">추가</button></div>
+    <div class="pf-sec" id="pf_admin_sec" style="display:none"><b>회원 관리 (ADMIN)</b><div id="pf_members"></div></div>
+    <div class="pf-sec"><button class="btn" style="color:#fca5a5" onclick="pfDeleteAccount()">회원 탈퇴</button></div>
   </div>
 </div>
 <style>
@@ -303,8 +313,9 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
   #loginOv.reg #recoverLink,#loginOv.reg #recoverPanel{display:none!important}
   /* 5-4: 모바일 safe-area — 등록 폼 하단이 홈바에 안 가려지도록 */
   #loginOv>div{padding-bottom:max(24px,calc(env(safe-area-inset-bottom,0px) + 28px))}
-  #acctChip{font-size:11px;color:#fca5a5;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);border-radius:6px;padding:4px 11px;cursor:pointer;font-weight:600}
-  #acctChip:hover{background:rgba(239,68,68,.2)}
+  #acctChip{font-size:11px;color:#cbd5e1;background:#1a2231;border:1px solid #2a3344;border-radius:6px;padding:4px 11px;cursor:pointer;font-weight:600}
+  #acctChip:hover{background:#222c3d}
+  .pf-sec{border-top:1px solid #232c3b;padding:12px 0}.pf-sec input{width:100%;box-sizing:border-box;margin:4px 0;padding:8px;border-radius:7px;border:1px solid #2a3344;background:#0e131d;color:#e8edf6}
 </style>
 <div class="app">
   <header class="header">
@@ -315,8 +326,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <a id="apiCost" href="https://openrouter.ai/settings/credits" target="_blank" rel="noopener" title="최근 사이클 API 추정 비용 (USD) — 클릭하면 OpenRouter 크레딧 페이지로 이동" style="font-size:11px;color:var(--dim);background:var(--s2);border-radius:6px;padding:3px 10px;border:1px solid var(--border);text-decoration:none;cursor:pointer">💵 $0.00/cycle</a>
       <!-- 사장 피드백 2026-05-18: 운용지원실장 피드백 on/off 토글 (ADMIN 전용 — 기본 숨김) -->
       <button id="opsToggle" onclick="toggleOpsFeedback()" title="운용지원실장 피드백(코드 자동 개선·재시작) on/off — ADMIN 전용" style="display:none;font-size:11px;color:var(--dim);background:var(--s2);border-radius:6px;padding:3px 10px;border:1px solid var(--border);cursor:pointer">🛠 운용지원 …</button>
-      <div id="acctChip" title="로그아웃">🚪 로그아웃</div>
-      <div id="badge" class="badge badge-idle">IDLE</div>
+      <div id="acctChip" title="프로필">👤</div>
     </div>
   </header>
   <aside class="sidebar">
@@ -503,9 +513,9 @@ function setAuthMode(reg){
   ['f_or','f_acct'].forEach(id=>{document.getElementById(id).required=reg;});
 }
 function renderAcct(a){
-  // 사장 피드백 2026-05-16: '사장님(.env 시드)' 라벨 표시 제거 → 그 자리는 로그아웃 버튼 고정.
+  // 사장 피드백 2026-05-16: '사장님(.env 시드)' 라벨 표시 제거 → 그 자리는 프로필 버튼 고정.
   const c=document.getElementById('acctChip');
-  c.textContent='🚪 로그아웃';
+  c.textContent='👤';
 }
 let _appStarted=false;
 function startApp(){ if(_appStarted)return; _appStarted=true; replayLog(); connectWS();
@@ -516,11 +526,7 @@ function startApp(){ if(_appStarted)return; _appStarted=true; replayLog(); conne
 document.addEventListener('DOMContentLoaded',()=>{
   document.getElementById('tabLogin').onclick=()=>setAuthMode(false);
   document.getElementById('tabReg').onclick=()=>setAuthMode(true);
-  document.getElementById('acctChip').onclick=async()=>{
-    if(!confirm('로그아웃 하시겠습니까? (다른 계정으로 다시 로그인 가능)'))return;
-    try{await fetch(API+'/api/logout',{method:'POST'});}catch(_){}
-    setToken('');location.reload();
-  };
+  document.getElementById('acctChip').onclick=()=>openProfile();
   // 비밀번호 정책(10자↑ · 특수문자 1개↑) 실시간 힌트 — 서버가 최종 강제
   function pwError(p){
     if((p||'').length<10) return '10자 이상 필요';
@@ -582,6 +588,58 @@ document.addEventListener('DOMContentLoaded',()=>{
     finally{btn.disabled=false;btn.textContent=reg?'등록하고 시작':'로그인';}
   });
 });
+// ── 프로필 모달 (Task 7) ──────────────────────────────────────────────────────
+async function openProfile(){
+  const m=await fetch(API+'/api/me').then(r=>r.json()).catch(()=>({}));
+  document.getElementById('pf_user').textContent=m.username||'계정';
+  document.getElementById('pf_admin').style.display=m.is_admin?'inline-block':'none';
+  document.getElementById('pf_admin_sec').style.display=m.is_admin?'block':'none';
+  if(m.is_admin)loadMembers();
+  loadDirs();
+  document.getElementById('profileOv').style.display='flex';
+}
+function closeProfile(){document.getElementById('profileOv').style.display='none';}
+async function pfLogout(){await fetch(API+'/api/logout',{method:'POST'});location.reload();}
+async function pfChangePw(){
+  const r=await fetch(API+'/api/profile/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current:document.getElementById('pf_cur').value,new:document.getElementById('pf_new').value})});
+  document.getElementById('pf_pwmsg').textContent=r.ok?'변경됨':((await r.json()).detail||'실패');}
+async function pfSaveCreds(){
+  const g=id=>document.getElementById(id).value,b={};
+  if(g('pf_or'))b.openrouter_key=g('pf_or');if(g('pf_ak'))b.kis_app_key=g('pf_ak');
+  if(g('pf_as'))b.kis_app_secret=g('pf_as');if(g('pf_acct2'))b.kis_account_no=g('pf_acct2');
+  if(g('pf_url'))b.kis_base_url=g('pf_url');
+  const r=await fetch(API+'/api/profile/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+  document.getElementById('pf_cmsg').textContent=r.ok?'저장됨':((await r.json()).detail||'실패');}
+async function loadDirs(){
+  const d=((await fetch(API+'/api/profile/directives').then(r=>r.json()))||{}).directives||[];
+  const box=document.getElementById('pf_dirs');box.textContent='';
+  if(!d.length){const i=document.createElement('i');i.style.color='#7a869c';i.textContent='없음';box.appendChild(i);return;}
+  d.forEach(x=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;gap:6px;padding:3px 0';
+    const s=document.createElement('span');s.textContent=x.text;
+    const btn=document.createElement('button');btn.textContent='✕';btn.onclick=()=>pfDelDir(x.id);
+    row.appendChild(s);row.appendChild(btn);box.appendChild(row);});}
+async function pfAddDir(){const t=document.getElementById('pf_dir');if(!t.value.trim())return;
+  await fetch(API+'/api/profile/directives',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t.value})});t.value='';loadDirs();}
+async function pfDelDir(id){await fetch(API+'/api/profile/directives/'+encodeURIComponent(id),{method:'DELETE'});loadDirs();}
+async function loadMembers(){
+  const r=await fetch(API+'/api/admin/members');const box=document.getElementById('pf_members');box.textContent='';
+  if(!r.ok){box.textContent='권한 없음';return;}
+  const ms=((await r.json())||{}).members||[];
+  ms.forEach(m=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;gap:6px;padding:4px 0;border-bottom:1px solid #1c2533';
+    const s=document.createElement('span');s.textContent=m.username+' ';
+    if(m.is_admin){const a=document.createElement('b');a.style.color='#fbbf24';a.textContent='ADMIN ';s.appendChild(a);}
+    const mode=document.createElement('span');mode.style.color=m.is_mock?'#fbbf24':'#34d399';mode.textContent=m.is_mock?'모의':'실거래';s.appendChild(mode);
+    row.appendChild(s);
+    if(!m.is_admin){const btn=document.createElement('button');btn.textContent='삭제';btn.onclick=()=>pfDelMember(m.username);row.appendChild(btn);}
+    box.appendChild(row);});}
+async function pfDelMember(u){if(!confirm(u+' 회원을 완전 삭제합니다. 되돌릴 수 없습니다.'))return;
+  await fetch(API+'/api/admin/members/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});loadMembers();}
+async function pfDeleteAccount(){
+  if(!confirm('정말 회원 탈퇴하시겠습니까? 계정·자격증명·지시사항이 영구 삭제됩니다.'))return;
+  const pw=prompt('확인을 위해 비밀번호를 입력하세요');if(!pw)return;
+  const r=await fetch(API+'/api/profile/delete_account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+  if(r.ok){alert('탈퇴 완료');location.reload();}else{alert(((await r.json())||{}).detail||'실패');}}
+// ── 프로필 모달 끝 ────────────────────────────────────────────────────────────
 // 사장 피드백 2026-05-15 (4차): 사이드바 계층화 — 운용전략실장/운용지원실장 산하 팀장 들여쓰기 + '시스템' 제거.
 const agents=[
   {name:"운용전략실장",role:"Chief Strategy · 2패스 결정",color:"#6366f1",level:0},
@@ -714,15 +772,14 @@ function _recShowMsg(okId,errId,ok,msg){
   eEl.style.display=ok?'none':'block'; if(!ok)eEl.textContent=msg;
 }
 async function doRecoverId(){
-  const appkey=(document.getElementById('rec_id_appkey').value||'').trim();
+  const acctno=(document.getElementById('rec_id_acctno').value||'').trim();
   const appsecret=(document.getElementById('rec_id_appsecret').value||'').trim();
-  const orkey=(document.getElementById('rec_id_orkey').value||'').trim();
-  if(!appkey||!appsecret||!orkey){_recShowMsg('recIdOk','recIdErr',false,'모든 항목을 입력해주세요.');return;}
+  if(!acctno||!appsecret){_recShowMsg('recIdOk','recIdErr',false,'모든 항목을 입력해주세요.');return;}
   const btn=document.querySelector('#recIdPanel button[type=button]');btn.disabled=true;btn.textContent='조회 중…';
   try{
     const r=await _origFetch(API+'/api/recover_id',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({kis_app_key:appkey,kis_app_secret:appsecret,openrouter_key:orkey})});
+      body:JSON.stringify({kis_account_no:acctno,kis_app_secret:appsecret})});
     const d=await r.json().catch(()=>({}));
     if(r.ok){_recShowMsg('recIdOk','recIdErr',true,'아이디: '+String(d.username||''));}
     else{_recShowMsg('recIdOk','recIdErr',false,(d&&(d.detail||d.message))||('HTTP '+r.status));}
@@ -731,11 +788,10 @@ async function doRecoverId(){
 }
 async function doRecoverPw(){
   const username=(document.getElementById('rec_pw_user').value||'').trim();
-  const appkey=(document.getElementById('rec_pw_appkey').value||'').trim();
+  const acctno=(document.getElementById('rec_pw_acctno').value||'').trim();
   const appsecret=(document.getElementById('rec_pw_appsecret').value||'').trim();
-  const orkey=(document.getElementById('rec_pw_orkey').value||'').trim();
   const newpw=document.getElementById('rec_pw_newpw').value||'';
-  if(!username||!appkey||!appsecret||!orkey||!newpw){_recShowMsg('recPwOk','recPwErr',false,'모든 항목을 입력해주세요.');return;}
+  if(!username||!acctno||!appsecret||!newpw){_recShowMsg('recPwOk','recPwErr',false,'모든 항목을 입력해주세요.');return;}
   // 클라이언트 사전 정책 검사
   if(newpw.length<10){_recShowMsg('recPwOk','recPwErr',false,'비밀번호: 10자 이상 필요');return;}
   if(!/[^A-Za-z0-9\s]/.test(newpw)){_recShowMsg('recPwOk','recPwErr',false,'비밀번호: 특수문자 1개 이상 필요');return;}
@@ -743,7 +799,7 @@ async function doRecoverPw(){
   try{
     const r=await _origFetch(API+'/api/recover_password',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({username,kis_app_key:appkey,kis_app_secret:appsecret,openrouter_key:orkey,new_password:newpw})});
+      body:JSON.stringify({username,kis_account_no:acctno,kis_app_secret:appsecret,new_password:newpw})});
     const d=await r.json().catch(()=>({}));
     if(r.ok){
       _recShowMsg('recPwOk','recPwErr',true,'비밀번호가 재설정되었습니다. 새 비밀번호로 로그인하세요.');
