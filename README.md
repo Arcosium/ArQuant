@@ -88,7 +88,7 @@ Arquant/
 
 | # | 에이전트 | 역할 | 모델 | LLM 호출 |
 |---|---------|------|------|---------|
-| 1 | **운용전략실장** | Chief Orchestrator — **2패스**: ① 매크로 + 뉴스분석팀장 분석(원문 안 봄) → 후보 6종목 선정 / ② **종목별** 계량 평가 받아 최종 1~3개 매수 결정 + 자산 배분 권고(확대/축소/유지)를 매수 종목 수에 반영. 사이클 요약도 작성 | `google/gemini-3.1-pro-preview` | ✅ 사이클당 3회 |
+| 1 | **운용전략실장** | Chief Orchestrator — **2패스**: ① 매크로 + 뉴스분석팀장 분석(원문 안 봄) → 후보 6종목 선정 / ② **종목별** 계량 평가 받아 최종 1~3개 매수 결정 + 자산 배분 권고(확대/축소/유지)를 매수 종목 수에 반영. 사이클 요약도 작성 | `moonshotai/kimi-k2.6` | ✅ 사이클당 3회 |
 | 2 | **전략리서치팀장** | Macro Analyst — 글로벌 지수·**Tavily 실시간 시황·해설**·뉴스·공시로 매크로 방향성 (30분 캐시) + **직전 사이클 자산 배분 권고를 컨텍스트로 기억** | `deepseek/deepseek-v4-flash` | ✅ |
 | 3 | **계량분석팀장** | Quant Analyst — **종목당 별개 호출**로 통일 5섹션 양식(추세·평균회귀·변동성·수급·뉴스연계)으로 평가, `퀀트점수: 코드=0~10` + 가중치 명시 + 선택적 `진입가: 코드=시장가/숫자/관망±X%` | `deepseek/deepseek-v4-flash` | ✅ 종목당 1회 |
 | 4 | **뉴스분석팀장** | News Analyst — **운용전략실장보다 먼저** 증권 속보를 KR/US/공통으로 분류해 종목/업종·이벤트·매크로 시사점 정리 → 후보 선정의 최우선 입력 | `deepseek/deepseek-v4-flash` | ✅ |
@@ -97,7 +97,7 @@ Arquant/
 | ⚙️ | *매크로 리서치* (내부) | 매크로 분석가 호출 직전, 세션별 1개 종합 쿼리로 외국인 수급·정책·심리·지정학 합성 (Tavily 대체) | `alibaba/tongyi-deepresearch-30b-a3b` (8차) | ✅ 매크로마다 |
 | 5 | **트레이딩팀장** | Trader — **실행 직후** 체결 결과(체결가 포함) + 매매 사유를 한국어 산문으로 보고. JSON/표/마크다운 금지 | `deepseek/deepseek-v4-flash` | ✅ 실행 후 |
 | 6 | **리스크관리실장** | Risk Guard — ① 파이썬 결정론 룰 게이트(KR=원/US=$ 자동 분리 표기) → ② 통과한 **매수** 종목의 **DART 최근 공시 + 직전연도 요약재무(재무상태표/손익계산서) 재심** | 룰 엔진 (Python) + `openrouter/free` | ✅ 매수 있을 때 |
-| 7 | **사후관리실장** | Post-Management — **현재 세션 시장의 보유 종목**만 자유 재결정, 반대편 시장 종목은 자동 `보유`. 매크로 → 계량 → 뉴스 → 평가손익 순 가중 (`매도결정: 코드=전량/절반/보유`) | `google/gemini-3.1-pro-preview` | ✅ 보유 있을 때 |
+| 7 | **사후관리실장** | Post-Management — **현재 세션 시장의 보유 종목**만 자유 재결정, 반대편 시장 종목은 자동 `보유`. 매크로 → 계량 → 뉴스 → 평가손익 순 가중 (`매도결정: 코드=전량/절반/보유`) | `moonshotai/kimi-k2.6` | ✅ 보유 있을 때 |
 | 8 | **수탁자책임실장** | Policy Filter — 수탁자 책임·정책 적합성 필터 (간단 분류) | `openrouter/free` | ✅ |
 | 9 | **운용지원실장** | Ops Support **조정자** — 사이클 결과 → 도메인 자동 분류(investment/operations/finance) → 산하 팀장 워커에 위임. spawn↔완료 메시지를 **`OPS#N` 마커**로 시각적 연결. 직접 코드 수정 X | `deepseek/deepseek-v4-pro` | ✅ 사이클 후 |
 | 9a | **투자관리팀장** | Investment Sub-lead — 전략 프리셋, 후보 필터링/사이징, 매도/익절/손절 로직, 퀀트 임계값. 코드 수정 후 즉시 서버 재시작 | `deepseek/deepseek-v4-pro` | ✅ 위임 시 |
@@ -105,7 +105,7 @@ Arquant/
 | 9c | **재무관리팀장** | Finance Sub-lead — 예산 비율, 리스크 한도, P&L·equity curve 정확성, **리스크 표시 단위(원/달러)**, 환율·평가액 산출 | `deepseek/deepseek-v4-pro` | ✅ 위임 시 |
 
 **모델 배정 원칙** (config.py:MODEL_ASSIGNMENTS)
-- 최종 매수 결정자 (운용전략실장·사후관리실장) → **Gemini 3.1 Pro** (3000 tok) — 고지능 추론
+- 최종 매수 결정자 (운용전략실장·사후관리실장) → **Kimi K2.6** (3000 tok) — 고지능 추론
 - 매크로·계량·뉴스·트레이더 → **DeepSeek V4 Flash** (1800/4096/2600/1500 tok) — 빠르고 저렴
 - **뉴스 분류기** → **`tencent/hy3-preview`** (12K tok, reasoning 모델) — 정확한 KR/US/BOTH 분류
 - 리스크·정책 → **`openrouter/free`** — 비용 0, 폴백·단순 분류
@@ -178,6 +178,20 @@ Arquant/
 - 최대주주 변경·경영권 분쟁
 
 응답은 `최종승인: 코드, 코드` 한 줄. 파싱 실패·LLM 에러 시 **fail-open**(1차 승인 유지). 매도는 리스크 감소 행위라 재심 안 거침.
+
+#### 조회 실패 vs 공시 없음 명확 구분 (2026-05-19 ITEM2a)
+DART 결과를 `DartResult` 데이터클래스의 **3-state**로 구분한다(`tools/dart_disclosure.py`):
+- **`OK`** — 조회 성공, 공시/재무 존재.
+- **`NO_DISCLOSURE`** — 조회는 성공했으나 해당 기간 공시·재무가 없음 → **정상**(특이사항 없음). 매수 차단 사유 아님.
+- **`QUERY_FAILED`** — API 키 없음·HTTP 오류·타임아웃·파싱 실패 → **시스템 리스크 신호**.
+  "신호 없음"을 "악재 없음"으로 오독하지 않도록, 조회 실패는 절대 안전 신호로 취급하지 않는다.
+
+#### 재무상태표 정합성 가드 — 부채>자산 오판 방지 (2026-05-19 ITEM2b)
+`parse_balance_sheet_sanity()`가 추출한 재무상태표를 검증한다:
+- `OK` / `PARSE_FAILED` / **`IMPOSSIBLE`**(부채총계>자산총계, 또는 자본 ≠ 자산−부채 회계항등식 붕괴).
+- `IMPOSSIBLE`이면 `debt_ratio=None`으로 두고 **`QUERY_FAILED`로 격상** → 데이터 오류를 근거로
+  "자본잠식/부실" 판정을 내리는 것을 차단. (2026-05-19 12:45:17에 리스크관리실장이
+  파싱 오류 수치로 잘못된 `부채총계>자산총계` 판단을 내렸던 사건의 재발 방지.)
 
 ---
 
@@ -628,45 +642,102 @@ KIS 시장가 주문은 응답에 정확한 체결가를 안 주지만, **주문
 
 ---
 
-## 🔐 인증 & 계정 (사장 피드백 2026-05-16)
+## 📌 계정별 상시 지시사항 (2026-05-19 ITEM6 — 신규)
 
-Cloudflare Access(Zero Trust)를 제거하고 **앱 자체 로그인**으로 전환. 인증 로직은
-HYFE_IQC 월드퀀트 계정 방식을 참조 — SQLite + `cryptography.Fernet` 대칭 암호화 +
-불투명 세션 토큰(`secrets.token_urlsafe(32)`, 7일 TTL).
+`/api/ceo` @멘션은 **일회성**이라 사이클마다 휘발된다. 사장님이 포트폴리오 운용
+원칙을 **본인 계정 한정**으로 영속 저장하고, 운용전략실장이 매 사이클 반영하도록 하는 메커니즘.
+
+- **저장**: `infra/standing_directives.py` → `data/profiles/<uid>/standing_directives.json`
+  (런타임 데이터, `.gitignore`). uid별 분리 — 다른 계정 지시는 절대 섞이지 않음.
+- **주입 지점**: 활성 계정 uid의 지시 블록을 **운용전략실장(오케스트레이터) Pass1·Pass2
+  프롬프트에만** 삽입(`main_swarm.py:1958` `build_orchestrator_directive_block`).
+  ⚠️ **결정론적 파이썬 리스크/guardrail 게이트(`agents/guardrails.py`)는 미참조** →
+  상시 지시가 안전 게이트를 우회해 실매매를 강제할 수 없다(프롬프트-only 영향).
+- **표현 강도**: "참고 지침 — 다른 신호·리스크 게이트와 균형 있게 반영"으로 프레이밍.
+  파이썬 리스크/guardrail이 항상 최종 우선임을 footer에 명시.
+- **영구 삭제 보장**: 최초 시드 시 `.standing_seed_done` sentinel 기록 →
+  사용자가 `clear/remove`로 지시를 지우면 재시작해도 **부활하지 않음**(`a05f1f7`).
+- **CRUD**: `append_directive` / `load` / `clear_directives` / `remove_directive`
+  (멱등 — 동일 내용 SHA256 12자 id 중복 시 추가 생략, 계정당 최대 50건).
+- 사장님(hh09080) 계정에는 **매크로 붕괴 시나리오 대응 지시**가 1회 시드됨
+  (달러 단기국채·MMF 핵심축, 퀄리티 팩터 우량주·인버스 헤지, 금·비트코인 배제,
+  리밸런싱 트리거·현금화 계획 보고 — 사용자 명시 승인 항목).
+
+## 🛰️ Coresight 관리자 전용 게이팅 + 승인 인박스 (2026-05-19 — 신규)
+
+Coresight는 인증 없는 로컬-JSON 키워드 RAG(`tools/coresight_rag.py`)였다.
+관리자 계정에서만 활성화되고, 유입 투자 로직을 **자동 실행 없이** 사장님 지시로 승격하는 게이트를 추가.
+
+- **조회 게이팅**: `query_coresight()`는 `_is_admin_active()`로 게이트(deny-by-default,
+  fail-soft). 비관리자 활성 시 "[Coresight] 비활성…" 메시지 반환, 도구 노출도 관리자에게만.
+- **승인 인박스**(`infra/coresight_inbox.py`): `scan_and_enqueue` → 신규 항목을
+  `coresight_pending.json`에 적재 → 관리자가 **명시 승인/거절**.
+  `approve`는 `standing_directives.append_directive(uid, "[Coresight 유래] …")`로만 반영
+  (자동 매매·자동 실행 없음). 처리 이력은 `coresight_seen.json`.
+- **엔드포인트(관리자 전용, 비관리자 403)**: `GET /api/coresight/pending` ·
+  `POST /api/coresight/approve` · `POST /api/coresight/reject`.
+
+> 설계 상세: `Implementation/Implementation.md` (ML+유전 알고리즘 파라미터 튜닝,
+> Markowitz GMV 포트폴리오 로직, Coresight 관리자 전용 설계 §3).
+
+---
+
+## 🔐 인증 & 계정 (로그인 오버홀 2026-05-19 — branch `feature/login-overhaul`)
+
+Cloudflare Access(Zero Trust)를 제거하고 **앱 자체 로그인**으로 전환. 2026-05-19
+로그인 오버홀로 비밀번호 저장·계정 복구·자격증명 정책을 전면 강화했다.
+세션은 여전히 불투명 토큰(`secrets.token_urlsafe(32)`, 7일 TTL).
 
 ### 모델
 - **로그인**: 아이디 + 비밀번호만.
 - **최초 등록**: 아이디(중복 확인, 3자 이상) + 비밀번호(**10자 이상 + 특수문자 1개 이상**, 서버가 최종 강제) +
-  OpenRouter API Key(필수) · KIS App Key/Secret · 계좌번호 · Base URL · DART Key(선택, 없으면 공시 분석 생략).
+  OpenRouter API Key(필수) · KIS App Key/Secret · **한국투자증권 계좌번호** · Base URL.
+  - **제거됨(5-5)**: 사용자별 DART Key 입력칸 + 계정 이름(선택) 필드. DART 공시는
+    이제 서버 소유 단일 `OPENDART_API_KEY` 환경변수(`config.py:18`)로 전 계정 공통 처리
+    → API 키 하드코딩·GitHub 유출 위험 제거, 사용자 입력 표면 축소.
 - **멀티 계정**: 여러 계정 등록 가능. 스왐은 단일 프로세스라 **로그인한 계정 1개가 봇을 장악**(활성 계정).
-  활성 계정 전환 시 실거래 안전 정책은 `infra/credentials.py: account_switch_policy()`
-  (기본값: 매매 루프 가동 중 다른 계정 전환은 루프 정지 후 진행).
 - 로그인하면 그 계정의 API 자격증명이 런타임에 주입됨(`config` 전역 재할당 + 브로커/스왐 싱글턴 리셋).
 
+### 비밀번호 — argon2id 해시 (평문 비교 폐기)
+- 비밀번호는 **argon2id 해시**(`infra/auth_store.py:183` `PasswordHasher`)로만 저장.
+  `password_enc` 컬럼은 DEPRECATED(항상 `''`, 하위호환 위해 컬럼만 유지).
+- **부팅 1회 멱등 마이그레이션** `migrate_passwords_and_bidx()`:
+  legacy 행의 `password_enc`(Fernet 평문) → argon2 해시로 승격 + 누락된 블라인드
+  인덱스 백필. 이미 마이그레이션된 행은 건너뜀. 로그: `auth 마이그레이션 완료: 해시승격 N, bidx백필 M`.
+- legacy 행 로그인 시에도 복호-비교 후 **즉시 argon2로 승격**(`verify_password` 경로).
+
+### 계정 복구 — 블라인드 인덱스(HMAC) (신규)
+사용자가 아이디/비밀번호를 잊었을 때, **암호화된 자격증명을 복호하지 않고** 복구한다.
+- 복구 인자(3종, 본인만 알 수 있는 값): **KIS App Key + KIS App Secret + OpenRouter Key**.
+- 저장 형태: 각 값의 `HMAC-SHA256` 블라인드 인덱스 컬럼
+  (`kis_app_key_bidx` / `kis_app_secret_bidx` / `openrouter_key_bidx`).
+  HMAC 키는 Fernet 원본키에서 `HKDF`(`info=b"arquant-bidx-v1"`)로 파생 — raw 키는 어디에도 평문 저장 안 됨.
+- **아이디 찾기**(`POST /api/recover_id`): 3인자 일치 → username 반환.
+- **비밀번호 재설정**(`POST /api/recover_password`): username + 3인자 일치 → 새 비밀번호 설정.
+- **열거 오라클 차단(I1)**: 새 비밀번호 정책 검증을 **인자 매칭보다 먼저** 수행 →
+  "인자 틀림" vs "정책 위반" 응답이 계정 존재 여부를 누설하지 않음.
+
 ### 영속성 — 모든 유저, 재시작 후에도 계정 유지
-- 계정·세션은 `data/arquant_auth.db`(Fernet 암호화), 키는 `data/.fernet.key`(0600)에 저장.
-- 둘 다 **서버 디스크에 영속** → 서버 재시작/코드 갱신 후에도 모든 유저 계정·세션(7일) 유지.
-  (`.gitignore`로 git 추적만 차단 — 파일 자체는 보존됨)
-- ⚠️ **`data/.fernet.key`는 별도 안전 백업 필수.** 분실 시 전 유저 자격증명이 복호 불능.
-  키가 없는데 계정이 이미 있으면 서버는 **새 키를 만들지 않고** 503(`fernet_key_lost`)으로
-  잠가 계정을 보호한다 — 백업 키 복구 또는 `ARQUANT_FERNET_KEY` 주입 후 재시작.
-- 최초 부팅 시 계정이 없고 `.env`에 `ARQUANT_BOOTSTRAP_USER`/`ARQUANT_BOOTSTRAP_PASS`가
-  있으면 `.env`의 API 키로 사장님 프로필 1개 자동 생성(`.env`는 gitignore라 비번 비노출).
+- 계정·세션은 `data/arquant_auth.db`, Fernet 키는 `data/.fernet.key`(0600).
+- 둘 다 **서버 디스크에 영속** → 재시작/코드 갱신 후에도 계정·세션(7일) 유지(`.gitignore`는 git 추적만 차단).
+- ⚠️ **`data/.fernet.key`는 별도 안전 백업 필수.** 분실 시 자격증명·블라인드 인덱스 복구 불능.
+  키가 없는데 계정이 이미 있으면 서버는 새 키를 만들지 않고 503(`fernet_key_lost`)으로 잠근다.
 
 ### 보안
-- 세션 쿠키: `HttpOnly` + `SameSite=Lax` + **`Secure`**(기본 켜짐, `ARQUANT_COOKIE_SECURE=0`로 해제 가능).
-  https 터널=쿠키 / 로컬 http=`X-Session` 헤더 이중화.
-- WebSocket(`/ws`)은 `?token=` 또는 쿠키로 세션 검증, 미인증 시 거부.
-- 비밀번호는 Fernet 복호 후 평문 비교(HYFE 패턴) — 해시 아님, 대칭 암호화 저장.
+- 세션 쿠키: `HttpOnly` + `SameSite=Lax` + **`Secure`**(기본 켜짐). https=쿠키 / 로컬 http=`X-Session` 이중화.
+- WebSocket(`/ws`)은 `?token=` 또는 쿠키로 세션 검증, 미인증 거부.
+- **레이트 리미터 + 감사 로그(JSONL)**: 로그인·등록·복구 시도에 공유 스로틀 + 감사 기록.
+  클라이언트 IP는 `CF-Connecting-IP` 우선(Cloudflare 터널 뒤 X-Forwarded-For 스푸핑 방지).
 
 ### 엔드포인트
 `POST /api/register` · `POST /api/login` · `POST /api/logout` · `GET /api/me` ·
 `GET /api/accounts` · `POST /api/switch` · `GET /api/auth_status`(공개) ·
-`GET /api/check_username`(공개, 중복 확인). 그 외 모든 `/api/*`는 세션 필요(미인증 401).
+`GET /api/check_username`(공개) · **`POST /api/recover_id`(공개)** · **`POST /api/recover_password`(공개)**.
+그 외 모든 `/api/*`는 세션 필요(미인증 401).
 
-> 모바일 앱(arquant_mobile): `CfAccessInterceptor` → `AppAuthInterceptor`(X-Session) 교체,
-> `TokenManager`(EncryptedPrefs 아님 — 앱 샌드박스 SharedPreferences, 토큰은 불투명 세션값),
-> `LoginScreen` 추가. APK 빌드는 Android Studio에서 수행.
+> 모바일 앱(arquant_mobile): 네이티브 `LoginScreen.kt`(Compose)로 로그인/등록 +
+> 아이디·비밀번호 찾기 폼 제공. 대시보드는 index.html WebView. APK 빌드는 Android SDK 환경에서 수행
+> (이 서버엔 SDK 미설치 — 코드+자체검토만 완료, `1f45601`).
 
 ---
 
@@ -704,7 +775,7 @@ cloudflared tunnel run hyfe-iqc
 ### 💵 API 비용 추적 (사장 피드백 #7 — 신규)
 - `agents/base_agent.py`가 OpenRouter `usage` 필드(prompt_tokens, completion_tokens)를 모델별 단가에 곱해 누적
 - 모델별 추정 단가 (USD per 1M tokens):
-  - `google/gemini-3.1-pro-preview`: $1.25 in / $5.00 out
+  - `moonshotai/kimi-k2.6`: $0.73 in / $3.49 out (context 262K)
   - `deepseek/deepseek-v4-flash`: $0.10 in / $0.30 out
   - `deepseek/deepseek-v4-pro`: $0.50 in / $1.50 out
   - `tencent/hy3-preview` (reasoning): ~$0.40 in / $1.20 out
@@ -721,6 +792,18 @@ cloudflared tunnel run hyfe-iqc
 ## 📱 모바일 앱 (`arquant_mobile/`)
 
 Compose UI 기반 Android 앱. 웹 대시보드와 동일한 백엔드를 사용하며 앱 자체 로그인(아이디/비밀번호 → X-Session 토큰)으로 인증.
+
+### 로그인 화면 오버홀 (2026-05-19 — 웹 `index.html` + 네이티브 `LoginScreen.kt` 동시 적용)
+- **5-1 로고 통일**: 로그인/등록 화면 로고를 대시보드 좌상단 로고와 동일하게(웹 SVG / Compose `ArQuantLogoBox` Canvas).
+- **5-2 계정 복구 UI**: "아이디 찾기"(KIS Key+Secret+OpenRouter Key) / "비밀번호 찾기"(아이디+3인자) 패널.
+- **5-3 모바일 배지 미러**: "에이전트 통신 로그" 텍스트 우측에 상태 배지 부착(`#badgeMirror`).
+- **5-4 안전영역 패딩**: 등록 버튼이 홈 인디케이터/내비바와 겹치지 않게(`navigationBarsPadding`/`imePadding`, 웹 safe-area).
+- **5-5 입력 필드 정리**: 계정 이름(선택)·DART API Key 칸 제거(서버 소유 키 사용).
+- **5-6 라벨**: "KIS 계좌번호" → **"한국투자증권 계좌번호"**.
+- **ITEM3 통신 로그 표 렌더링 수정**: 운용전략실장의 종합 평가표·후보 5종목 근거표가
+  사용자 채팅창에 **공란**으로 보이던 버그. 근본 원인 = `_cleanLog()`의
+  `^\|.*\|$` 정규식이 마크다운 표 행 자체를 삭제. 수정 = 에이전트 메시지를
+  XSS-안전 `<table>`로 렌더(`_renderAgentContent()`) → 표가 정상 표시.
 
 ### 핵심 화면
 - **사이드바** (사장 피드백 모바일 #1): `statusBarsPadding()` 적용해 X 닫기 버튼이 상태바와 안 겹침. LazyColumn으로 전체 에이전트(9 + 3) 스크롤. 뉴스 피드는 별도 탭으로 이동했다는 안내 표시
@@ -750,7 +833,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 |----|--------|----------|
 | `OPENROUTER_API_KEY` | 모든 LLM (`BaseAgent` · `news_classifier`(tencent) · `ops_support_worker`) | 사이클당 13~15회 + 크롤당 1회 분류 |
 | `KIS_APP_KEY` + `KIS_APP_SECRET` | KIS OpenAPI 토큰·시세·주문·잔고·체결확인 | 토큰 1회/24h + 주문·시세 다수 |
-| `OPENDART_API_KEY` | DART 공시 + corpCode 매핑 + 직전연도 요약재무(BS+IS) | KR 세션 30분 간격 + 후보별 1회 |
+| `OPENDART_API_KEY` | DART 공시 + corpCode 매핑 + 직전연도 요약재무(BS+IS) — **서버 소유 단일 env, 전 계정 공통**(2026-05-19 사용자별 입력칸 제거) | KR 세션 30분 간격 + 후보별 1회 |
 | ~~`TAVILY_API_KEY`~~ | **제거됨** (사장 피드백 8차) — `alibaba/tongyi-deepresearch`가 검색·분류·리서치 통합 | — |
 
 `CORESIGHT_PATH` / `CORESIGHT_CHROMA_PATH`는 로컬 파일시스템 경로 (API 키 아님).
@@ -765,6 +848,11 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | GET | `/api/status` | 감시 상태(`is_running`), 현재 상태/세션, `next_cycle_sec`, 지수 워치리스트, **`api_cost`(USD·콜수)** |
 | POST | `/api/start` / `/api/stop` | 감시 시작 / 중지 |
 | POST | `/api/ceo` | 사장 직접 지시 (`@에이전트명`) |
+| POST | `/api/register` / `/api/login` / `/api/logout` | 계정 등록 / 로그인 / 로그아웃 |
+| POST | `/api/recover_id` | **아이디 찾기**(공개) — KIS Key+Secret+OpenRouter Key 3인자 일치 시 username 반환 |
+| POST | `/api/recover_password` | **비밀번호 재설정**(공개) — username + 3인자 일치 시 새 비번 설정 (정책 선검증) |
+| GET | `/api/coresight/pending` | **관리자 전용** — Coresight 승인 대기 항목 (비관리자 403) |
+| POST | `/api/coresight/approve` / `/api/coresight/reject` | **관리자 전용** — 항목 승인(→상시 지시 승격)/거절 |
 | GET | `/api/balance` | 통합 포트폴리오 — 국내·해외·채권·펀드 + 예수금/총평가 |
 | GET | `/api/news` | 최근 뉴스(최대 20) + 크롤 상태, 항목별 `market` (KR/US/BOTH) |
 | GET | `/api/equity?view=realtime\|daily\|monthly&limit=N` | 평가금액 추이 |
@@ -814,7 +902,7 @@ MIN_HOLDING_DAYS_FOR_SELL = 0.5       # ALLOW_DAY_TRADING=False일 때만 적용
 
 # 모델 배정 (사장 피드백 다수 차수에 걸쳐 진화)
 MODEL_ASSIGNMENTS = {
-    "chief_orchestrator": "google/gemini-3.1-pro-preview",    # 운용전략실장·사후관리실장
+    "chief_orchestrator": "moonshotai/kimi-k2.6",    # 운용전략실장·사후관리실장
     "macro_analyst":      "deepseek/deepseek-v4-flash",
     "quant_analyst":      "deepseek/deepseek-v4-flash",
     "news_analyst":       "deepseek/deepseek-v4-flash",
@@ -823,7 +911,7 @@ MODEL_ASSIGNMENTS = {
     "trader":             "deepseek/deepseek-v4-flash",       # 사장 피드백 3차 — free → flash로 격상
     "risk_guard":         "openrouter/free",
     "policy_filter":      "openrouter/free",
-    "post_manager":       "google/gemini-3.1-pro-preview",
+    "post_manager":       "moonshotai/kimi-k2.6",
     "ops_support":        "deepseek/deepseek-v4-pro",         # 산하 팀장 3명도 동일 모델 공유
 }
 
@@ -851,6 +939,8 @@ AGENT_HISTORY_TURNS      = 3
 10. **재시작 친화** — KIS 토큰 디스크 캐시, equity_curve/strategy_state 영속화, claude_response.json 무삭제 로그, `RESUME_ON_BOOT` 마커로 운용지원실장 코드 수정 후 자동 감시 재개.
 11. **운용지원실장 = 조정자, 산하 팀장 = 수정자** — 직접 코드를 만지지 않고 도메인 분류(investment/operations/finance) 후 산하 팀장 워커에 위임. spawn↔완료를 `OPS#N` 마커로 시각적 연결. 보호 패턴(FORBIDDEN_PATTERNS)이 핵심 매매 로직 침범을 막음.
 12. **조용한 실패 금지 + 검증된 결정론 핵심** (사장 피드백 2026-05-18) — 돈이 걸린 결정론 코드(주문 검증·사이징·파서)는 `pytest` 회귀 테스트로 고정, 의존성은 핀 고정, 머니패스의 삼켜진 예외는 `notifier`로 운영자에게 표면화(동작 보존·중복억제), 자가수정은 컴파일 실패 시 **디스크 전면 롤백**으로 부분 적용 불일치 차단.
+13. **지시는 프롬프트에만, 게이트는 불변** (2026-05-19) — 사장님 상시 지시·Coresight 승격 지시는 운용전략실장 LLM 프롬프트에만 주입되고 `agents/guardrails.py` 결정론 리스크 게이트는 절대 참조하지 않는다. 어떤 지시도 안전 게이트를 우회해 실매매를 강제할 수 없으며, 계정별로 완전 격리된다(uid 분리 파일 + sentinel 영구 삭제 보장).
+14. **신호 없음 ≠ 악재 없음** (2026-05-19) — DART 조회 실패(`QUERY_FAILED`)를 공시 부재(`NO_DISCLOSURE`)와 엄격히 구분하고, 재무상태표가 회계항등식을 깨면(`IMPOSSIBLE`) 그 수치로 부실 판정을 내리지 않고 `QUERY_FAILED`로 격상. 데이터 결손을 안전 신호로 오독하지 않는다.
 
 ---
 
