@@ -233,6 +233,12 @@ def init() -> None:
             qs = ",".join("?" * len(ADMIN_USERNAMES))
             conn.execute(f"UPDATE users SET is_admin=1 WHERE username IN ({qs})",
                          tuple(ADMIN_USERNAMES))
+        for _c in ("password_hash", "kis_app_key_bidx",
+                   "kis_app_secret_bidx", "openrouter_key_bidx"):
+            if _c not in cols:
+                conn.execute(
+                    f"ALTER TABLE users ADD COLUMN {_c} TEXT NOT NULL DEFAULT ''")
+                logger.info("auth_store 마이그레이션: users.%s 컬럼 추가", _c)
     _INITED = True
 
 
