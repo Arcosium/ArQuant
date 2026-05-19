@@ -63,6 +63,46 @@ def test_delete_account_requires_password(client):
     assert a.find_user_by_username("u1") is None
 
 
+@pytest.fixture
+def admin_client(tmp_path, monkeypatch):
+    import infra.auth_store as a
+    for n, v in [("_DATA_DIR", tmp_path), ("_DB_PATH", tmp_path / "auth.db"),
+                 ("_FERNET_KEY_PATH", tmp_path / ".fernet.key"),
+                 ("_AUDIT_PATH", tmp_path / "audit.log"),
+                 ("_INITED", False), ("_FERNET", None),
+                 ("_FERNET_RAW", None), ("_BIDX_KEY", None)]:
+        monkeypatch.setattr(a, n, v, raising=False)
+    a.init()
+    uid = a.upsert_user("hh09080", "AdminPassw0rd!!", "AK", "AS", "OR", "5012345601",
+                         "https://openapi.koreainvestment.com:9443", is_admin=True)
+    tok = a.create_session(uid)
+    import infra.standing_directives as sd
+    monkeypatch.setattr(sd, "_PROFILES_DIR", tmp_path / "profiles")
+    import server.app as app_mod
+    c = TestClient(app_mod.app)
+    c.headers.update({"X-Session": tok})
+    return c, a, uid
+
+
+def test_admin_cannot_self_delete(admin_client):
+    """ADMIN이 올바른 비밀번호로 본인 탈퇴를 시도하면 400이어야 한다(단독 ADMIN 보호)."""
+    c, a, uid = admin_client
+    resp = c.post("/api/profile/delete_account", json={"password": "AdminPassw0rd!!"})
+    assert resp.status_code == 400
+    assert "ADMIN" in resp.json().get("detail", "")
+    # 계정이 삭제되지 않았어야 한다
+    assert a.find_user_by_username("hh09080") is not None
+    # 감사 로그에 fail/admin_protected가 기록돼야 한다
+    import json
+    audit_path = a._AUDIT_PATH
+    entries = [json.loads(ln) for ln in audit_path.read_text().splitlines() if ln.strip()]
+    fail_entries = [e for e in entries
+                    if e.get("event") == "delete_account"
+                    and e.get("outcome") == "fail"
+                    and e.get("detail") == "admin_protected"]
+    assert len(fail_entries) >= 1
+
+
 # ── Fix 3: /api/profile/credentials tests ────────────────────────────────────
 
 async def _stub_validate_kis_ok(app_key, app_secret, base_url):

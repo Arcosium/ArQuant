@@ -400,6 +400,10 @@ async def profile_delete_account(req: DeleteAccountReq, request: Request):
                          username=(creds or {}).get("username", ""),
                          ip=ip, outcome="fail", detail="")
         raise HTTPException(400, "비밀번호가 일치하지 않습니다.")
+    if auth_store.is_admin(uid):
+        auth_store.audit("delete_account", username=creds["username"], ip=ip,
+                         outcome="fail", detail="admin_protected")
+        raise HTTPException(400, "ADMIN 계정은 탈퇴할 수 없습니다(단독 ADMIN 보호).")
     # Audit BEFORE deletion (need creds["username"])
     auth_store.audit("delete_account", username=creds["username"], ip=ip, outcome="ok", detail="")
     import shutil
