@@ -152,15 +152,13 @@ class LoginReq(BaseModel):
     remember: bool = True
 
 class RecoverIdReq(BaseModel):
-    kis_app_key: str
+    kis_account_no: str
     kis_app_secret: str
-    openrouter_key: str
 
 class RecoverPwReq(BaseModel):
     username: str
-    kis_app_key: str
+    kis_account_no: str
     kis_app_secret: str
-    openrouter_key: str
     new_password: str
 
 class SwitchReq(BaseModel):
@@ -258,7 +256,7 @@ async def recover_id(req: RecoverIdReq, request: Request):
     ip = _client_ip(request)
     _throttle(_rl_recover, f"recid:{ip}")
     uname = auth_store.find_username_by_factors(
-        req.kis_app_key, req.kis_app_secret, req.openrouter_key)
+        req.kis_account_no, req.kis_app_secret)
     auth_store.audit("recover_id", username=uname, ip=ip,
                      outcome=("ok" if uname else "fail"), detail="")
     if not uname:
@@ -271,8 +269,8 @@ async def recover_password(req: RecoverPwReq, request: Request):
     _throttle(_rl_recover, f"recpw:{ip}")
     try:
         ok = auth_store.reset_password_by_factors(
-            (req.username or "").strip(), req.kis_app_key, req.kis_app_secret,
-            req.openrouter_key, req.new_password)
+            (req.username or "").strip(), req.kis_account_no,
+            req.kis_app_secret, req.new_password)
     except ValueError as e:
         auth_store.audit("recover_password", username=(req.username or "").strip(),
                          ip=ip, outcome="fail", detail="policy")
