@@ -315,6 +315,7 @@ def _row_to_creds(row: sqlite3.Row) -> Dict[str, Any]:
         "id": int(row["id"]),
         "username": row["username"],
         "password": decrypt(row["password_enc"]),
+        "password_hash": row["password_hash"] if "password_hash" in row.keys() else "",
         "kis_app_key": decrypt(row["kis_app_key_enc"]),
         "kis_app_secret": decrypt(row["kis_app_secret_enc"]),
         "openrouter_key": decrypt(row["openrouter_key_enc"]),
@@ -360,19 +361,43 @@ def is_admin(user_id: Optional[int]) -> bool:
 
 
 def verify_password(username: str, password: str) -> Optional[Dict[str, Any]]:
-    """HYFE 패턴 — 복호 후 평문 비교. 일치하면 자격증명 dict, 아니면 None."""
+    """argon2id 검증. 미마이그레이션(legacy) 행이면 복호-비교 후 즉시 해시로 승격.
+    성공 시 자격증명 dict, 실패 시 None."""
     u = find_user_by_username(username)
     if not u:
         return None
-    if u["password"] != (password or ""):
-        return None
-    return u
+    stored = u.get("password_hash") or ""
+    if stored:
+        if not verify_pw_hash(stored, password or ""):
+            return None
+        try:
+            if _PH.check_needs_rehash(stored):
+                _set_password_hash(u["id"], hash_password(password or ""), clear_enc=True)
+        except Exception:
+            logger.warning("argon2 rehash 점검 실패(user_id=%s)", u.get("id"))
+        return u
+    # legacy: password_hash 없음 → 복호-비교 후 해시 승격(1회성)
+    if (u.get("password") or "") and u["password"] == (password or ""):
+        _set_password_hash(u["id"], hash_password(password or ""), clear_enc=True)
+        return u
+    return None
 
 
 def touch_login(user_id: int) -> None:
     init()
     with _DB_LOCK, _connect() as conn:
         conn.execute("UPDATE users SET last_login_at=? WHERE id=?", (time.time(), int(user_id)))
+
+
+def _set_password_hash(user_id: int, new_hash: str, clear_enc: bool = True) -> None:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        if clear_enc:
+            conn.execute("UPDATE users SET password_hash=?, password_enc='' WHERE id=?",
+                         (new_hash, int(user_id)))
+        else:
+            conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                         (new_hash, int(user_id)))
 
 
 def _mask(s: str, keep: int = 4) -> str:

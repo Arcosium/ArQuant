@@ -463,7 +463,7 @@ def fresh_auth(tmp_path, monkeypatch):
                       ("_FERNET_KEY_PATH", tmp_path/".k"),
                       ("_AUDIT_PATH", tmp_path/"au.log"), ("_INITED", False),
                       ("_FERNET", None), ("_FERNET_RAW", None), ("_BIDX_KEY", None)]:
-        monkeypatch.setattr(A, name, val)
+        monkeypatch.setattr(A, name, val, raising=False)
     A.init(); return A
 
 def test_verify_password_argon2_path(fresh_auth):
