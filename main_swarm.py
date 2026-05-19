@@ -14,8 +14,10 @@ from agents.specialists import (create_macro_analyst, create_quant_analyst, crea
 from agents.guardrails import create_risk_guard, validate_order_draft
 from infra.kis_broker import get_broker, OrderDraft
 from infra import cycle_store, news_classifier_log, notifier, metrics
+from infra.error_log import record_error
 from tools.news_monitor import get_monitor
-from tools.dart_disclosure import search_disclosures, get_financial_summary_by_stock_code
+from tools.dart_disclosure import (search_disclosures, get_financial_summary_by_stock_code,
+                                    DART_STATE_QUERY_FAILED, DART_STATE_NO_DISCLOSURE)
 # 사장 피드백 2026-05-15 (8차): Tavily → alibaba/tongyi-deepresearch로 전환
 from tools.global_search import deep_research
 from tools.market_data import (
@@ -485,7 +487,7 @@ def _enrich_trade_history(events: list) -> list:
                 positions.setdefault(tk, []).append({"qty": qty, "price": effective_price,
                                                        "ts": ts, "source": price_source})
             e["detail"] = {"buy_price": effective_price, "qty": qty, "currency": e["est_currency"],
-                          "price_source": price_source}
+                          "price_source": price_source, "avg_cost": e.get("avg_cost")}
         elif side == "sell":
             queue = positions.get(tk, [])
             remaining = qty
@@ -514,9 +516,29 @@ def _enrich_trade_history(events: list) -> list:
             total_pnl = sum(m["pnl"] for m in matches)
             shown_sell = (actual_fill if actual_fill is not None
                           else (est_price if est_price else (matches[0]["sell_price"] if matches else None)))
+            # 사장 지시 2026-05-19: 매도 거래에 박힌 KIS 실매입평균가(avg_cost)가 있으면
+            # 그것을 실현손익의 권위 기준으로 삼는다 — 세전(총손익).
+            # FIFO 재구성은 로그가 잘리면 어긋나 명목/실제 불일치의 근본 원인이었다.
+            # avg_cost가 없는 과거 이벤트만 FIFO 폴백(cost_source로 구분).
+            rec_avg = e.get("avg_cost")
+            try:
+                rec_avg = float(rec_avg) if rec_avg not in (None, "", 0, "0", 0.0) else None
+            except (TypeError, ValueError):
+                rec_avg = None
+            eff_sell_auth = (actual_fill if actual_fill is not None
+                             else (est_price if est_price else shown_sell))
+            realized_pnl = realized_pct = None
+            if rec_avg and rec_avg > 0 and eff_sell_auth:
+                realized_pnl = (eff_sell_auth - rec_avg) * qty
+                realized_pct = (eff_sell_auth / rec_avg - 1) * 100.0
+                total_pnl = realized_pnl  # 표시 P&L을 권위값(KIS 평단 기준)으로 교체
             e["detail"] = {"matched": matches, "sell_price": shown_sell, "qty": qty,
                           "total_pnl": total_pnl, "unmatched_qty": remaining,
                           "currency": e["est_currency"], "price_source": price_source,
+                          "cost_basis": rec_avg, "realized_pnl": realized_pnl,
+                          "realized_pnl_pct": realized_pct,
+                          "cost_source": ("kis_avg" if (rec_avg and rec_avg > 0)
+                                          else "fifo_reconstructed"),
                           "sell_price_inferred": (actual_fill is None and est_price is None)}
     return sorted_evs
 
@@ -850,7 +872,19 @@ class ArquantOrchestrator:
                     _guide = ("(참고: 당신은 시스템 설정·소스코드를 직접 변경할 수 없습니다. 이 지시가 설정/매매규칙/코드 변경을 요구하면 "
                               "의견·이유는 자유롭게 답하되, 이 계정에서는 시스템 반영이 불가능함을 간단히 알리십시오. "
                               "단순 질의·분석 요청이면 평소 역할대로 답하십시오. 무성의하게 거절하지 마십시오.)")
-                resp = await agent.think(f"[🔴 사장 직접 지시] {message}\n\n{_guide}")
+                # 사장 지시 2026-05-19: 포지션 인지 에이전트(트레이딩팀장·사후관리실장)가
+                # 실시간 잔고 없이 '보유 0주·이미 정리됨' 같은 환각을 답한 사례(한화시스템
+                # 272210: 09:14 매수 1주 보유 중인데 09:39 "정리됨"이라 거짓 보고)를 차단 —
+                # 멘션 시 실제 KIS 잔고를 컨텍스트로 주입한다.
+                _live_ctx = None
+                if name in ("트레이딩팀장", "사후관리실장"):
+                    try:
+                        _live_ctx = await self.broker.kr_balance()
+                    except Exception as _be:
+                        record_error(name, _be, context="ceo_directive 멘션 잔고 주입 실패")
+                        _live_ctx = ("[국내 계좌잔고] 조회 실패 — 보유 수량을 단정하지 말고 "
+                                     "'확인 불가'로 답하십시오.")
+                resp = await agent.think(f"[🔴 사장 직접 지시] {message}\n\n{_guide}", context=_live_ctx)
                 await _broadcast({"type":"agent_msg","agent":name,"message":resp})
                 # 자동 체이닝은 ADMIN 계정에서만 — 비관리자는 운용지원실장 라인 자체가 비활성
                 if _admin and self._needs_ops_chain(resp):
@@ -1130,6 +1164,7 @@ class ArquantOrchestrator:
         await _broadcast({"type":"status","state":"DATA_COLLECTION","message":f"종목 {len(codes)}개 데이터 수집 중"})
         loop = asyncio.get_event_loop()
         summaries = []
+        empty_us_codes = set()
         for code in codes[:8]:  # cap to avoid rate limits (was 5 — bumped for 6 후보 + 보유 종목)
             if code.isdigit() and len(code) == 6:
                 # ── KR 일봉: KIS API 먼저 (페이지네이션으로 ~2년) ──
@@ -1138,13 +1173,22 @@ class ArquantOrchestrator:
                     kis_rows = len(await self.broker.kr_daily_chart_deep(code, years=2))
                 except Exception as e:
                     summaries.append(f"  ⚠ [{code}] KIS 일봉 조회 예외: {e}")
-                csv_daily = _csv_row_count(_Path("data") / f"daily_{code}.csv")
-                if kis_rows > 0 or csv_daily > 0:
+                if kis_rows > 0:
+                    csv_daily = _csv_row_count(_Path("data") / f"daily_{code}.csv")
                     summaries.append(f"[{code}] 일봉: KIS +{kis_rows}행 / 누적 {csv_daily}행")
                 else:
-                    # ── KIS 0행 → 네이버 금융 크롤 폴백 ──
-                    s = await loop.run_in_executor(None, crawl_company_full, code)
-                    summaries.append(f"  🔁 [{code}] KIS 일봉 0행 → 네이버 폴백\n{s}")
+                    # 사장님 지시 2026-05-19: KIS 신규 0행이면 누적 CSV가 있어도(=stale 가능성)
+                    # 네이버 금융(KRX Sim 로직 fetch_stock_daily)으로 최신 봉 top-up — stale 데이터로
+                    # 분석하던 문제 차단. (기존엔 csv_daily>0이면 폴백을 아예 안 했음.)
+                    _n = 0
+                    try:
+                        from tools.market_data import fetch_stock_daily as _fsd
+                        _ndf = await loop.run_in_executor(None, _fsd, code, 2)
+                        _n = len(_ndf) if _ndf is not None else 0
+                    except Exception as _e:
+                        summaries.append(f"  ⚠ [{code}] 네이버 일봉 폴백 예외: {_e}")
+                    csv_daily = _csv_row_count(_Path("data") / f"daily_{code}.csv")
+                    summaries.append(f"  🔁 [{code}] KIS 0행 → 네이버 폴백 +{_n}행 / 누적 {csv_daily}행")
                 # ── KR 수급(기관·외인): KIS 미제공 → 네이버 크롤로 항상 보강 ──
                 try:
                     inv_df = await loop.run_in_executor(None, fetch_investor_data, code)
@@ -1171,7 +1215,8 @@ class ArquantOrchestrator:
                     if us_rows:
                         summaries.append(f"  📈 [{code}] KIS 미국 일봉 +{len(us_rows)}행 누적")
                     else:
-                        summaries.append(f"  ⚠ [{code}] 미국 일봉 0행 — KIS API 응답 비어있음")
+                        summaries.append(f"  ⚠️ [{code}] KIS US 일봉 수집 실패 (0행)")
+                        empty_us_codes.add(code)
                 except Exception as e:
                     summaries.append(f"  ⚠ [{code}] 미국 일봉 수집 실패: {e}")
             await asyncio.sleep(0.5)
@@ -1180,6 +1225,8 @@ class ArquantOrchestrator:
         quant_parts = []
         for code in codes[:8]:
             quant_parts.append(format_quant_data_for_agent(code))
+            if code in empty_us_codes:
+                quant_parts.append(f"⚠️ [{code}] KIS US 일봉 수집 실패 (0행)")
         return "\n".join(summaries + quant_parts)
 
     async def _prefilter_news(self, articles: List[Dict], limit: Optional[int] = None) -> List[Dict]:
@@ -1219,6 +1266,8 @@ class ArquantOrchestrator:
     async def _collect_per_stock_dart(self, codes: List[str], days: int = 90, limit: int = 8):
         """Per-stock 최근 공시(~90일) + **가장 최근** 분기/반기/연간 요약재무.
         사장 피드백 2026-05-18: 공시 윈도우를 14→90일로 넓혀 관리종목·증자·소송 등을 놓치지 않음.
+        ITEM2a: DartResult.state 를 사람-읽기 텍스트로 접두사 표기 — 리스크관리실장이
+                QUERY_FAILED(시스템 리스크 주의)와 NO_DISCLOSURE(특이사항 없음)를 명확히 구분.
         Returns (dart_dict, name_map). Best-effort — skips a code on any error."""
         out: Dict[str, str] = {}; names: Dict[str, str] = {}
         loop = asyncio.get_event_loop()
@@ -1227,14 +1276,19 @@ class ArquantOrchestrator:
                 nm = await loop.run_in_executor(None, get_stock_name, code)
                 if nm:
                     names[code] = nm
-                    # 최근 공시 (기존 동작)
-                    dd = await search_disclosures(corp_name=nm, bgn_de=(datetime.now() - timedelta(days=days)).strftime("%Y%m%d"))
-                    # 사장 피드백 #7: 직전연도 요약재무상태표 + 손익계산서 추가
-                    fin = await get_financial_summary_by_stock_code(code)
-                    sections = [f"{nm}({code})", dd]
-                    if fin:
+                    # 최근 공시 (기존 동작) — DartResult 반환
+                    dd_result = await search_disclosures(corp_name=nm, bgn_de=(datetime.now() - timedelta(days=days)).strftime("%Y%m%d"))
+                    # 사장 피드백 #7: 직전연도 요약재무상태표 + 손익계산서 추가 — DartResult 반환
+                    fin_result = await get_financial_summary_by_stock_code(code)
+
+                    # QUERY_FAILED 이면 리스크관리실장이 알 수 있도록 명시적 경고 접두사 삽입
+                    dd_text = dd_result.risk_text() if dd_result.failed else str(dd_result)
+                    fin_text = fin_result.risk_text() if fin_result.failed else str(fin_result)
+
+                    sections = [f"{nm}({code})", dd_text]
+                    if fin_text:
                         sections.append("")
-                        sections.append(fin)
+                        sections.append(fin_text)
                     out[code] = "\n".join(sections)
             except Exception as _e:
                 logger.warning(f"per-stock DART {code} 실패: {_e}")
@@ -1255,12 +1309,30 @@ class ArquantOrchestrator:
             return set(), "DART 재심: 관련 공시 없음 — 1차 결과 유지"
         tickers = [str(r.get("ticker", "")).strip() for r in buy_orders]
         digest = "\n\n".join(f"[{k}]\n{(v or '')[:2500]}" for k, v in relevant.items())
+        # ITEM2b: QUERY_FAILED 종목 목록 추출 — 해당 종목은 특별 주의 지시
+        _qf_tickers = []
+        for r in (buy_orders or []):
+            tk_qf = str(r.get("ticker", "")).strip()
+            d_qf = per_dart.get(tk_qf) or per_dart.get(tk_qf.upper()) or ""
+            if "시스템 리스크" in d_qf or "QUERY_FAILED" in d_qf:
+                _qf_tickers.append(tk_qf)
+        _qf_warning = ""
+        if _qf_tickers:
+            _qf_warning = (
+                f"\n\n⚠️ [DART 조회 실패 종목 — 시스템 리스크 주의]: {', '.join(_qf_tickers)}\n"
+                f"위 종목은 API 오류·키 없음·네트워크 장애로 DART 데이터를 가져오지 못했습니다. "
+                f"'재무 미확보'로 처리하되, 조회 실패 자체를 **시스템 리스크 경고**로 간주하십시오. "
+                f"다른 명백한 승인 근거가 없으면 보수적으로 반려를 검토하십시오.\n"
+            )
         try:
             resp = await self.risk_guard.think(
                 f"1차 결정론 검증을 통과한 매수 주문 종목: {', '.join(tickers)}\n\n"
-                f"각 종목 — 최근 ~90일 DART 공시 + **가장 최근 가용 분기/반기/연간 요약재무**:\n{digest}\n\n"
+                f"각 종목 — 최근 ~90일 DART 공시 + **가장 최근 가용 분기/반기/연간 요약재무**:\n{digest}"
+                f"{_qf_warning}\n\n"
                 f"① 공시 리스크 신호(관리종목/거래정지/상장폐지심사/횡령·배임/회계감리/불성실공시/감자/대규모 유상증자/주요 소송·제재 등) "
-                f"② 재무 적신호(자본잠식·부채>자산·연속 적자·매출 급감) 를 종합해, 해당하는 종목은 반려하십시오. "
+                f"② 재무 적신호(자본잠식·부채비율 과다·연속 적자·매출 급감) 를 종합해, 해당하는 종목은 반려하십시오. "
+                f"⚠️ '부채>자산' 판정은 **재무상태표 검증 통과(✅ 재무상태표 검증: ...)** 표기가 있을 때만 하십시오. "
+                f"'⚠️ 재무상태표 내적 불일치' 또는 '시스템 리스크' 경고가 있는 종목의 재무 수치를 근거로 부채>자산·자본잠식을 단정하지 마십시오. "
                 f"명백한 악재가 없으면 승인 유지(공시·재무 정보 없음만으로는 반려 금지). "
                 f"마지막 줄에 반드시 `최종승인: 코드, 코드` (유지할 종목만; 전부 반려면 `최종승인: 없음`).")
             if not _has_label(resp, "최종승인"):
@@ -1880,6 +1952,14 @@ class ArquantOrchestrator:
         prefilter_limit = 100 if market_open else None  # None → config 기본(NEWS_PREFILTER_LIMIT=40)
         news_articles = await self._prefilter_news(news_articles, limit=prefilter_limit)
         formatted_news = self.news_monitor.format_articles_for_agent(news_articles)
+        # ITEM6: 활성 계정의 상시 지시사항 로드 — 운용전략실장 프롬프트에 주입 (계정 격리)
+        _active_uid, _ = self._active_actor()
+        try:
+            from infra.standing_directives import build_orchestrator_directive_block
+            _standing_directive_block = build_orchestrator_directive_block(_active_uid)
+        except Exception as _sde:
+            logger.warning("상시지시 로드 실패(uid=%s): %s — 사이클 계속", _active_uid, _sde)
+            _standing_directive_block = ""
         try:
             # [1] GLOBAL INDEX DATA (validated numbers only — no garbage)
             index_data = await self._collect_index_data()
@@ -1893,7 +1973,10 @@ class ArquantOrchestrator:
             holdings = []
             try:
                 holdings = await self.broker.kr_holdings()
-            except Exception: pass
+            except Exception as _he:
+                # 클린코드 2026-05-19: 침묵 삼킴 제거 — 빈 holdings로 진행하면 보유 종목
+                # 회피·체결확인이 불가하므로 최소한 원인을 남긴다.
+                record_error("_collect_company_data", _he, context="kr_holdings 조회 실패 → 빈 목록 진행")
             holdings_str = ("; ".join(f"{h['name']}({h['code']}) {h['qty']}주 손익 {h['pnl_pct']:+.1f}%" for h in holdings) or "없음")
 
             # [2] DART — 사장 피드백 2026-05-15 (#20): DART는 국내 종목만 있으니 KR 장 시간에만 30분 간격으로 가동.
@@ -1907,8 +1990,12 @@ class ArquantOrchestrator:
                 dart_report = _dart_cache["value"]
                 await _broadcast({"type":"agent_msg","agent":"시스템","message":f"♻️ DART 공시 캐시 재사용 ({int((time.time()-_dart_cache['ts'])/60)}분 전) — API 호출 생략"})
             else:
-                dart_report = await search_disclosures(bgn_de=(datetime.now()-timedelta(days=3)).strftime("%Y%m%d"))
-                _dart_cache.update(ts=time.time(), value=dart_report)
+                _dr = await search_disclosures(bgn_de=(datetime.now()-timedelta(days=3)).strftime("%Y%m%d"))
+                # ITEM2a: QUERY_FAILED는 시스템 리스크 경고, NO_DISCLOSURE는 정상으로 구분
+                dart_report = _dr.risk_text() if _dr.failed else str(_dr)
+                # QUERY_FAILED 응답은 캐시하지 않음 (다음 사이클에서 재시도)
+                if not _dr.failed:
+                    _dart_cache.update(ts=time.time(), value=dart_report)
             self.cycle_log.log("DATA", "시스템", dart_report)
 
             # [3] NEWS ANALYSIS first — macro now reflects the analyzed news (사장 지시 2026-05-14).
@@ -2001,7 +2088,12 @@ class ArquantOrchestrator:
                     f"근거 1~2줄씩, 핵심 리스크는 3개 이상 + 각 리스크의 트리거/모니터링 포인트를 함께 적으십시오. "
                     f"단, 가격·지수 수치 인용 규칙(검증 지수만)은 그대로 지키고 표/마크다운 강조는 쓰지 마십시오.\n"
                     f"표에 없는 수치는 추정·생성 금지.")
-                _macro_cache.update(ts=time.time(), value=macro_report)
+                # 버그 수정 2026-05-19: 빈/실패(예: OpenRouter 401) 응답이 캐시되면
+                # MACRO_CACHE_TTL(30분) 동안 모든 사이클이 그 빈 값을 '캐시 재사용'해
+                # 전략리서치팀장이 계속 '매크로 분석 실패'만 반복했다.
+                # → 유효 응답(비어있지 않고 40자 이상)일 때만 캐시한다.
+                if (macro_report or "").strip() and len((macro_report or "").strip()) >= 40:
+                    _macro_cache.update(ts=time.time(), value=macro_report)
             # 사장 피드백 2026-05-16 (OPS#21): 매크로 LLM이 빈/너무 짧은 응답을 줄 때
             # 전략리서치팀장 칸이 '아무 말 없이' 비어 운용전략실장이 참조할 게 없던 문제.
             # 빈 응답은 명확히 표시하고, 운용전략실장에는 '매크로 분석 불가' 신호를 전달.
@@ -2054,7 +2146,8 @@ class ArquantOrchestrator:
                     f"{('사장 지시: '+user_directive if user_directive else '')}\n"
                     f"{_budget_hint}\n\n"
                     f"{session_hint}\n"
-                    f"분석할 후보 종목 **정확히 5개**를 고르십시오.\n"
+                    + (f"\n{_standing_directive_block}\n" if _standing_directive_block else "")
+                    + f"분석할 후보 종목 **정확히 5개**를 고르십시오.\n"
                     f"⚠️ **최우선**: 위 뉴스분석팀장이 짚은 종목/업종을 먼저 후보에 넣으십시오. (뉴스 원문은 제공되지 않으니 뉴스분석팀장 분석만 참고) "
                     f"뉴스 기반 적격 종목이 5개에 못 미칠 때만 매크로 판단으로 나머지를 채우십시오.\n"
                     f"종목명만 보고 종목코드를 임의 생성하지 말고 확실히 아는 코드만 쓰십시오. "
@@ -2155,12 +2248,18 @@ class ArquantOrchestrator:
                             except Exception:
                                 _delisted_suspects.append(_c)
                             await asyncio.sleep(0.1)
-                    _msg_lines = [f"🚫 일봉 데이터 없는 종목 자동 제외: {', '.join(no_data_codes)} → 후보 {len(candidate_codes)} → {len(_kept)}개"]
+                    _msg_lines = [f"🚫 일봉 데이터 없는 종목 평가 제외 (LLM 계량평가 생략): {', '.join(no_data_codes)} → 후보 {len(candidate_codes)} → {len(_kept)}개"]
                     if _delisted_suspects:
                         _msg_lines.append(f"⚠️ 상장폐지/거래정지 의심: {', '.join(_delisted_suspects)} (다음 사이클 후보 선정 시 사전 확인 필요)")
                     await _broadcast({"type":"agent_msg","agent":"계량분석팀장",
                         "message": "\n".join(_msg_lines)})
                     candidate_codes = _kept
+                    # 버그+정책 수정 2026-05-19 (사장님 지시: "데이터 없으면 평가 자체를 안 함"):
+                    # 기존엔 candidate_codes만 필터링하고 퀀트 루프는 analysis_codes를
+                    # 순회해 데이터 없는 종목(예: BAC)이 그대로 LLM 평가·자의적 채점됐다.
+                    # analysis_codes에서도 제거해 LLM 호출 자체를 생략한다.
+                    # (보유 종목은 위 가드에서 no_data_codes에 넣지 않으므로 매도 판단은 유지)
+                    analysis_codes = [c for c in analysis_codes if c not in no_data_codes]
 
             def _nm(c: str) -> str:
                 c = str(c).strip()
@@ -2195,11 +2294,16 @@ class ArquantOrchestrator:
                 _qname = _nm(_qcode)
                 _is_held = _qcode in held_kr
                 _qrole = "보유" if _is_held else "후보"
-                _stock_section_marker = f"\n[{_qcode}]"
+                # 버그 수정 2026-05-19 (치명적): 마커가 '\n[{code}]'였는데 실제 퀀트 블록은
+                # format_quant_data_for_agent가 '[{code} 퀀트 데이터]'로 출력 → 마커가 요약줄
+                # '[{code}] 일봉: KIS +N행'에 매칭돼 행수만 전달, 실데이터(OHLCV/지표/수급)는
+                # 누락 → 계량분석팀장이 매번 '데이터 부족'으로 블라인드 평가(실매매까지 발생).
+                # 실제 출력 헤더 '[{code} 퀀트 데이터]'를 직접 타깃팅한다.
+                _stock_section_marker = f"[{_qcode} 퀀트 데이터]"
                 _stock_data = ""
                 _idx = company_data.find(_stock_section_marker)
                 if _idx >= 0:
-                    _end = company_data.find("\n[", _idx + 1)
+                    _end = company_data.find("\n[", _idx + len(_stock_section_marker))
                     _stock_data = company_data[_idx:_end] if _end > _idx else company_data[_idx:_idx + 4000]
                 _per_dart_str = per_dart.get(_qcode, "")
                 # 자동 재시도: 실패/도구호출JSON 응답 시 최대 2회 retry (사장 피드백 2026-05-18)
@@ -2275,7 +2379,8 @@ class ArquantOrchestrator:
                 final_view = await self.orchestrator.think(
                     f"[최종 매수 종목 결정]\n1차 후보: {_cand_line}\n최대 매수 개수 N = {_N} (전략 프리셋)\n현재 세션: {session}\n"
                     f"{_budget_hint}\n\n"
-                    f"전략리서치팀장 자산 배분 권고(전략리서치팀장의 매크로 판단 — 참고하여 반영):\n{macro_report[:600]}\n\n"
+                    + (f"{_standing_directive_block}\n\n" if _standing_directive_block else "")
+                    + f"전략리서치팀장 자산 배분 권고(전략리서치팀장의 매크로 판단 — 참고하여 반영):\n{macro_report[:600]}\n\n"
                     f"계량분석팀장 평가:\n{quant_report}\n\n뉴스분석팀장 평가:\n{news_report}\n\n"
                     f"후보 {len(candidate_codes)}개 중에서 실제로 매수할 종목을 **N개 이하**로 좁히십시오. "
                     f"퀀트 점수가 낮거나 뉴스 감성이 부정적이거나 1주 예산을 크게 넘는 종목은 빼십시오. 마땅한 게 없으면 더 적게 골라도, 0개여도 됩니다.\n"
@@ -2485,6 +2590,7 @@ class ArquantOrchestrator:
                     accepted = all(bad not in res for bad in ("실패", "에러", "거부", "예외", "REJECT", "초당", "거래건수"))
                     # Fill confirmation — "주문 전송 완료" only means *accepted*, not *filled*. Re-read holdings.
                     filled = False; fill_note = ""; fill_price: Optional[float] = None
+                    after_avg = 0.0  # KR 체결 확인 시 갱신 — 매수 후 블렌딩 평단
                     if accepted and is_kr:
                         try:
                             await asyncio.sleep(2.0)
@@ -2523,9 +2629,16 @@ class ArquantOrchestrator:
                     # 5분 후 _reverify_fills가 실제 보유 변동 없으면 차감한다.
                     is_us = not is_kr
                     ok = filled or (is_us and accepted)  # KR: 체결 확인 필수 / US: 접수=잠정 체결
+                    # 사장 지시 2026-05-19: 매수·매도 시점의 KIS 실매입평균가(pchs_avg_pric)를
+                    # 거래에 직접 박는다. 매도는 주문 직전 평단(before_avg)=청산 로트의 실제
+                    # 매수평단, 매수는 체결 후 블렌딩 평단(after_avg). 이게 없으면 실현수익률을
+                    # 로그 FIFO 재구성으로 추정해야 해 명목/실제가 어긋났다(근본 원인).
+                    avg_cost = (float(before_avg or 0.0) if od.side == "sell"
+                                else float(after_avg or before_avg or 0.0))
                     rec = {"ticker": tk, "side": od.side, "qty": qty, "result": res,
                            "accepted": accepted, "filled": filled, "fill_note": fill_note, "ok": ok,
-                           "fill_price": fill_price, "fill_currency": ("USD" if is_us else "KRW")}
+                           "fill_price": fill_price, "fill_currency": ("USD" if is_us else "KRW"),
+                           "avg_cost": avg_cost}
                     exec_results.append(rec)
                     if ok:
                         self._trades_executed += 1
@@ -2535,6 +2648,7 @@ class ArquantOrchestrator:
                         "message": f"{badge} — {res}" + (f" | {fill_note}" if fill_note else ""),
                         "ticker": tk, "side": od.side, "qty": qty, "filled": filled,
                         "fill_price": fill_price, "fill_currency": ("USD" if is_us else "KRW"),
+                        "avg_cost": avg_cost,
                         "trades_total": self._trades_executed})
                     self.cycle_log.log("EXEC", "시스템", f"{tk} {od.side} x{qty} → {res} | {fill_note}")
                 # 사장 피드백 2026-05-15 (#15): 체결과 접수 분리 표기
