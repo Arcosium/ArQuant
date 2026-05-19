@@ -139,3 +139,116 @@ def test_seed_admin_directive_safe_no_op_without_admin(isolated_profiles, monkey
         _real_seed()
     except Exception as e:
         pytest.fail(f"seed_admin_directive raised unexpectedly: {e}")
+
+
+# ─── sentinel / non-resurrection 테스트 ────────────────────────────────────────
+
+def _make_fake_user(uid: int):
+    return {"id": uid, "username": "hh09080"}
+
+
+def test_seed_writes_sentinel_on_first_seed(isolated_profiles, monkeypatch):
+    """최초 시드 후 sentinel 파일이 생성되어야 한다."""
+    sd = isolated_profiles
+    import infra.auth_store as _as
+    fake_uid = 77
+    monkeypatch.setattr(_as, "find_user_by_username", lambda *a, **kw: _make_fake_user(fake_uid))
+
+    sd.seed_admin_directive()
+
+    sentinel = sd._seed_sentinel_path(fake_uid)
+    assert sentinel.exists(), "sentinel 파일이 존재해야 한다"
+    import json as _json
+    data = _json.loads(sentinel.read_text(encoding="utf-8"))
+    assert "seeded_ids" in data
+    assert "ts" in data
+
+
+def test_non_resurrection_after_clear_directives(isolated_profiles, monkeypatch):
+    """시드 → clear_directives → seed_admin_directive() 재호출 시 지시가 부활하지 않는다.
+
+    sentinel 존재 → 재시드 차단 → 지시 목록은 여전히 비어있어야 함.
+    """
+    sd = isolated_profiles
+    import infra.auth_store as _as
+    fake_uid = 88
+    monkeypatch.setattr(_as, "find_user_by_username", lambda *a, **kw: _make_fake_user(fake_uid))
+
+    # 1) 최초 시드
+    sd.seed_admin_directive()
+    assert len(sd.load(fake_uid)) == 1, "시드 후 지시 1건 있어야 함"
+
+    # 2) 사용자가 지시 삭제
+    deleted = sd.clear_directives(fake_uid)
+    assert deleted == 1
+    assert sd.load(fake_uid) == [], "삭제 후 목록 비어있어야 함"
+
+    # sentinel은 그대로 남아있음
+    assert sd._seed_sentinel_exists(fake_uid), "sentinel은 삭제 후에도 유지되어야 함"
+
+    # 3) 재시작 시뮬레이션: seed_admin_directive() 재호출
+    sd.seed_admin_directive()
+
+    # 4) 지시가 부활하지 않아야 함
+    directives_after = sd.load(fake_uid)
+    assert directives_after == [], (
+        f"sentinel이 있으면 지시가 부활하면 안 된다. 실제: {directives_after}"
+    )
+
+
+def test_non_resurrection_after_remove_directive(isolated_profiles, monkeypatch):
+    """시드 → remove_directive → seed_admin_directive() 재호출 시 지시가 부활하지 않는다."""
+    sd = isolated_profiles
+    import infra.auth_store as _as
+    fake_uid = 89
+    monkeypatch.setattr(_as, "find_user_by_username", lambda *a, **kw: _make_fake_user(fake_uid))
+
+    # 1) 최초 시드
+    sd.seed_admin_directive()
+    directives = sd.load(fake_uid)
+    assert len(directives) == 1
+    directive_id = directives[0]["id"]
+
+    # 2) 단건 삭제
+    removed = sd.remove_directive(fake_uid, directive_id)
+    assert removed is True
+    assert sd.load(fake_uid) == []
+
+    # 3) 재시작 시뮬레이션
+    sd.seed_admin_directive()
+
+    # 4) 지시 부활 없음
+    assert sd.load(fake_uid) == [], "remove_directive 후 sentinel이 재시드를 차단해야 한다"
+
+
+def test_sentinel_governs_regardless_of_directive_presence(isolated_profiles, monkeypatch):
+    """sentinel 존재 시 지시 파일이 없어도 / 있어도 재시드 없음.
+
+    sentinel만 수동으로 기록해 두고 seed 호출 → 지시가 새로 추가되지 않아야 한다.
+    """
+    sd = isolated_profiles
+    import infra.auth_store as _as
+    fake_uid = 91
+    monkeypatch.setattr(_as, "find_user_by_username", lambda *a, **kw: _make_fake_user(fake_uid))
+
+    # sentinel만 미리 기록 (지시 파일 없음)
+    sd._write_seed_sentinel(fake_uid, ["manual"])
+
+    sd.seed_admin_directive()
+
+    # 지시가 추가되지 않아야 함
+    assert sd.load(fake_uid) == [], "sentinel이 있으면 지시가 없어도 재시드하면 안 된다"
+
+
+def test_multiple_restarts_only_seed_once(isolated_profiles, monkeypatch):
+    """여러 번 재시작(seed_admin_directive 다회 호출)해도 지시는 1건만."""
+    sd = isolated_profiles
+    import infra.auth_store as _as
+    fake_uid = 92
+    monkeypatch.setattr(_as, "find_user_by_username", lambda *a, **kw: _make_fake_user(fake_uid))
+
+    for _ in range(5):
+        sd.seed_admin_directive()
+
+    directives = sd.load(fake_uid)
+    assert len(directives) == 1, f"5번 재시드해도 지시는 1건이어야 함. 실제: {len(directives)}"

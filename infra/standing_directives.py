@@ -12,6 +12,12 @@ ArQuant — 계정별 상시 지시사항 (사장 피드백 2026-05-19 ITEM6)
 격리 보장:
   uid 별로 분리된 파일. 운용전략실장 프롬프트에는 활성 계정의 uid 지시만 삽입됨.
   다른 계정의 지시는 절대 섞이지 않는다.
+
+시드 sentinel 불변식:
+  data/profiles/<uid>/.standing_seed_done 이 존재하면 seed_admin_directive()는
+  즉시 반환(no-op)한다. 지시사항의 현재 존재 여부와 무관하게 재시드하지 않는다.
+  이는 사용자가 remove_directive/clear_directives 로 지시를 삭제한 경우
+  다음 재시작에서 지시가 부활하지 않음을 보장한다(영구 삭제 보장).
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ KST = timezone(timedelta(hours=9))
 _DATA_DIR = Path(__file__).parent.parent / "data"
 _PROFILES_DIR = _DATA_DIR / "profiles"
 _DIRECTIVES_FILENAME = "standing_directives.json"
+_SEED_SENTINEL_FILENAME = ".standing_seed_done"  # 계정당 시드 완료 마커
 _MAX_DIRECTIVES = 50  # 계정당 최대 저장 건수
 
 
@@ -147,6 +154,30 @@ def build_orchestrator_directive_block(uid: Optional[int]) -> str:
     return "\n".join(lines)
 
 
+# ─── 시드 sentinel 헬퍼 ────────────────────────────────────────────────────────
+
+def _seed_sentinel_path(uid: int) -> Path:
+    return _profile_dir(uid) / _SEED_SENTINEL_FILENAME
+
+
+def _seed_sentinel_exists(uid: int) -> bool:
+    """uid 계정의 시드 sentinel 파일이 존재하면 True."""
+    return _seed_sentinel_path(uid).exists()
+
+
+def _write_seed_sentinel(uid: int, seeded_ids: list) -> None:
+    """시드 완료 sentinel 파일 기록. 한 번만 실행됨을 보장하는 마커."""
+    try:
+        _seed_sentinel_path(uid).write_text(
+            json.dumps({"seeded_ids": seeded_ids, "ts": _now_kst()},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("seed sentinel 기록(uid=%s ids=%s)", uid, seeded_ids)
+    except Exception as e:
+        logger.warning("seed sentinel 기록 실패(uid=%s): %s", uid, e)
+
+
 # ─── Admin 계정 시드 ───────────────────────────────────────────────────────────
 
 # 사장 피드백 2026-05-19 ITEM6: 매크로 붕괴 시나리오 대응 상시 지시사항
@@ -162,8 +193,16 @@ MACRO_COLLAPSE_DIRECTIVE = (
 )
 
 
+# 안전 주석: 이 상시 지시는 운용전략실장 LLM 프롬프트에만 주입된다.
+# 결정론적 파이썬 리스크/guardrail 게이트는 영향받지 않으며(guardrails.py 미참조)
+# 지시가 안전 게이트를 우회해 실매매를 강제할 수 없다.
 def seed_admin_directive() -> None:
     """부팅 시 1회 호출: admin(hh09080) 계정에 매크로 붕괴 지시사항을 멱등 삽입.
+
+    sentinel 불변식:
+      data/profiles/<uid>/.standing_seed_done 이 존재하면 즉시 반환(no-op).
+      현재 지시 존재 여부와 무관하게 재시드하지 않는다.
+      사용자가 삭제한 지시는 영구 삭제 상태로 유지된다(부활 없음).
 
     admin 계정이 DB에 없으면 'data/profiles/admin_pending/' 에 대기 파일을 저장하고
     크래시 없이 종료 (안전한 no-op). 다음 부팅 시 계정이 생성되면 재시도된다.
@@ -209,8 +248,20 @@ def seed_admin_directive() -> None:
         return
 
     uid = user["id"]
+
+    # sentinel 확인: 이미 시드된 계정이면 즉시 반환 (부활 방지 핵심 게이트)
+    if _seed_sentinel_exists(uid):
+        logger.info(
+            "seed_admin_directive: sentinel 존재(uid=%s) — 재시드 생략 (사용자 삭제 보호)", uid
+        )
+        return
+
+    # 최초 시드: 지시 추가(멱등) 후 sentinel 기록
     added = append_directive(uid, MACRO_COLLAPSE_DIRECTIVE)
     if added:
         logger.info("seed_admin_directive: 매크로 붕괴 지시 admin uid=%s 에 삽입 완료", uid)
     else:
         logger.info("seed_admin_directive: 매크로 붕괴 지시 이미 존재(uid=%s) — 중복 생략", uid)
+
+    # sentinel 기록 — 이후 모든 재시작에서 재시드 차단
+    _write_seed_sentinel(uid, [_directive_id(MACRO_COLLAPSE_DIRECTIVE)])
