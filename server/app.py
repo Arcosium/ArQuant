@@ -425,18 +425,24 @@ async def admin_member_delete(req: AdminDeleteReq, request: Request):
     me = _require_admin(request)
     target = auth_store.find_user_by_username((req.username or "").strip())
     if not target:
+        auth_store.audit("admin_delete_member", username=(req.username or "").strip(),
+                         ip=_client_ip(request), outcome="fail", detail="not_found")
         raise HTTPException(404, "해당 회원을 찾을 수 없습니다.")
     if target["id"] == me:
+        auth_store.audit("admin_delete_member", username=(req.username or "").strip(),
+                         ip=_client_ip(request), outcome="fail", detail="self")
         raise HTTPException(400, "본인 계정은 삭제할 수 없습니다.")
     if target.get("is_admin"):
+        auth_store.audit("admin_delete_member", username=(req.username or "").strip(),
+                         ip=_client_ip(request), outcome="fail", detail="admin_protected")
         raise HTTPException(400, "ADMIN 계정은 삭제할 수 없습니다(단독 ADMIN 보호).")
     auth_store.delete_user(target["id"])
     import shutil
     from pathlib import Path
     shutil.rmtree(Path(__file__).resolve().parent.parent / "data" /
                   "profiles" / str(target["id"]), ignore_errors=True)
-    auth_store.audit("admin_delete_member", username=req.username,
-                     ip=_client_ip(request), outcome="ok", detail="")
+    auth_store.audit("admin_delete_member", username=target["username"],
+                     ip=_client_ip(request), outcome="ok", detail=f"uid={target['id']}")
     return {"ok": True}
 
 @app.get("/api/accounts")
