@@ -59,14 +59,15 @@ Expected: prints e.g. `argon2-cffi==23.1.0`
 
 - [ ] **Step 3: Pin it in requirements.txt**
 
-Add the printed line under `aiohttp==3.13.3` (keep alpha order — it goes first):
+Insert the printed line between `aiohttp==3.13.3` and `beautifulsoup4==4.14.3` (alphabetical: aiohttp < argon2-cffi < beautifulsoup4):
 
 ```
-argon2-cffi==23.1.0
 aiohttp==3.13.3
+argon2-cffi==25.1.0
+beautifulsoup4==4.14.3
 ```
 
-(Use the exact version Step 2 printed, not necessarily 23.1.0.)
+(Use the exact version Step 2 printed, not necessarily 25.1.0.)
 
 - [ ] **Step 4: Verify import works**
 
