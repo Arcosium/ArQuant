@@ -364,38 +364,35 @@ def get_user_credentials(user_id: int) -> Optional[Dict[str, Any]]:
     return _row_to_creds(row) if row else None
 
 
-def find_username_by_factors(kis_app_key: str, kis_app_secret: str,
-                             openrouter_key: str) -> Optional[str]:
-    """세 자격증명이 모두 정확히 일치하는 단일 유저의 아이디 반환(없으면 None).
-    블라인드 인덱스 단일 인덱스 조회 — 전체 복호 없음."""
-    if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(openrouter_key)):
+def find_username_by_factors(kis_account_no: str, kis_app_secret: str) -> Optional[str]:
+    """한투 계좌번호 + 한투 App Secret 이 모두 일치하는 단일 유저 아이디 반환.
+    블라인드 인덱스 조회 — 전체 복호 없음."""
+    if not (_norm(kis_account_no) and _norm(kis_app_secret)):
         return None
     init()
-    a, b, c = bidx(kis_app_key), bidx(kis_app_secret), bidx(openrouter_key)
+    a, b = bidx(kis_account_no), bidx(kis_app_secret)
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
-            "SELECT username FROM users WHERE kis_app_key_bidx=? AND "
-            "kis_app_secret_bidx=? AND openrouter_key_bidx=?", (a, b, c)).fetchone()
+            "SELECT username FROM users WHERE kis_account_no_bidx=? AND "
+            "kis_app_secret_bidx=?", (a, b)).fetchone()
     return row["username"] if row else None
 
 
-def reset_password_by_factors(username: str, kis_app_key: str, kis_app_secret: str,
-                              openrouter_key: str, new_password: str) -> bool:
-    """비밀번호 정책을 먼저 검사(정책 위반 → ValueError, 팩터 정오와 무관 — 공격자가
-    고른 입력의 약함만 노출, 계정/팩터 정보 무누설: enum 오라클 차단). 그다음 아이디+3팩터
-    완전 일치 시에만 새 비밀번호로 재설정. 불일치 시 False(아무 것도 바꾸지 않음)."""
+def reset_password_by_factors(username: str, kis_account_no: str,
+                              kis_app_secret: str, new_password: str) -> bool:
+    """정책 먼저 검사(위반→ValueError, 팩터 정오 무관 — enum 오라클 차단).
+    그다음 아이디+계좌번호+App Secret 완전 일치 시에만 재설정. 불일치 시 False."""
     perr = password_policy_error(new_password or "")
     if perr:
         raise ValueError(perr)
-    if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(openrouter_key)):
+    if not (_norm(kis_account_no) and _norm(kis_app_secret)):
         return False
     init()
-    a, b, c = bidx(kis_app_key), bidx(kis_app_secret), bidx(openrouter_key)
+    a, b = bidx(kis_account_no), bidx(kis_app_secret)
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
-            "SELECT id FROM users WHERE username=? AND kis_app_key_bidx=? AND "
-            "kis_app_secret_bidx=? AND openrouter_key_bidx=?",
-            (_norm(username), a, b, c)).fetchone()
+            "SELECT id FROM users WHERE username=? AND kis_account_no_bidx=? AND "
+            "kis_app_secret_bidx=?", (_norm(username), a, b)).fetchone()
         if not row:
             return False
         conn.execute("UPDATE users SET password_hash=?, password_enc='' WHERE id=?",
