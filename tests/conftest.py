@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from infra import auth_store as _auth_store
 
 # 저장소 루트를 import path 에 추가 (pytest를 어디서 호출하든 동작).
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,11 +42,7 @@ def fixed_runtime_limits(monkeypatch):
     return FIXED_LIMITS
 
 
-import pytest as _pytest
-from infra import auth_store as _auth_store
-
-
-@_pytest.fixture
+@pytest.fixture
 def fresh_auth(tmp_path, monkeypatch):
     """격리된 임시 DB/키로 auth_store 초기화 (모듈 글로벌 리셋). 인증 테스트 공용."""
     for _n, _v in [("_DATA_DIR", tmp_path), ("_DB_PATH", tmp_path / "auth.db"),
