@@ -590,6 +590,8 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 // ── 프로필 모달 (Task 7) ──────────────────────────────────────────────────────
 async function openProfile(){
+  document.getElementById('pf_pwmsg').textContent='';
+  document.getElementById('pf_cmsg').textContent='';
   const m=await fetch(API+'/api/me').then(r=>r.json()).catch(()=>({}));
   document.getElementById('pf_user').textContent=m.username||'계정';
   document.getElementById('pf_admin').style.display=m.is_admin?'inline-block':'none';
@@ -602,21 +604,24 @@ function closeProfile(){document.getElementById('profileOv').style.display='none
 async function pfLogout(){await fetch(API+'/api/logout',{method:'POST'});location.reload();}
 async function pfChangePw(){
   const r=await fetch(API+'/api/profile/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current:document.getElementById('pf_cur').value,new:document.getElementById('pf_new').value})});
-  document.getElementById('pf_pwmsg').textContent=r.ok?'변경됨':((await r.json()).detail||'실패');}
+  const d=await r.json().catch(()=>({}));
+  if(r.ok){document.getElementById('pf_cur').value='';document.getElementById('pf_new').value='';}
+  document.getElementById('pf_pwmsg').textContent=r.ok?'변경됨':((d&&(d.detail||d.message))||('HTTP '+r.status));}
 async function pfSaveCreds(){
   const g=id=>document.getElementById(id).value,b={};
   if(g('pf_or'))b.openrouter_key=g('pf_or');if(g('pf_ak'))b.kis_app_key=g('pf_ak');
   if(g('pf_as'))b.kis_app_secret=g('pf_as');if(g('pf_acct2'))b.kis_account_no=g('pf_acct2');
   if(g('pf_url'))b.kis_base_url=g('pf_url');
   const r=await fetch(API+'/api/profile/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
-  document.getElementById('pf_cmsg').textContent=r.ok?'저장됨':((await r.json()).detail||'실패');}
+  const d=await r.json().catch(()=>({}));
+  document.getElementById('pf_cmsg').textContent=r.ok?'저장됨':((d&&(d.detail||d.message))||('HTTP '+r.status));}
 async function loadDirs(){
   const d=((await fetch(API+'/api/profile/directives').then(r=>r.json()))||{}).directives||[];
   const box=document.getElementById('pf_dirs');box.textContent='';
   if(!d.length){const i=document.createElement('i');i.style.color='#7a869c';i.textContent='없음';box.appendChild(i);return;}
   d.forEach(x=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;gap:6px;padding:3px 0';
     const s=document.createElement('span');s.textContent=x.text;
-    const btn=document.createElement('button');btn.textContent='✕';btn.onclick=()=>pfDelDir(x.id);
+    const btn=document.createElement('button');btn.className='btn btn-ghost';btn.textContent='✕';btn.onclick=()=>pfDelDir(x.id);
     row.appendChild(s);row.appendChild(btn);box.appendChild(row);});}
 async function pfAddDir(){const t=document.getElementById('pf_dir');if(!t.value.trim())return;
   await fetch(API+'/api/profile/directives',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t.value})});t.value='';loadDirs();}
@@ -630,7 +635,7 @@ async function loadMembers(){
     if(m.is_admin){const a=document.createElement('b');a.style.color='#fbbf24';a.textContent='ADMIN ';s.appendChild(a);}
     const mode=document.createElement('span');mode.style.color=m.is_mock?'#fbbf24':'#34d399';mode.textContent=m.is_mock?'모의':'실거래';s.appendChild(mode);
     row.appendChild(s);
-    if(!m.is_admin){const btn=document.createElement('button');btn.textContent='삭제';btn.onclick=()=>pfDelMember(m.username);row.appendChild(btn);}
+    if(!m.is_admin){const btn=document.createElement('button');btn.className='btn btn-ghost';btn.textContent='삭제';btn.onclick=()=>pfDelMember(m.username);row.appendChild(btn);}
     box.appendChild(row);});}
 async function pfDelMember(u){if(!confirm(u+' 회원을 완전 삭제합니다. 되돌릴 수 없습니다.'))return;
   await fetch(API+'/api/admin/members/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});loadMembers();}
@@ -638,7 +643,7 @@ async function pfDeleteAccount(){
   if(!confirm('정말 회원 탈퇴하시겠습니까? 계정·자격증명·지시사항이 영구 삭제됩니다.'))return;
   const pw=prompt('확인을 위해 비밀번호를 입력하세요');if(!pw)return;
   const r=await fetch(API+'/api/profile/delete_account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
-  if(r.ok){alert('탈퇴 완료');location.reload();}else{alert(((await r.json())||{}).detail||'실패');}}
+  if(r.ok){alert('탈퇴 완료');location.reload();}else{const d=await r.json().catch(()=>({}));alert((d&&(d.detail||d.message))||('HTTP '+r.status));}}
 // ── 프로필 모달 끝 ────────────────────────────────────────────────────────────
 // 사장 피드백 2026-05-15 (4차): 사이드바 계층화 — 운용전략실장/운용지원실장 산하 팀장 들여쓰기 + '시스템' 제거.
 const agents=[
