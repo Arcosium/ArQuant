@@ -254,17 +254,17 @@ def username_exists(username: str) -> bool:
 def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: str,
                 openrouter_key: str, kis_account_no: str, kis_base_url: str,
                 dart_key: str = "", label: str = "", is_admin: bool = False) -> int:
-    """username 기준 upsert. 신규면 생성, 기존이면 자격증명·비밀번호 갱신. user_id 반환.
+    """username 기준 upsert. 비밀번호는 argon2id 해시로만 저장(password_enc 미사용),
+    복구용 블라인드 인덱스도 함께 기록. user_id 반환.
 
-    is_admin: 신규 생성 시에만 적용. 기존 계정의 ADMIN 권한은 절대 강등하지 않는다
-    (init() 마이그레이션이 ADMIN_USERNAMES 를 매번 재승격하므로 표시는 항상 일관)."""
+    is_admin: 신규 생성 시에만 적용. 기존 ADMIN 강등 안 함."""
     init()
     now = time.time()
     username = (username or "").strip()
     base_url = (kis_base_url or "https://openapi.koreainvestment.com:9443").strip()
     label = (label or username).strip()
     vals = dict(
-        password_enc=encrypt(password),
+        password_hash=hash_password(password),
         kis_app_key_enc=encrypt(kis_app_key),
         kis_app_secret_enc=encrypt(kis_app_secret),
         openrouter_key_enc=encrypt(openrouter_key),
@@ -272,29 +272,39 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
         kis_base_url=base_url,
         dart_key_enc=encrypt(dart_key) if (dart_key or "").strip() else "",
         label=label,
+        kis_app_key_bidx=bidx(kis_app_key),
+        kis_app_secret_bidx=bidx(kis_app_secret),
+        openrouter_key_bidx=bidx(openrouter_key),
     )
     with _DB_LOCK, _connect() as conn:
         row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
         if row:
             uid = int(row["id"])
             conn.execute(
-                """UPDATE users SET password_enc=?, kis_app_key_enc=?, kis_app_secret_enc=?,
-                   openrouter_key_enc=?, kis_account_no_enc=?, kis_base_url=?, dart_key_enc=?,
-                   label=?, last_login_at=?, last_validated_at=? WHERE id=?""",
-                (vals["password_enc"], vals["kis_app_key_enc"], vals["kis_app_secret_enc"],
+                """UPDATE users SET password_hash=?, password_enc='',
+                   kis_app_key_enc=?, kis_app_secret_enc=?, openrouter_key_enc=?,
+                   kis_account_no_enc=?, kis_base_url=?, dart_key_enc=?, label=?,
+                   kis_app_key_bidx=?, kis_app_secret_bidx=?, openrouter_key_bidx=?,
+                   last_login_at=?, last_validated_at=? WHERE id=?""",
+                (vals["password_hash"], vals["kis_app_key_enc"], vals["kis_app_secret_enc"],
                  vals["openrouter_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
-                 vals["dart_key_enc"], vals["label"], now, now, uid),
+                 vals["dart_key_enc"], vals["label"], vals["kis_app_key_bidx"],
+                 vals["kis_app_secret_bidx"], vals["openrouter_key_bidx"], now, now, uid),
             )
             return uid
         adm = 1 if (is_admin or username in ADMIN_USERNAMES) else 0
         cur = conn.execute(
-            """INSERT INTO users (username, password_enc, kis_app_key_enc, kis_app_secret_enc,
-               openrouter_key_enc, kis_account_no_enc, kis_base_url, dart_key_enc, label,
+            """INSERT INTO users (username, password_enc, password_hash,
+               kis_app_key_enc, kis_app_secret_enc, openrouter_key_enc,
+               kis_account_no_enc, kis_base_url, dart_key_enc, label,
+               kis_app_key_bidx, kis_app_secret_bidx, openrouter_key_bidx,
                is_admin, created_at, last_login_at, last_validated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (username, vals["password_enc"], vals["kis_app_key_enc"], vals["kis_app_secret_enc"],
-             vals["openrouter_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
-             vals["dart_key_enc"], vals["label"], adm, now, now, now),
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (username, "", vals["password_hash"], vals["kis_app_key_enc"],
+             vals["kis_app_secret_enc"], vals["openrouter_key_enc"],
+             vals["kis_account_no_enc"], vals["kis_base_url"], vals["dart_key_enc"],
+             vals["label"], vals["kis_app_key_bidx"], vals["kis_app_secret_bidx"],
+             vals["openrouter_key_bidx"], adm, now, now, now),
         )
         return int(cur.lastrowid)
 

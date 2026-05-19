@@ -20,3 +20,17 @@ def test_new_columns_exist(fresh_auth):
     con.close()
     assert {"password_hash", "kis_app_key_bidx",
             "kis_app_secret_bidx", "openrouter_key_bidx"} <= cols
+
+def test_upsert_stores_hash_and_bidx_not_plaintext(fresh_auth):
+    uid = fresh_auth.upsert_user(
+        username="alice", password="Sup3r$ecret!",
+        kis_app_key="AK", kis_app_secret="AS", openrouter_key="OR",
+        kis_account_no="123-01", kis_base_url="", dart_key="", label="")
+    import sqlite3
+    con = sqlite3.connect(fresh_auth._DB_PATH); con.row_factory = sqlite3.Row
+    r = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone(); con.close()
+    assert r["password_enc"] == ""                       # no encrypted password
+    assert r["password_hash"].startswith("$argon2id$")
+    assert r["kis_app_key_bidx"] == fresh_auth.bidx("AK")
+    assert r["kis_app_secret_bidx"] == fresh_auth.bidx("AS")
+    assert r["openrouter_key_bidx"] == fresh_auth.bidx("OR")

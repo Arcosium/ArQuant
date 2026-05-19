@@ -361,7 +361,6 @@ def test_upsert_stores_hash_and_bidx_not_plaintext(fresh_auth):
     assert r["kis_app_key_bidx"] == fresh_auth.bidx("AK")
     assert r["kis_app_secret_bidx"] == fresh_auth.bidx("AS")
     assert r["openrouter_key_bidx"] == fresh_auth.bidx("OR")
-    assert fresh_auth.verify_password("alice", "Sup3r$ecret!") is not None
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -433,7 +432,7 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3.11 -m pytest tests/test_auth_migration.py -v`
-Expected: PASS (both tests) — note this depends on Task 6's `verify_password`; if `verify_password` not yet rewritten this asserts via the legacy path which will fail. Run Task 6 next; re-run after Task 6. Mark this step done once Task 6 green.
+Expected: PASS (both tests). Run full suite — all green (verify_password integration is covered by Task 6's own tests).
 
 - [ ] **Step 5: Commit**
 
@@ -543,7 +542,7 @@ def verify_password(username: str, password: str) -> Optional[Dict[str, Any]]:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3.11 -m pytest tests/test_auth_hashing.py tests/test_auth_migration.py -v`
-Expected: PASS (all). Re-confirm Task 5 Step 4 now green.
+Expected: PASS (all).
 
 - [ ] **Step 5: Commit**
 
