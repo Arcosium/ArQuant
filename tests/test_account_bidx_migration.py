@@ -43,3 +43,25 @@ def test_migration_backfills_blank_account_bidx_idempotent(store):
     assert s1.get("acct_bidx", 0) >= 1
     s2 = store.migrate_passwords_and_bidx()
     assert s2.get("acct_bidx", 0) == 0
+
+
+def test_migration_skips_corrupt_account_enc_row_preserved(store):
+    """corrupt kis_account_no_enc → acct_bidx 카운트 안됨, 행(kis_account_no_bidx='') 보존."""
+    uid = store.upsert_user("u3", "Passw0rd!!xx", "AK", "AS", "OR",
+                            "1112223334", "https://openapi.koreainvestment.com:9443")
+    # kis_account_no_enc 를 유효하지 않은 Fernet 토큰으로 교체, bidx 초기화
+    with store._connect() as c:
+        c.execute(
+            "UPDATE users SET kis_account_no_enc='not-a-valid-fernet-token', "
+            "kis_account_no_bidx='' WHERE id=?",
+            (uid,),
+        )
+    stats = store.migrate_passwords_and_bidx()
+    # (a) acct_bidx 카운트 0 — 복호 실패로 백필 안됨
+    assert stats.get("acct_bidx", 0) == 0
+    # (b) 행 보존 — kis_account_no_bidx 여전히 '' (부분 쓰기·행 삭제 없음)
+    with store._connect() as c:
+        val = c.execute(
+            "SELECT kis_account_no_bidx FROM users WHERE id=?", (uid,)
+        ).fetchone()["kis_account_no_bidx"]
+    assert (val or "") == ""

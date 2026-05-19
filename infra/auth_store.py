@@ -525,6 +525,10 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                         if dec_acct:
                             updates["kis_account_no_bidx"] = bidx(dec_acct)
                             did_acct = True
+                        else:
+                            logger.error(
+                                "auth 마이그레이션: user_id=%s kis_account_no_enc "
+                                "복호 실패 — 계좌bidx 백필 스킵(행 보존)", r["id"])
 
                 # 여기까지 오면 updates 는 안전하게 쓸 수 있는 값들만 포함
                 if updates:
