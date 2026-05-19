@@ -20,12 +20,16 @@ import logging
 import os
 import secrets
 import sqlite3
+import hashlib
+import hmac as _hmac
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes as _hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 logger = logging.getLogger("AUTH")
 
@@ -39,6 +43,8 @@ SESSION_TTL_SEC = 7 * 24 * 60 * 60  # 7일
 
 _DB_LOCK = threading.RLock()
 _FERNET: Optional[Fernet] = None
+_FERNET_RAW: Optional[bytes] = None
+_BIDX_KEY: Optional[bytes] = None
 
 # 비밀번호 정책 (사장 피드백 2026-05-16 2차)
 PW_MIN_LEN = 10
@@ -84,7 +90,7 @@ def _existing_user_count() -> int:
 
 # ─── Fernet ───────────────────────────────────────────────────────────────────
 def _ensure_fernet() -> None:
-    global _FERNET
+    global _FERNET, _FERNET_RAW
     if _FERNET is not None:
         return
     key = (os.environ.get("ARQUANT_FERNET_KEY", "").strip() or "").encode("utf-8") or None
@@ -108,6 +114,7 @@ def _ensure_fernet() -> None:
             _FERNET_KEY_PATH.write_bytes(key)
             os.chmod(_FERNET_KEY_PATH, 0o600)
             logger.info("Fernet 키 신규 생성(신규 환경): %s (0600)", _FERNET_KEY_PATH)
+    _FERNET_RAW = key
     _FERNET = Fernet(key)
 
 
@@ -125,6 +132,31 @@ def decrypt(token: str) -> str:
     except (InvalidToken, ValueError) as e:
         logger.warning("Fernet 복호 실패(%s) — 빈 문자열 반환", type(e).__name__)
         return ""
+
+
+def _norm(v: str) -> str:
+    """복구 인자 정규화 — 등록 저장 시(.strip())와 반드시 동일해야 매칭됨."""
+    return (v or "").strip()
+
+
+def _bidx_key() -> bytes:
+    """Fernet 키에서 HKDF-SHA256 으로 파생한 블라인드 인덱스 전용 키.
+    별도 시크릿을 두지 않아 운영 부담이 없다(단, Fernet 키에 결합됨)."""
+    global _BIDX_KEY
+    if _BIDX_KEY is not None:
+        return _BIDX_KEY
+    _ensure_fernet()
+    if not _FERNET_RAW:
+        raise RuntimeError("blind-index 키 파생 불가 — Fernet 키 없음")
+    _BIDX_KEY = HKDF(algorithm=_hashes.SHA256(), length=32, salt=None,
+                     info=b"arquant-bidx-v1").derive(_FERNET_RAW)
+    return _BIDX_KEY
+
+
+def bidx(value: str) -> str:
+    """결정론적 블라인드 인덱스(HMAC-SHA256 hex) — 평문 노출 없이 동치 조회용."""
+    return _hmac.new(_bidx_key(), _norm(value).encode("utf-8"),
+                     hashlib.sha256).hexdigest()
 
 
 # ─── DB ───────────────────────────────────────────────────────────────────────
