@@ -320,31 +320,52 @@ class DeleteAccountReq(BaseModel):
 @app.post("/api/profile/password")
 async def profile_password(req: PwChangeReq, request: Request):
     uid = _uid_or_403(request)
+    ip = _client_ip(request)
+    creds_pw = auth_store.get_user_credentials(uid)
+    uname_pw = (creds_pw or {}).get("username", "")
     try:
         auth_store.change_password(uid, req.current, req.new)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    except ValueError:
+        auth_store.audit("profile_password", username=uname_pw, ip=ip,
+                         outcome="fail", detail="policy_or_current")
+        raise HTTPException(400, "비밀번호 변경 실패 — 현재 비밀번호 불일치 또는 정책 위반.")
+    auth_store.audit("profile_password", username=uname_pw, ip=ip, outcome="ok", detail="")
     return {"ok": True}
 
 @app.post("/api/profile/credentials")
 async def profile_credentials(req: CredsReq, request: Request):
     uid = _uid_or_403(request)
-    cur = auth_store.get_user_credentials(uid) or {}
-    ak = req.kis_app_key if req.kis_app_key is not None else cur.get("kis_app_key")
-    as_ = req.kis_app_secret if req.kis_app_secret is not None else cur.get("kis_app_secret")
-    bu = req.kis_base_url if req.kis_base_url is not None else cur.get("kis_base_url")
-    if req.kis_app_key is not None or req.kis_app_secret is not None or req.kis_base_url is not None:
-        ok, msg = await _validate_kis(ak, as_, bu)
+    ip = _client_ip(request)
+    creds_cr = auth_store.get_user_credentials(uid)
+    uname_cr = (creds_cr or {}).get("username", "")
+    cur = creds_cr or {}
+    # Fix 2 — strip whitespace on provided fields (mirrors register handler)
+    ak = req.kis_app_key.strip() if req.kis_app_key is not None else None
+    as_ = req.kis_app_secret.strip() if req.kis_app_secret is not None else None
+    or_key = req.openrouter_key.strip() if req.openrouter_key is not None else None
+    an = req.kis_account_no.strip() if req.kis_account_no is not None else None
+    bu = req.kis_base_url.strip() if req.kis_base_url is not None else None
+    # Resolve effective values for KIS validation (fall back to stored values when not provided)
+    eff_ak = ak if ak is not None else cur.get("kis_app_key")
+    eff_as = as_ if as_ is not None else cur.get("kis_app_secret")
+    eff_bu = bu if bu is not None else cur.get("kis_base_url")
+    if ak is not None or as_ is not None or bu is not None:
+        ok, msg = await _validate_kis(eff_ak, eff_as, eff_bu)
         if not ok:
+            auth_store.audit("profile_credentials", username=uname_cr, ip=ip,
+                             outcome="fail", detail="validate")
             raise HTTPException(400, msg)
-    if req.openrouter_key is not None:
-        ok, msg = await _validate_openrouter(req.openrouter_key)
+    if or_key is not None:
+        ok, msg = await _validate_openrouter(or_key)
         if not ok:
+            auth_store.audit("profile_credentials", username=uname_cr, ip=ip,
+                             outcome="fail", detail="validate")
             raise HTTPException(400, msg)
     auth_store.update_credentials(
-        uid, openrouter_key=req.openrouter_key, kis_app_key=req.kis_app_key,
-        kis_app_secret=req.kis_app_secret, kis_account_no=req.kis_account_no,
-        kis_base_url=req.kis_base_url)
+        uid, openrouter_key=or_key, kis_app_key=ak,
+        kis_app_secret=as_, kis_account_no=an,
+        kis_base_url=bu)
+    auth_store.audit("profile_credentials", username=uname_cr, ip=ip, outcome="ok", detail="")
     if creds_layer.current().get("user_id") == uid:
         await _activate_with_policy(uid)
     return {"ok": True}
@@ -372,9 +393,15 @@ async def profile_directives_del(did: str, request: Request):
 @app.post("/api/profile/delete_account")
 async def profile_delete_account(req: DeleteAccountReq, request: Request):
     uid = _uid_or_403(request)
+    ip = _client_ip(request)
     creds = auth_store.get_user_credentials(uid)
     if not creds or not auth_store.verify_password(creds["username"], req.password or ""):
+        auth_store.audit("delete_account",
+                         username=(creds or {}).get("username", ""),
+                         ip=ip, outcome="fail", detail="")
         raise HTTPException(400, "비밀번호가 일치하지 않습니다.")
+    # Audit BEFORE deletion (need creds["username"])
+    auth_store.audit("delete_account", username=creds["username"], ip=ip, outcome="ok", detail="")
     import shutil
     from pathlib import Path
     auth_store.delete_user(uid)
