@@ -407,6 +407,7 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
     복호 실패(InvalidToken 또는 기타 예외) 시 해당 행을 건너뜀 — 데이터 훼손 방지.
     FernetKeyLost 는 _ensure_fernet 에서 루프 진입 전에 발생하므로 여기서 잡지 않음."""
     init()
+    _ensure_fernet()  # 키 분실이면 여기서 FernetKeyLost — per-row except 에 삼켜지지 않게 선제 발생
     stats = {"pw": 0, "bidx": 0}
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
@@ -464,6 +465,7 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                 if did_bidx:
                     stats["bidx"] += 1
             except Exception as e:
+                # FernetKeyLost 는 위 _ensure_fernet() 선제 호출에서 발생 — 여기 도달 안 함
                 logger.error(
                     "auth 마이그레이션 행 실패 user_id=%s: %s — 스킵", r["id"], e)
                 continue

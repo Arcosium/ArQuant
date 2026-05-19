@@ -603,6 +603,19 @@ def test_migration_skips_row_with_corrupt_enc_no_data_loss(fresh_auth):
     assert r["password_enc"] == "not-a-valid-fernet-token"
     assert r["password_hash"] == ""
     assert r["kis_app_key_bidx"] == ""
+
+def test_migration_propagates_fernet_key_lost(fresh_auth, monkeypatch):
+    # a user exists (so key-loss is the dangerous case), then key disappears
+    fresh_auth.upsert_user("frank", "KeyLost$p9", "AK", "AS", "OR", "1-1", "", "", "")
+    # drop the in-memory key + the key file, reset init flag → next crypto op must raise
+    (fresh_auth._FERNET_KEY_PATH).unlink(missing_ok=True)
+    monkeypatch.setattr(fresh_auth, "_FERNET", None)
+    monkeypatch.setattr(fresh_auth, "_FERNET_RAW", None, raising=False)
+    monkeypatch.setattr(fresh_auth, "_BIDX_KEY", None, raising=False)
+    monkeypatch.setattr(fresh_auth, "_INITED", False)
+    import pytest as _pt
+    with _pt.raises(fresh_auth.FernetKeyLost):
+        fresh_auth.migrate_passwords_and_bidx()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -622,6 +635,7 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
     복호 실패(InvalidToken 또는 기타 예외) 시 해당 행을 건너뜀 — 데이터 훼손 방지.
     FernetKeyLost 는 _ensure_fernet 에서 루프 진입 전에 발생하므로 여기서 잡지 않음."""
     init()
+    _ensure_fernet()  # 키 분실이면 여기서 FernetKeyLost — per-row except 에 삼켜지지 않게 선제 발생
     stats = {"pw": 0, "bidx": 0}
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
@@ -679,6 +693,7 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                 if did_bidx:
                     stats["bidx"] += 1
             except Exception as e:
+                # FernetKeyLost 는 위 _ensure_fernet() 선제 호출에서 발생 — 여기 도달 안 함
                 logger.error(
                     "auth 마이그레이션 행 실패 user_id=%s: %s — 스킵", r["id"], e)
                 continue
@@ -705,7 +720,7 @@ In `server/app.py`, find the startup event (`@app.on_event("startup")` whose bod
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `python3.11 -m pytest tests/test_auth_migration.py -v`
-Expected: PASS (all 4)
+Expected: PASS (all 5: new_columns_exist, upsert_stores_hash_and_bidx, one_shot_migration_is_idempotent, migration_skips_row_with_corrupt_enc_no_data_loss, migration_propagates_fernet_key_lost)
 
 - [ ] **Step 5: Commit**
 

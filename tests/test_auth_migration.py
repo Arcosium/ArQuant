@@ -73,3 +73,16 @@ def test_migration_skips_row_with_corrupt_enc_no_data_loss(fresh_auth):
     assert r["password_enc"] == "not-a-valid-fernet-token"
     assert r["password_hash"] == ""
     assert r["kis_app_key_bidx"] == ""
+
+def test_migration_propagates_fernet_key_lost(fresh_auth, monkeypatch):
+    # a user exists (so key-loss is the dangerous case), then key disappears
+    fresh_auth.upsert_user("frank", "KeyLost$p9", "AK", "AS", "OR", "1-1", "", "", "")
+    # drop the in-memory key + the key file, reset init flag → next crypto op must raise
+    (fresh_auth._FERNET_KEY_PATH).unlink(missing_ok=True)
+    monkeypatch.setattr(fresh_auth, "_FERNET", None)
+    monkeypatch.setattr(fresh_auth, "_FERNET_RAW", None, raising=False)
+    monkeypatch.setattr(fresh_auth, "_BIDX_KEY", None, raising=False)
+    monkeypatch.setattr(fresh_auth, "_INITED", False)
+    import pytest as _pt
+    with _pt.raises(fresh_auth.FernetKeyLost):
+        fresh_auth.migrate_passwords_and_bidx()
