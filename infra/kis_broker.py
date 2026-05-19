@@ -41,6 +41,15 @@ def _clean_kis_msg(msg: str) -> str:
     return s.strip()
 
 
+def excd_to_excg(excd: Optional[str]) -> str:
+    """시세 프로브 거래소코드(NAS/NYS/AMS) → 주문 거래소코드(NASD/NYSE/AMEX).
+    미상·기타는 NASD 로 안전 폴백. 이미 주문코드면 그대로 통과."""
+    e = (excd or "").strip().upper()
+    if e in ("NASD", "NYSE", "AMEX"):
+        return e
+    return {"NAS": "NASD", "NYS": "NYSE", "AMS": "AMEX"}.get(e, "NASD")
+
+
 class OrderSide(str, Enum):
     BUY = "buy"; SELL = "sell"
 class PriceType(str, Enum):
@@ -241,8 +250,10 @@ class KISBroker:
     # ═══════════════════ 국내주식 주문 ═══════════════════
     async def kr_buy(self, code: str, qty: int, price: int = 0) -> str:
         tok = await self.token(); s = await self._s(); c, p = self._acnt()
-        body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":"01" if price else "01",
-                "ORD_QTY":str(qty),"ORD_UNPR":str(price),"CTAC_TLNO":""}
+        # 사장 지시 2026-05-19: 지정가(price>0)면 ORD_DVSN="00"(지정가), 없으면 "01"(시장가).
+        # 기존 '"01" if price else "01"'은 지정가 주문도 시장가로 체결시키던 버그.
+        body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":"00" if price else "01",
+                "ORD_QTY":str(qty),"ORD_UNPR":str(price) if price else "0","CTAC_TLNO":""}
         async with s.post(f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash",
             headers=self._h(tok,"TTTC0802U"), json=body) as r:
             d = await r.json()
@@ -250,8 +261,10 @@ class KISBroker:
 
     async def kr_sell(self, code: str, qty: int, price: int = 0) -> str:
         tok = await self.token(); s = await self._s(); c, p = self._acnt()
-        body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":"01" if price else "01",
-                "ORD_QTY":str(qty),"ORD_UNPR":str(price),"CTAC_TLNO":""}
+        # 사장 지시 2026-05-19: 지정가(price>0)면 ORD_DVSN="00"(지정가), 없으면 "01"(시장가).
+        # 기존 '"01" if price else "01"'은 지정가 매도도 시장가로 체결시키던 버그.
+        body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":"00" if price else "01",
+                "ORD_QTY":str(qty),"ORD_UNPR":str(price) if price else "0","CTAC_TLNO":""}
         async with s.post(f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash",
             headers=self._h(tok,"TTTC0801U"), json=body) as r:
             d = await r.json()
@@ -524,6 +537,9 @@ class KISBroker:
     # JNJ·PG are NYSE names so a NASDAQ-only query returns an empty 'last'. Probe these, cache the hit.
     _US_EXCH_CODES = ("NAS", "NYS", "AMS")
     _us_excd_cache: Dict[str, str] = {}
+    # 2026-05-19: 모든 거래소가 rt_cd=0(정상)인데 일봉 0건인 티커(예: 상장폐지 "X"=US Steel)를
+    # 기억해 이후 사이클의 3회 중복 KIS 호출·경보 로그를 생략. 프로세스 재시작 시 비워져 재검증됨.
+    _us_dataless: set = set()
 
     async def _us_price_raw(self, ticker: str) -> Dict:
         """First non-empty overseas-price 'output' across NAS/NYS/AMS ({} on total failure).
@@ -572,28 +588,65 @@ class KISBroker:
             return 0.0
 
     async def us_daily_chart(self, ticker: str, days: int = 100) -> List[Dict]:
-        """미국주식 일봉 조회 (HHDFS76240000) — 거래소 자동 탐색 후 CSV 누적.
+        """미국주식 일봉 조회 (HHDFS76240000) — 거래소(NAS/NYS/AMS) 직접 프로브 후 CSV 누적.
         Returns parsed rows; writes to data/daily_US_{ticker}.csv with the same OHLCV schema as KR.
-        사장 지시(2026-05-14): 미국 종목도 historical 데이터를 가져야 퀀트 분석이 정상 작동."""
+        사장 지시(2026-05-14): 미국 종목도 historical 데이터를 가져야 퀀트 분석이 정상 작동.
+
+        버그 수정 2026-05-19: 과거엔 실시간시세 프로브(_us_price_raw)로만 거래소를
+        알아내, 그게 실패하면 excd가 'NAS'로 폴백돼 NYSE 종목(예: BAC)이 0행이 됐다.
+        일봉은 실시간 호가가 필요 없으므로 dailyprice 엔드포인트 자체를 거래소별로
+        직접 시도하고 첫 비어있지 않은 응답을 채택한다 (장시간·시세구독과 무관)."""
         tk = (ticker or "").strip().upper()
         if not tk:
             return []
-        # First make sure we know the right exchange — reuse the price-probe cache
-        if tk not in self._us_excd_cache:
-            await self._us_price_raw(tk)
-        excd = self._us_excd_cache.get(tk, "NAS")
-        # daily-price API uses 3-letter EXCD same as price API
+        if tk in self._us_dataless:
+            logger.info(f"[US일봉] {tk} 상장폐지/데이터없음 캐시 — KIS 조회 생략 (재시작 시 재검증)")
+            return []
         tok = await self.token(); s = await self._s()
-        try:
-            async with s.get(f"{self.base_url}/uapi/overseas-price/v1/quotations/dailyprice",
-                headers=self._h(tok, "HHDFS76240000"),
-                params={"AUTH":"","EXCD":excd,"SYMB":tk,
-                        "GUBN":"0",          # 0=일, 1=주, 2=월
-                        "BYMD": datetime.now(KST).strftime("%Y%m%d"),
-                        "MODP":"1"}) as r:   # 1=수정주가 반영
-                data = (await r.json()).get("output2", []) or []
-        except Exception as e:
-            logger.warning(f"[US일봉] {tk} 조회 실패: {e}")
+        # 알려진 거래소가 있으면 그것부터, 없으면 NAS→NYS→AMS 순으로 일봉 직접 프로브
+        codes = list(self._US_EXCH_CODES)
+        if tk in self._us_excd_cache:
+            codes = [self._us_excd_cache[tk]] + [c for c in codes if c != self._us_excd_cache[tk]]
+        data: List[Dict] = []
+        exchange_results = []
+        for i, excd in enumerate(codes):
+            try:
+                if i:
+                    await asyncio.sleep(0.3)  # KIS TPS 완화
+                async with s.get(f"{self.base_url}/uapi/overseas-price/v1/quotations/dailyprice",
+                    headers=self._h(tok, "HHDFS76240000"),
+                    params={"AUTH":"","EXCD":excd,"SYMB":tk,
+                            "GUBN":"0",          # 0=일, 1=주, 2=월
+                            "BYMD": datetime.now(KST).strftime("%Y%m%d"),
+                            "MODP":"1"}) as r:   # 1=수정주가 반영
+                    resp_json = await r.json()
+                    status = resp_json.get("rt_cd", "?")
+                    _out = resp_json.get("output2", []) or []
+                    exchange_results.append({"excd": excd, "status": status, "output2_len": len(_out)})
+                    if status != "0":
+                        logger.warning(f"[US일봉] {tk} {excd} rt_cd={status} msg1={resp_json.get('msg1','')} output2_len={len(_out)}")
+                    elif not _out:
+                        logger.info(f"[US일봉] {tk} {excd} rt_cd=0 but output2 empty (msg1={resp_json.get('msg1','')})")
+                if _out:
+                    data = _out
+                    self._us_excd_cache[tk] = excd   # 다음 조회는 단일 요청으로
+                    break
+            except Exception as e:
+                logger.warning(f"[US일봉] {tk} {excd} 조회 예외: {e}")
+                continue
+        if not data:
+            details = "; ".join(f"{r['excd']}: status={r['status']}, output2_len={r['output2_len']}" for r in exchange_results)
+            _all_clean_empty = (len(exchange_results) == len(codes)
+                                and all(r["status"] == "0" and r["output2_len"] == 0 for r in exchange_results))
+            if _all_clean_empty:
+                # 모든 거래소가 rt_cd=0(정상)인데 데이터 0 → 상장폐지/미지원 종목으로 확정.
+                # 캐시 등록해 이후 사이클의 중복 호출·경보를 제거 (프로세스 재시작 시 재검증).
+                self._us_dataless.add(tk)
+                logger.info(f"[US일봉] {tk} 상장폐지/데이터없음 확정 (전 거래소 rt_cd=0+빈응답) — "
+                            f"이후 사이클 조회 생략. 상세: {details}")
+            else:
+                # 일부 거래소 에러/비정상 → 일시적일 수 있어 캐시하지 않고 경고 유지(다음 사이클 재시도).
+                logger.warning(f"[US일봉] {tk} 모든 거래소(NAS/NYS/AMS) output2 비어있음 — 상세: {details}")
             return []
         rows = []
         for x in data[:max(1, days)]:
@@ -614,23 +667,58 @@ class KISBroker:
         self._append_csv(f"daily_US_{tk}.csv", rows, ["date","open","high","low","close","volume"])
         return rows
 
+    async def _overseas_order_body(self, ticker: str, qty: int, price: float,
+                                   *, side: str, excd: str):
+        """KIS 해외주식 주문 바디 조립.
+
+        버그(2026-05-19): KIS 해외주식 주문 TR(TTTT1002U/1006U)은 국내 '01'
+        시장가가 없고 유효 지정가 단가를 요구한다. price 미지정(시장가 의도)에
+        OVRS_ORD_UNPR="0" 을 보내면 KIS 가 "가격 $0.01 미만 주문불가" 로 거부.
+        → 시장가 의도면 현재가 기반 **체결가능 지정가**로 환산해 전송한다.
+        현재가 미확보면 0 전송 대신 실패 문자열 반환(원칙 #14: 데이터 결손을
+        주문가능 조건으로 오인 금지). 거래소는 시세 프로브가 캐싱한 값을 매핑.
+        반환: dict(주문 바디) 또는 str(실패 — 미전송)."""
+        import math
+        tk = (ticker or "").strip().upper()
+        lp = 0.0
+        try:
+            lp = float(price or 0)
+        except (TypeError, ValueError):
+            lp = 0.0
+        if lp <= 0:  # 시장가 의도 → 현재가로 체결가능 지정가 산출
+            lp = await self.us_last_price(tk)
+            if not lp or lp <= 0:
+                return (f"[US{'매수' if side == 'buy' else '매도'} 실패] {tk} "
+                        f"현재가(시세) 조회 실패 — 주문 미전송")
+        if side == "buy":      # 매수: 현재가보다 살짝 위(체결 보장), 센트 올림
+            unpr = math.ceil(lp * 1.003 * 100) / 100.0
+        else:                   # 매도: 현재가보다 살짝 아래, 센트 내림
+            unpr = math.floor(lp * 0.997 * 100) / 100.0
+        excg = excd_to_excg(self._us_excd_cache.get(tk) or excd)
+        c, p = self._acnt()
+        return {"CANO": c, "ACNT_PRDT_CD": p, "OVRS_EXCG_CD": excg, "PDNO": tk,
+                "ORD_QTY": str(int(qty)), "OVRS_ORD_UNPR": f"{unpr:.2f}",
+                "ORD_SVR_DVSN_CD": "0", "ORD_DVSN": "00"}
+
     async def us_buy(self, ticker: str, qty: int, price: float = 0, excd: str = "NASD") -> str:
-        tok = await self.token(); s = await self._s(); c, p = self._acnt()
+        body = await self._overseas_order_body(ticker, qty, price, side="buy", excd=excd)
+        if isinstance(body, str):
+            return body
+        tok = await self.token(); s = await self._s()
         async with s.post(f"{self.base_url}/uapi/overseas-stock/v1/trading/order",
-            headers=self._h(tok,"TTTT1002U"),
-            json={"CANO":c,"ACNT_PRDT_CD":p,"OVRS_EXCG_CD":excd,"PDNO":ticker,
-                  "ORD_QTY":str(qty),"OVRS_ORD_UNPR":str(price),"ORD_SVR_DVSN_CD":"0","ORD_DVSN":"00"}) as r:
+            headers=self._h(tok,"TTTT1002U"), json=body) as r:
             d = await r.json()
-        return f"[US매수] {ticker} {qty}주 → {_clean_kis_msg(d.get('msg1',''))}"
+        return f"[US매수] {ticker} {qty}주 @ ${body['OVRS_ORD_UNPR']} → {_clean_kis_msg(d.get('msg1',''))}"
 
     async def us_sell(self, ticker: str, qty: int, price: float = 0, excd: str = "NASD") -> str:
-        tok = await self.token(); s = await self._s(); c, p = self._acnt()
+        body = await self._overseas_order_body(ticker, qty, price, side="sell", excd=excd)
+        if isinstance(body, str):
+            return body
+        tok = await self.token(); s = await self._s()
         async with s.post(f"{self.base_url}/uapi/overseas-stock/v1/trading/order",
-            headers=self._h(tok,"TTTT1006U"),
-            json={"CANO":c,"ACNT_PRDT_CD":p,"OVRS_EXCG_CD":excd,"PDNO":ticker,
-                  "ORD_QTY":str(qty),"OVRS_ORD_UNPR":str(price),"ORD_SVR_DVSN_CD":"0","ORD_DVSN":"00"}) as r:
+            headers=self._h(tok,"TTTT1006U"), json=body) as r:
             d = await r.json()
-        return f"[US매도] {ticker} {qty}주 → {_clean_kis_msg(d.get('msg1',''))}"
+        return f"[US매도] {ticker} {qty}주 @ ${body['OVRS_ORD_UNPR']} → {_clean_kis_msg(d.get('msg1',''))}"
 
     async def us_balance(self) -> str:
         tok = await self.token(); s = await self._s(); c, p = self._acnt()

@@ -1,0 +1,110 @@
+"""US 해외주식 '시장가' 주문 버그 회귀 테스트.
+
+버그(2026-05-19, 런타임 입증 claude_response.json L6856):
+  price_type:"market" US 매수가 us_buy(price=0)로 호출되어 KIS에
+  OVRS_ORD_UNPR="0" + ORD_DVSN="00"(지정가) 전송 → KIS가
+  "가격 $0.01 미만시 온라인 주문불가조건입니다" 로 거부.
+  (KIS 해외주식 주문 TR은 국내 '01' 시장가가 없고 유효한 지정가 단가를 요구.)
+
+요구 동작:
+  - limit price 미지정(시장가 의도) 시 현재가(us_last_price) 기반
+    체결가능 지정가(marketable limit, 2자리)로 전송 — 절대 "0" 금지.
+  - OVRS_EXCG_CD 는 시세 프로브가 캐싱한 거래소(NAS/NYS/AMS)를
+    주문 거래소코드(NASD/NYSE/AMEX)로 매핑 (UUP=AMS→AMEX).
+  - 현재가 조회 실패(0) 시 0 전송 대신 명확한 실패 반환·미전송(원칙 #14).
+"""
+import asyncio
+import pytest
+
+from infra import kis_broker
+from infra.kis_broker import KISBroker
+
+
+def test_excd_to_excg_maps_price_exchange_to_order_exchange():
+    f = kis_broker.excd_to_excg
+    assert f("NAS") == "NASD"
+    assert f("NYS") == "NYSE"
+    assert f("AMS") == "AMEX"
+    assert f("") == "NASD"          # 미상 → 안전 기본
+    assert f(None) == "NASD"
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._p = payload
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+    async def json(self):
+        return self._p
+
+
+class _FakeSession:
+    """aiohttp 세션 대역 — post 의 json 바디를 캡처한다."""
+    def __init__(self):
+        self.posted = []
+    def post(self, url, headers=None, json=None):
+        self.posted.append({"url": url, "json": json})
+        return _FakeResp({"rt_cd": "0", "msg1": "정상처리 되었습니다."})
+
+
+def _broker_with_fakes(monkeypatch, *, last_price):
+    b = KISBroker()
+    fake = _FakeSession()
+
+    async def _tok():
+        return "TESTTOKEN"
+
+    async def _sess():
+        return fake
+
+    async def _last(tk):
+        return last_price
+
+    monkeypatch.setattr(b, "token", _tok)
+    monkeypatch.setattr(b, "_s", _sess)
+    monkeypatch.setattr(b, "us_last_price", _last)
+    b._us_excd_cache["UUP"] = "AMS"   # 시세 프로브가 발견·캐싱한 거래소
+    return b, fake
+
+
+def test_us_buy_market_sends_marketable_limit_not_zero(monkeypatch):
+    b, fake = _broker_with_fakes(monkeypatch, last_price=27.80)
+
+    asyncio.run(b.us_buy("UUP", 2, price=0))
+
+    assert fake.posted, "주문이 KIS 로 전송되어야 한다"
+    body = fake.posted[-1]["json"]
+    unpr = body["OVRS_ORD_UNPR"]
+    assert unpr not in ("0", "0.0", "0.00", 0, ""), (
+        f"시장가 주문이 단가 0 으로 전송됨(버그): {unpr!r}")
+    assert float(unpr) >= 27.80, f"체결가능 지정가는 현재가 이상이어야: {unpr!r}"
+    assert float(unpr) <= 27.80 * 1.05, f"버퍼 과대(슬리피지): {unpr!r}"
+    assert body["OVRS_EXCG_CD"] == "AMEX", (
+        f"UUP(AMS) → AMEX 매핑이어야: {body['OVRS_EXCG_CD']!r}")
+    # 2자리 통화 정밀도 (sub-penny 자체가 KIS 거부 사유)
+    assert len(str(unpr).split(".")[-1]) <= 2, f"센트 단위 초과: {unpr!r}"
+
+
+def test_us_buy_no_price_available_does_not_submit_zero(monkeypatch):
+    b, fake = _broker_with_fakes(monkeypatch, last_price=0.0)
+
+    res = asyncio.run(b.us_buy("UUP", 2, price=0))
+
+    assert not fake.posted, "현재가 미확보면 KIS 로 주문을 보내면 안 된다"
+    assert "실패" in res or "시세" in res, f"명확한 실패 메시지여야: {res!r}"
+
+
+def test_us_sell_market_sends_marketable_limit_not_zero(monkeypatch):
+    b, fake = _broker_with_fakes(monkeypatch, last_price=27.80)
+
+    asyncio.run(b.us_sell("UUP", 2, price=0))
+
+    body = fake.posted[-1]["json"]
+    unpr = body["OVRS_ORD_UNPR"]
+    assert unpr not in ("0", "0.0", "0.00", 0, ""), (
+        f"시장가 매도가 단가 0 으로 전송됨(버그): {unpr!r}")
+    assert float(unpr) <= 27.80, "매도 체결가능 지정가는 현재가 이하여야"
+    assert float(unpr) >= 27.80 * 0.95, "매도 버퍼 과대(슬리피지)"
+    assert body["OVRS_EXCG_CD"] == "AMEX"
