@@ -152,15 +152,13 @@ class LoginReq(BaseModel):
     remember: bool = True
 
 class RecoverIdReq(BaseModel):
-    kis_app_key: str
+    kis_account_no: str
     kis_app_secret: str
-    openrouter_key: str
 
 class RecoverPwReq(BaseModel):
     username: str
-    kis_app_key: str
+    kis_account_no: str
     kis_app_secret: str
-    openrouter_key: str
     new_password: str
 
 class SwitchReq(BaseModel):
@@ -258,7 +256,7 @@ async def recover_id(req: RecoverIdReq, request: Request):
     ip = _client_ip(request)
     _throttle(_rl_recover, f"recid:{ip}")
     uname = auth_store.find_username_by_factors(
-        req.kis_app_key, req.kis_app_secret, req.openrouter_key)
+        req.kis_account_no, req.kis_app_secret)
     auth_store.audit("recover_id", username=uname, ip=ip,
                      outcome=("ok" if uname else "fail"), detail="")
     if not uname:
@@ -271,8 +269,8 @@ async def recover_password(req: RecoverPwReq, request: Request):
     _throttle(_rl_recover, f"recpw:{ip}")
     try:
         ok = auth_store.reset_password_by_factors(
-            (req.username or "").strip(), req.kis_app_key, req.kis_app_secret,
-            req.openrouter_key, req.new_password)
+            (req.username or "").strip(), req.kis_account_no,
+            req.kis_app_secret, req.new_password)
     except ValueError as e:
         auth_store.audit("recover_password", username=(req.username or "").strip(),
                          ip=ip, outcome="fail", detail="policy")
@@ -301,6 +299,155 @@ async def me(request: Request):
             "has_dart": bool(c.get("dart_key")),
             "is_admin": bool(c.get("is_admin")),  # 사장 피드백 2026-05-18: 코드변경 전체반영 권한 표시
             "active": creds_layer.current()}
+
+class PwChangeReq(BaseModel):
+    current: str
+    new: str
+
+class CredsReq(BaseModel):
+    openrouter_key: Optional[str] = None
+    kis_app_key: Optional[str] = None
+    kis_app_secret: Optional[str] = None
+    kis_account_no: Optional[str] = None
+    kis_base_url: Optional[str] = None
+
+class DirectiveReq(BaseModel):
+    text: str
+
+class DeleteAccountReq(BaseModel):
+    password: str
+
+@app.post("/api/profile/password")
+async def profile_password(req: PwChangeReq, request: Request):
+    uid = _uid_or_403(request)
+    ip = _client_ip(request)
+    creds_pw = auth_store.get_user_credentials(uid)
+    uname_pw = (creds_pw or {}).get("username", "")
+    try:
+        auth_store.change_password(uid, req.current, req.new)
+    except ValueError:
+        auth_store.audit("profile_password", username=uname_pw, ip=ip,
+                         outcome="fail", detail="policy_or_current")
+        raise HTTPException(400, "비밀번호 변경 실패 — 현재 비밀번호 불일치 또는 정책 위반.")
+    auth_store.audit("profile_password", username=uname_pw, ip=ip, outcome="ok", detail="")
+    return {"ok": True}
+
+@app.post("/api/profile/credentials")
+async def profile_credentials(req: CredsReq, request: Request):
+    uid = _uid_or_403(request)
+    ip = _client_ip(request)
+    creds_cr = auth_store.get_user_credentials(uid)
+    uname_cr = (creds_cr or {}).get("username", "")
+    cur = creds_cr or {}
+    # Fix 2 — strip whitespace on provided fields (mirrors register handler)
+    ak = req.kis_app_key.strip() if req.kis_app_key is not None else None
+    as_ = req.kis_app_secret.strip() if req.kis_app_secret is not None else None
+    or_key = req.openrouter_key.strip() if req.openrouter_key is not None else None
+    an = req.kis_account_no.strip() if req.kis_account_no is not None else None
+    bu = req.kis_base_url.strip() if req.kis_base_url is not None else None
+    # Resolve effective values for KIS validation (fall back to stored values when not provided)
+    eff_ak = ak if ak is not None else cur.get("kis_app_key")
+    eff_as = as_ if as_ is not None else cur.get("kis_app_secret")
+    eff_bu = bu if bu is not None else cur.get("kis_base_url")
+    if ak is not None or as_ is not None or bu is not None:
+        ok, msg = await _validate_kis(eff_ak, eff_as, eff_bu)
+        if not ok:
+            auth_store.audit("profile_credentials", username=uname_cr, ip=ip,
+                             outcome="fail", detail="validate")
+            raise HTTPException(400, msg)
+    if or_key is not None:
+        ok, msg = await _validate_openrouter(or_key)
+        if not ok:
+            auth_store.audit("profile_credentials", username=uname_cr, ip=ip,
+                             outcome="fail", detail="validate")
+            raise HTTPException(400, msg)
+    auth_store.update_credentials(
+        uid, openrouter_key=or_key, kis_app_key=ak,
+        kis_app_secret=as_, kis_account_no=an,
+        kis_base_url=bu)
+    auth_store.audit("profile_credentials", username=uname_cr, ip=ip, outcome="ok", detail="")
+    if creds_layer.current().get("user_id") == uid:
+        await _activate_with_policy(uid)
+    return {"ok": True}
+
+@app.get("/api/profile/directives")
+async def profile_directives_list(request: Request):
+    uid = _uid_or_403(request)
+    from infra import standing_directives as sd
+    return {"directives": sd.load(uid)}
+
+@app.post("/api/profile/directives")
+async def profile_directives_add(req: DirectiveReq, request: Request):
+    uid = _uid_or_403(request)
+    from infra import standing_directives as sd
+    added = sd.append_directive(uid, req.text)
+    return {"ok": True, "added": added, "directives": sd.load(uid)}
+
+@app.delete("/api/profile/directives/{did}")
+async def profile_directives_del(did: str, request: Request):
+    uid = _uid_or_403(request)
+    from infra import standing_directives as sd
+    sd.remove_directive(uid, did)
+    return {"ok": True, "directives": sd.load(uid)}
+
+@app.post("/api/profile/delete_account")
+async def profile_delete_account(req: DeleteAccountReq, request: Request):
+    uid = _uid_or_403(request)
+    ip = _client_ip(request)
+    creds = auth_store.get_user_credentials(uid)
+    if not creds or not auth_store.verify_password(creds["username"], req.password or ""):
+        auth_store.audit("delete_account",
+                         username=(creds or {}).get("username", ""),
+                         ip=ip, outcome="fail", detail="")
+        raise HTTPException(400, "비밀번호가 일치하지 않습니다.")
+    if auth_store.is_admin(uid):
+        auth_store.audit("delete_account", username=creds["username"], ip=ip,
+                         outcome="fail", detail="admin_protected")
+        raise HTTPException(400, "ADMIN 계정은 탈퇴할 수 없습니다(단독 ADMIN 보호).")
+    # Audit BEFORE deletion (need creds["username"])
+    auth_store.audit("delete_account", username=creds["username"], ip=ip, outcome="ok", detail="")
+    import shutil
+    from pathlib import Path
+    auth_store.delete_user(uid)
+    shutil.rmtree(Path(__file__).resolve().parent.parent / "data" /
+                  "profiles" / str(uid), ignore_errors=True)
+    resp = JSONResponse(content={"ok": True})
+    resp.delete_cookie(auth_store.SESSION_COOKIE, path="/",
+                       secure=_COOKIE_SECURE, httponly=True, samesite="lax")
+    return resp
+
+class AdminDeleteReq(BaseModel):
+    username: str
+
+@app.get("/api/admin/members")
+async def admin_members(request: Request):
+    _require_admin(request)
+    return {"members": auth_store.list_members()}
+
+@app.post("/api/admin/members/delete")
+async def admin_member_delete(req: AdminDeleteReq, request: Request):
+    me = _require_admin(request)
+    target = auth_store.find_user_by_username((req.username or "").strip())
+    if not target:
+        auth_store.audit("admin_delete_member", username=(req.username or "").strip(),
+                         ip=_client_ip(request), outcome="fail", detail="not_found")
+        raise HTTPException(404, "해당 회원을 찾을 수 없습니다.")
+    if target["id"] == me:
+        auth_store.audit("admin_delete_member", username=(req.username or "").strip(),
+                         ip=_client_ip(request), outcome="fail", detail="self")
+        raise HTTPException(400, "본인 계정은 삭제할 수 없습니다.")
+    if target.get("is_admin"):
+        auth_store.audit("admin_delete_member", username=(req.username or "").strip(),
+                         ip=_client_ip(request), outcome="fail", detail="admin_protected")
+        raise HTTPException(400, "ADMIN 계정은 삭제할 수 없습니다(단독 ADMIN 보호).")
+    auth_store.delete_user(target["id"])
+    import shutil
+    from pathlib import Path
+    shutil.rmtree(Path(__file__).resolve().parent.parent / "data" /
+                  "profiles" / str(target["id"]), ignore_errors=True)
+    auth_store.audit("admin_delete_member", username=target["username"],
+                     ip=_client_ip(request), outcome="ok", detail=f"uid={target['id']}")
+    return {"ok": True}
 
 @app.get("/api/accounts")
 async def accounts():
@@ -490,6 +637,13 @@ def _admin_uid_or_403(request: Request) -> int:
         _is_adm = False
     if not _is_adm:
         raise HTTPException(403, "Coresight 수신함은 ADMIN(hh09080) 전용입니다.")
+    return uid
+
+
+def _require_admin(request: Request) -> int:
+    uid = _uid_or_403(request)
+    if not auth_store.is_admin(uid):
+        raise HTTPException(403, "ADMIN(hh09080) 전용 기능입니다.")
     return uid
 
 

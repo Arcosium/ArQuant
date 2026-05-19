@@ -16,16 +16,16 @@ def client(tmp_path, monkeypatch):
 
 def test_recover_id_endpoint(client):
     r = client.post("/api/recover_id", json={
-        "kis_app_key": "AKz", "kis_app_secret": "ASz", "openrouter_key": "ORz"})
+        "kis_account_no": "1-1", "kis_app_secret": "ASz"})
     assert r.status_code == 200 and r.json()["username"] == "zoe"
     bad = client.post("/api/recover_id", json={
-        "kis_app_key": "AKz", "kis_app_secret": "ASz", "openrouter_key": "NOPE"})
+        "kis_account_no": "1-1", "kis_app_secret": "NOPE"})
     assert bad.status_code == 404
 
 def test_recover_password_endpoint(client):
     ok = client.post("/api/recover_password", json={
-        "username": "zoe", "kis_app_key": "AKz", "kis_app_secret": "ASz",
-        "openrouter_key": "ORz", "new_password": "BrandN3w$pw"})
+        "username": "zoe", "kis_account_no": "1-1", "kis_app_secret": "ASz",
+        "new_password": "BrandN3w$pw"})
     assert ok.status_code == 200 and ok.json()["ok"] is True
     assert client.post("/api/login", json={
         "username": "zoe", "password": "BrandN3w$pw"}).status_code == 200
@@ -33,8 +33,8 @@ def test_recover_password_endpoint(client):
 def test_recover_password_policy_fail_is_audited_and_400(client, tmp_path):
     from infra import auth_store as A
     r = client.post("/api/recover_password", json={
-        "username": "zoe", "kis_app_key": "AKz", "kis_app_secret": "ASz",
-        "openrouter_key": "ORz", "new_password": "weak"})
+        "username": "zoe", "kis_account_no": "1-1", "kis_app_secret": "ASz",
+        "new_password": "weak"})
     assert r.status_code == 400
     import json as _j
     lines = (A._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()
@@ -45,24 +45,24 @@ def test_recover_password_weak_pw_is_400_regardless_of_factors(client):
     # wrong factors + weak pw → 400 (policy), SAME as right factors + weak pw → 400.
     # No 400/404 split on factor correctness for a weak password ⇒ no stealth oracle.
     bad = client.post("/api/recover_password", json={
-        "username": "zoe", "kis_app_key": "WRONG", "kis_app_secret": "WRONG",
-        "openrouter_key": "WRONG", "new_password": "weak"})
+        "username": "zoe", "kis_account_no": "WRONG", "kis_app_secret": "WRONG",
+        "new_password": "weak"})
     assert bad.status_code == 400
     good_factors_weak = client.post("/api/recover_password", json={
-        "username": "zoe", "kis_app_key": "AKz", "kis_app_secret": "ASz",
-        "openrouter_key": "ORz", "new_password": "weak"})
+        "username": "zoe", "kis_account_no": "1-1", "kis_app_secret": "ASz",
+        "new_password": "weak"})
     assert good_factors_weak.status_code == 400
     # strong pw + wrong factors → 404 generic (no reset happened)
     strong_wrong = client.post("/api/recover_password", json={
-        "username": "zoe", "kis_app_key": "WRONG", "kis_app_secret": "WRONG",
-        "openrouter_key": "WRONG", "new_password": "BrandN3w$pw"})
+        "username": "zoe", "kis_account_no": "WRONG", "kis_app_secret": "WRONG",
+        "new_password": "BrandN3w$pw"})
     assert strong_wrong.status_code == 404
 
 def test_client_ip_prefers_cf_connecting_ip(client):
     # CF-Connecting-IP must win over X-Forwarded-For for throttle keying / audit
     r = client.post("/api/recover_id",
                      headers={"CF-Connecting-IP": "9.9.9.9", "X-Forwarded-For": "1.1.1.1"},
-                     json={"kis_app_key":"AKz","kis_app_secret":"ASz","openrouter_key":"ORz"})
+                     json={"kis_account_no":"1-1","kis_app_secret":"ASz"})
     assert r.status_code == 200
     from infra import auth_store as A
     import json as _j

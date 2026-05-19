@@ -224,9 +224,8 @@ data class RegisterRequest(
 // ─── Recovery (5-2: 아이디/비밀번호 찾기) ──────────────────────────────────
 @Serializable
 data class RecoverIdRequest(
-    @SerialName("kis_app_key") val kisAppKey: String,
+    @SerialName("kis_account_no") val kisAccountNo: String,
     @SerialName("kis_app_secret") val kisAppSecret: String,
-    @SerialName("openrouter_key") val openrouterKey: String,
 )
 
 @Serializable
@@ -237,9 +236,8 @@ data class RecoverIdResponse(
 @Serializable
 data class RecoverPwRequest(
     val username: String,
-    @SerialName("kis_app_key") val kisAppKey: String,
+    @SerialName("kis_account_no") val kisAccountNo: String,
     @SerialName("kis_app_secret") val kisAppSecret: String,
-    @SerialName("openrouter_key") val openrouterKey: String,
     @SerialName("new_password") val newPassword: String,
 )
 

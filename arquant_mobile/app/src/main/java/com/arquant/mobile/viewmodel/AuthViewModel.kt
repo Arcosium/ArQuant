@@ -120,11 +120,11 @@ class AuthViewModel @Inject constructor(
         _state.update { it.copy(recovery = it.recovery.copy(tab = tab, message = null, error = null)) }
     }
 
-    fun recoverId(kisAppKey: String, kisAppSecret: String, openrouterKey: String) {
+    fun recoverId(kisAccountNo: String, kisAppSecret: String) {
         viewModelScope.launch {
             _state.update { it.copy(recovery = it.recovery.copy(busy = true, message = null, error = null)) }
             try {
-                val r = repo.recoverId(kisAppKey.trim(), kisAppSecret.trim(), openrouterKey.trim())
+                val r = repo.recoverId(kisAccountNo.trim(), kisAppSecret.trim())
                 _state.update { it.copy(recovery = it.recovery.copy(busy = false,
                     message = "아이디: ${r.username}")) }
             } catch (e: Exception) {
@@ -136,16 +136,14 @@ class AuthViewModel @Inject constructor(
 
     fun recoverPassword(
         username: String,
-        kisAppKey: String,
+        kisAccountNo: String,
         kisAppSecret: String,
-        openrouterKey: String,
         newPassword: String,
     ) {
         viewModelScope.launch {
             _state.update { it.copy(recovery = it.recovery.copy(busy = true, message = null, error = null)) }
             try {
-                repo.recoverPassword(username.trim(), kisAppKey.trim(), kisAppSecret.trim(),
-                    openrouterKey.trim(), newPassword)
+                repo.recoverPassword(username.trim(), kisAccountNo.trim(), kisAppSecret.trim(), newPassword)
                 _state.update { it.copy(recovery = it.recovery.copy(busy = false,
                     message = "비밀번호가 재설정되었습니다. 새 비밀번호로 로그인하세요.")) }
             } catch (e: Exception) {
