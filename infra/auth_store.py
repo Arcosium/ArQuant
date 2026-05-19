@@ -27,6 +27,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, InvalidHash, VerificationError
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes as _hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -159,6 +161,22 @@ def bidx(value: str) -> str:
     """결정론적 블라인드 인덱스(HMAC-SHA256 hex) — 평문 노출 없이 동치 조회용."""
     return _hmac.new(_bidx_key(), _norm(value).encode("utf-8"),
                      hashlib.sha256).hexdigest()
+
+
+_PH = PasswordHasher()  # argon2id, library defaults (tune later if needed)
+
+
+def hash_password(pw: str) -> str:
+    return _PH.hash(pw or "")
+
+
+def verify_pw_hash(stored_hash: str, pw: str) -> bool:
+    if not stored_hash:
+        return False
+    try:
+        return _PH.verify(stored_hash, pw or "")
+    except (VerifyMismatchError, InvalidHash, VerificationError):
+        return False
 
 
 # ─── DB ───────────────────────────────────────────────────────────────────────
