@@ -645,6 +645,12 @@ async def _auth_bootstrap():
         reactivated = creds_layer.reactivate_last()
         if reactivated is None and seeded:
             creds_layer.set_active(seeded)  # 첫 부팅: 시드 계정을 바로 활성화
+        # ITEM6: admin 계정에 매크로 붕괴 상시 지시사항 멱등 시드
+        try:
+            from infra.standing_directives import seed_admin_directive
+            seed_admin_directive()
+        except Exception as _sde:
+            logging.getLogger("AUTH").warning("상시지시 시드 실패(계속): %s", _sde)
     except Exception as e:
         logging.getLogger("AUTH").warning("인증 부트스트랩 실패: %s", e)
 
