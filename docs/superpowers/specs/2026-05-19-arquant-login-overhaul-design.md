@@ -127,8 +127,11 @@ Prioritized; only 🔴 items are fixed in this overhaul (§6/§7).
 - **🔴 NOT truly multi-tenant (top concern).** `creds_layer` holds **one global
   active account**; the swarm trades for whoever is active and refuses switching
   while the loop runs (`app.py:99-115`). N registered users ≠ concurrent isolated
-  trading. Decide before public deploy: single-operator-with-saved-accounts (today's
-  reality) vs. true per-user isolation (large, separate rework). **Out of scope here.**
+  trading. → **DECISION 2026-05-19: split into Phase 2.** Phase 1 (this spec) ships
+  as-is; true per-user isolation (9 global-state layers) gets its own spec/plan/impl
+  cycle. Requirements & decisions captured in
+  `2026-05-19-arquant-multitenant-phase2-requirements.md`. Phase 1 is the auth
+  foundation Phase 2 builds on.
 - 🔴 Plaintext password compare / no hashing → fixed (§6).
 - 🔴 No rate-limit / lockout anywhere → fixed (§7).
 - 🟠 Single shared Fernet key for all users' secrets (known/accepted per `.gitignore`
@@ -147,9 +150,10 @@ Prioritized; only 🔴 items are fixed in this overhaul (§6/§7).
 
 ## Non-goals (YAGNI / explicitly out of scope)
 
-True multi-tenant trading isolation; email-based recovery; CSRF tokens; per-user
-Fernet key derivation; authenticating `/api/check_username`. These are reported in §8
-for separate scheduling, not built here.
+True multi-tenant trading isolation (→ **Phase 2**, see
+`2026-05-19-arquant-multitenant-phase2-requirements.md`); email-based recovery;
+CSRF tokens; per-user Fernet key derivation; authenticating `/api/check_username`.
+Reported in §8 for separate scheduling, not built in Phase 1.
 
 ## Testing strategy
 
