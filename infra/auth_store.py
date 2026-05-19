@@ -572,6 +572,87 @@ def list_accounts() -> List[Dict[str, Any]]:
     } for r in rows]
 
 
+def delete_user(user_id: int) -> bool:
+    """유저 행 + 해당 세션 완전 삭제. 성공 True, 없는 uid False.
+    (SQLite FK CASCADE 는 PRAGMA 미설정이라 세션을 명시 삭제한다.)"""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute("SELECT id FROM users WHERE id=?",
+                           (int(user_id),)).fetchone()
+        if not row:
+            return False
+        conn.execute("DELETE FROM sessions WHERE user_id=?", (int(user_id),))
+        conn.execute("DELETE FROM users WHERE id=?", (int(user_id),))
+    return True
+
+
+def _is_mock_url(url: str) -> bool:
+    u = url or ""
+    return ("openapivts" in u) or (":29443" in u)
+
+
+def list_members() -> List[Dict[str, Any]]:
+    """ADMIN 회원 현황(읽기 전용). 민감값 비노출. is_mock 은 Base URL 파생."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, username, kis_base_url, created_at, last_login_at, "
+            "is_admin FROM users ORDER BY created_at ASC").fetchall()
+    return [{
+        "id": int(r["id"]), "username": r["username"],
+        "created_at": r["created_at"], "last_login_at": r["last_login_at"],
+        "is_admin": bool(r["is_admin"]),
+        "is_mock": _is_mock_url(r["kis_base_url"]),
+    } for r in rows]
+
+
+def change_password(user_id: int, current: str, new_password: str) -> bool:
+    """현재 비번 검증 → 신규 정책 검사 → argon2 해시 갱신.
+    현재 비번 불일치/정책 위반 → ValueError."""
+    init()
+    creds = get_user_credentials(int(user_id))
+    if not creds:
+        raise ValueError("계정을 찾을 수 없습니다.")
+    if not verify_password(creds["username"], current or ""):
+        raise ValueError("현재 비밀번호가 일치하지 않습니다.")
+    perr = password_policy_error(new_password or "")
+    if perr:
+        raise ValueError(perr)
+    _set_password_hash(int(user_id), hash_password(new_password), clear_enc=True)
+    return True
+
+
+def update_credentials(user_id: int, *, openrouter_key: Optional[str] = None,
+                        kis_app_key: Optional[str] = None,
+                        kis_app_secret: Optional[str] = None,
+                        kis_account_no: Optional[str] = None,
+                        kis_base_url: Optional[str] = None) -> bool:
+    """제공된 자격증명만 갱신(None=미변경). 변경분 enc + bidx 동시 재계산."""
+    init()
+    sets, params = [], []
+    if openrouter_key is not None:
+        sets += ["openrouter_key_enc=?", "openrouter_key_bidx=?"]
+        params += [encrypt(openrouter_key), bidx(openrouter_key)]
+    if kis_app_key is not None:
+        sets += ["kis_app_key_enc=?", "kis_app_key_bidx=?"]
+        params += [encrypt(kis_app_key), bidx(kis_app_key)]
+    if kis_app_secret is not None:
+        sets += ["kis_app_secret_enc=?", "kis_app_secret_bidx=?"]
+        params += [encrypt(kis_app_secret), bidx(kis_app_secret)]
+    if kis_account_no is not None:
+        sets += ["kis_account_no_enc=?", "kis_account_no_bidx=?"]
+        params += [encrypt(kis_account_no), bidx(kis_account_no)]
+    if kis_base_url is not None:
+        sets += ["kis_base_url=?"]
+        params += [(kis_base_url or "").strip()]
+    if not sets:
+        return False
+    params.append(int(user_id))
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(f"UPDATE users SET {','.join(sets)} WHERE id=?", tuple(params))
+    return True
+
+
 # ─── Sessions ─────────────────────────────────────────────────────────────────
 def create_session(user_id: int) -> str:
     init()
