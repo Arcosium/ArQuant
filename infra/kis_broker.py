@@ -680,17 +680,34 @@ class KISBroker:
         반환: dict(주문 바디) 또는 str(실패 — 미전송)."""
         import math
         tk = (ticker or "").strip().upper()
-        lp = 0.0
+        explicit = False
         try:
             lp = float(price or 0)
         except (TypeError, ValueError):
             lp = 0.0
-        if lp <= 0:  # 시장가 의도 → 현재가로 체결가능 지정가 산출
+        if lp > 0:
+            explicit = True   # 호출자가 명시 지정가 → 그대로 사용(버퍼 X)
+        else:
+            # 시장가 의도 → 다중 폴백으로 끝까지 가격 확보(주문 스킵 금지).
             lp = await self.us_last_price(tk)
+            if not lp or lp <= 0:                 # ① 실시간 실패 → 일봉 종가
+                try:
+                    rows = await self.us_daily_chart(tk, days=5)
+                except Exception:
+                    rows = []
+                if rows:
+                    try:
+                        lp = float(rows[-1].get("close") or 0)
+                    except (TypeError, ValueError):
+                        lp = 0.0
             if not lp or lp <= 0:
+                # 실시간·일봉 모두 비어 KIS 지정가에 넣을 단가가 물리적으로
+                # 없음(상장폐지/미지원 추정). 0 전송은 원래 버그 재현이라 금지.
                 return (f"[US{'매수' if side == 'buy' else '매도'} 실패] {tk} "
-                        f"현재가(시세) 조회 실패 — 주문 미전송")
-        if side == "buy":      # 매수: 현재가보다 살짝 위(체결 보장), 센트 올림
+                        f"현재가·일봉 모두 미확보 — 단가 산출 불가, 주문 미전송")
+        if explicit:           # 명시 지정가: 센트 정밀도만 정규화
+            unpr = round(lp, 2)
+        elif side == "buy":    # 매수: 현재가보다 살짝 위(체결 보장), 센트 올림
             unpr = math.ceil(lp * 1.003 * 100) / 100.0
         else:                   # 매도: 현재가보다 살짝 아래, 센트 내림
             unpr = math.floor(lp * 0.997 * 100) / 100.0
