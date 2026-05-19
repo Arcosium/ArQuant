@@ -1290,24 +1290,49 @@ git commit -m "fix(test): robust AST-based guard for dart/label-not-in-upsert (w
 
 ## Task 13: Full suite + branch checkpoint
 
-- [ ] **Step 1: Run the entire test suite**
+- [x] **Step 1: Run the entire test suite**
 
 Run: `python3.11 -m pytest -q`
 Expected: all tests pass (new auth tests + pre-existing `test_backtest`, `test_guardrails`, etc. unaffected).
+Result: **78 passed** (before and after fixture consolidation — count identical).
 
-- [ ] **Step 2: Manual smoke (existing single user still works)**
+- [x] **Step 2: Migration smoke on a COPY — NEVER the live DB**
 
-Run: `python3.11 -c "from infra import auth_store as A; A.init(); A.migrate_passwords_and_bidx(); print('migration ok')"`
-Expected: `migration ok` (no exception against the real `data/arquant_auth.db`; hh09080 row gets hash+bidx, password_enc blanked).
-
-- [ ] **Step 3: Commit checkpoint**
+CRITICAL SAFETY: Do NOT run migration against the real `data/arquant_auth.db` — a systemd service may be running OLD code against it; blanking `password_enc` live would break logins until redeploy.
 
 ```bash
-git add -A
-git commit -m "chore: backend login-overhaul plan complete (Plan 1/3)"
+cp data/arquant_auth.db /tmp/arquant_auth_smoke.db
+cp data/.fernet.key /tmp/.fernet.key.smoke 2>/dev/null || true
 ```
 
-- [ ] **Consolidate the duplicated `fresh_auth` fixture** into `tests/conftest.py` (currently copied in test_auth_bidx/migration/recovery/hashing). Move one canonical copy to conftest, delete the per-file duplicates, run `python3.11 -m pytest -q` to confirm all green.
+Then run against the COPY only:
+```python
+python3.11 -c "
+import sys; sys.path.insert(0, '.')
+import pathlib, os
+from infra import auth_store as A
+A._DB_PATH = pathlib.Path('/tmp/arquant_auth_smoke.db')
+A._FERNET_KEY_PATH = pathlib.Path('/tmp/.fernet.key.smoke')
+A._INITED = False; A._FERNET = None; A._FERNET_RAW = None; A._BIDX_KEY = None
+print(A.migrate_passwords_and_bidx())
+"
+```
+Then clean up: `rm -f /tmp/arquant_auth_smoke.db /tmp/.fernet.key.smoke`
+
+Result: `{'pw': 1, 'bidx': 1}` — 1 password migrated to argon2id, 1 bidx populated. Live DB untouched.
+
+> **운영자 노트:** 실 마이그레이션은 신코드로 서비스 재시작(systemd) 시 startup 훅에서 자동·안전 적용된다(트랜잭션·멱등·손상행보존·FernetKeyLost 시 critical+중단). 라이브 DB를 수동 변형하지 말 것 — 구코드 서비스가 살아있으면 재배포 전까지 로그인 불가.
+
+- [x] **Step 3: Commit checkpoint**
+
+```bash
+git add tests/conftest.py tests/test_auth_bidx.py tests/test_auth_hashing.py \
+        tests/test_auth_migration.py tests/test_auth_recovery.py \
+        docs/superpowers/plans/2026-05-19-arquant-login-overhaul-backend.md
+git commit -m "chore: consolidate fresh_auth into conftest; Plan 1/3 backend complete"
+```
+
+- [x] **Consolidate the duplicated `fresh_auth` fixture** into `tests/conftest.py` (previously copied in test_auth_bidx/migration/recovery/hashing). One canonical copy moved to conftest, per-file duplicates deleted, `python3.11 -m pytest -q` confirmed all 78 green (before: 78, after: 78).
 
 **DEPLOY HARDENING (infra, not code — deploy files are user-modified):** run uvicorn with `--proxy-headers --forwarded-allow-ips=127.0.0.1` (or rely on CF-Connecting-IP) so X-Forwarded-For can't be spoofed by a direct-to-:8500 connection bypassing the Cloudflare tunnel.
 

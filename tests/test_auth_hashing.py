@@ -1,6 +1,4 @@
-import pytest
 from infra import auth_store
-from infra import auth_store as A
 
 
 def test_hash_and_verify_roundtrip():
@@ -11,15 +9,6 @@ def test_hash_and_verify_roundtrip():
     assert auth_store.verify_pw_hash("", "anything") is False
     assert auth_store.verify_pw_hash("not-a-hash", "x") is False
 
-
-@pytest.fixture
-def fresh_auth(tmp_path, monkeypatch):
-    for name, val in [("_DATA_DIR", tmp_path), ("_DB_PATH", tmp_path/"a.db"),
-                      ("_FERNET_KEY_PATH", tmp_path/".k"),
-                      ("_AUDIT_PATH", tmp_path/"au.log"), ("_INITED", False),
-                      ("_FERNET", None), ("_FERNET_RAW", None), ("_BIDX_KEY", None)]:
-        monkeypatch.setattr(A, name, val, raising=False)
-    A.init(); return A
 
 def test_verify_password_argon2_path(fresh_auth):
     fresh_auth.upsert_user("bob", "P@ssword12!", "k", "s", "o", "1-1", "", "", "")

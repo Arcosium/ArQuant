@@ -1,15 +1,5 @@
 import json
 import pytest
-from infra import auth_store as A
-
-@pytest.fixture
-def fresh_auth(tmp_path, monkeypatch):
-    for n, v in [("_DATA_DIR", tmp_path), ("_DB_PATH", tmp_path/"a.db"),
-                 ("_FERNET_KEY_PATH", tmp_path/".k"), ("_AUDIT_PATH", tmp_path/"au.log"),
-                 ("_INITED", False), ("_FERNET", None), ("_FERNET_RAW", None),
-                 ("_BIDX_KEY", None)]:
-        monkeypatch.setattr(A, n, v, raising=False)
-    A.init(); return A
 
 def test_find_username_by_factors(fresh_auth):
     fresh_auth.upsert_user("erin", "P@ss12345!", "AK1", "AS1", "OR1", "1-1", "", "", "")

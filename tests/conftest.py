@@ -39,3 +39,20 @@ def fixed_runtime_limits(monkeypatch):
 
     monkeypatch.setattr(_rt, "get", _patched)
     return FIXED_LIMITS
+
+
+import pytest as _pytest
+from infra import auth_store as _auth_store
+
+
+@_pytest.fixture
+def fresh_auth(tmp_path, monkeypatch):
+    """격리된 임시 DB/키로 auth_store 초기화 (모듈 글로벌 리셋). 인증 테스트 공용."""
+    for _n, _v in [("_DATA_DIR", tmp_path), ("_DB_PATH", tmp_path / "auth.db"),
+                   ("_FERNET_KEY_PATH", tmp_path / ".fernet.key"),
+                   ("_AUDIT_PATH", tmp_path / "auth_audit.log"),
+                   ("_INITED", False), ("_FERNET", None),
+                   ("_FERNET_RAW", None), ("_BIDX_KEY", None)]:
+        monkeypatch.setattr(_auth_store, _n, _v, raising=False)
+    _auth_store.init()
+    return _auth_store
