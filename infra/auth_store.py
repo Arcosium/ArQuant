@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError, InvalidHash, VerificationError
+from argon2.exceptions import InvalidHash, VerificationError
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes as _hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -167,15 +167,17 @@ _PH = PasswordHasher()  # argon2id, library defaults (tune later if needed)
 
 
 def hash_password(pw: str) -> str:
+    """평문 비밀번호 → argon2id 해시 문자열."""
     return _PH.hash(pw or "")
 
 
 def verify_pw_hash(stored_hash: str, pw: str) -> bool:
+    """저장된 argon2 해시와 평문 일치 검증. 불일치/빈 해시/손상 해시는 False."""
     if not stored_hash:
         return False
     try:
         return _PH.verify(stored_hash, pw or "")
-    except (VerifyMismatchError, InvalidHash, VerificationError):
+    except (VerificationError, InvalidHash):  # VerifyMismatchError ⊂ VerificationError
         return False
 
 
