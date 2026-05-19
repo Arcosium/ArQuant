@@ -19,10 +19,22 @@ import javax.inject.Inject
  */
 enum class AuthPhase { LOADING, NEED_LOGIN, NEED_REGISTER, AUTHED }
 
+// 5-2: 아이디/비밀번호 찾기 화면 상태
+enum class RecoverTab { ID, PASSWORD }
+
+data class RecoveryState(
+    val visible: Boolean = false,
+    val tab: RecoverTab = RecoverTab.ID,
+    val busy: Boolean = false,
+    val message: String? = null,   // success message (green)
+    val error: String? = null,     // error message (red)
+)
+
 data class AuthState(
     val phase: AuthPhase = AuthPhase.LOADING,
     val busy: Boolean = false,
     val error: String? = null,
+    val recovery: RecoveryState = RecoveryState(),
 )
 
 @HiltViewModel
@@ -95,6 +107,61 @@ class AuthViewModel @Inject constructor(
         viewModelScope.launch {
             runCatching { repo.logout() }
             _state.update { it.copy(phase = AuthPhase.NEED_LOGIN, error = null) }
+        }
+    }
+
+    // ─── Recovery (5-2) ────────────────────────────────────────────────────
+
+    fun setRecoveryVisible(visible: Boolean) {
+        _state.update { it.copy(recovery = RecoveryState(visible = visible)) }
+    }
+
+    fun setRecoveryTab(tab: RecoverTab) {
+        _state.update { it.copy(recovery = it.recovery.copy(tab = tab, message = null, error = null)) }
+    }
+
+    fun recoverId(kisAppKey: String, kisAppSecret: String, openrouterKey: String) {
+        viewModelScope.launch {
+            _state.update { it.copy(recovery = it.recovery.copy(busy = true, message = null, error = null)) }
+            try {
+                val r = repo.recoverId(kisAppKey.trim(), kisAppSecret.trim(), openrouterKey.trim())
+                _state.update { it.copy(recovery = it.recovery.copy(busy = false,
+                    message = "아이디: ${r.username}")) }
+            } catch (e: Exception) {
+                _state.update { it.copy(recovery = it.recovery.copy(busy = false,
+                    error = parseRecoverErr(e))) }
+            }
+        }
+    }
+
+    fun recoverPassword(
+        username: String,
+        kisAppKey: String,
+        kisAppSecret: String,
+        openrouterKey: String,
+        newPassword: String,
+    ) {
+        viewModelScope.launch {
+            _state.update { it.copy(recovery = it.recovery.copy(busy = true, message = null, error = null)) }
+            try {
+                repo.recoverPassword(username.trim(), kisAppKey.trim(), kisAppSecret.trim(),
+                    openrouterKey.trim(), newPassword)
+                _state.update { it.copy(recovery = it.recovery.copy(busy = false,
+                    message = "비밀번호가 재설정되었습니다. 새 비밀번호로 로그인하세요.")) }
+            } catch (e: Exception) {
+                _state.update { it.copy(recovery = it.recovery.copy(busy = false,
+                    error = parseRecoverErr(e))) }
+            }
+        }
+    }
+
+    private fun parseRecoverErr(e: Exception): String {
+        val m = e.message ?: "오류"
+        return when {
+            "400" in m -> "비밀번호 정책 오류: 10자 이상, 특수문자 1개 이상 필요합니다."
+            "404" in m -> "일치하는 계정을 찾을 수 없습니다."
+            "429" in m -> "요청이 너무 많습니다. 잠시 후 다시 시도하세요."
+            else -> "오류가 발생했습니다. 다시 시도해 주세요."
         }
     }
 

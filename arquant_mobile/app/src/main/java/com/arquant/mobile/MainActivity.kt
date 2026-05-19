@@ -76,6 +76,10 @@ class MainActivity : ComponentActivity() {
                         onLogin = auth::login,
                         onRegister = auth::register,
                         onToggleMode = auth::setMode,
+                        onRecoveryToggle = auth::setRecoveryVisible,
+                        onRecoveryTabChange = auth::setRecoveryTab,
+                        onRecoverId = auth::recoverId,
+                        onRecoverPassword = auth::recoverPassword,
                     )
 
                     AuthPhase.AUTHED -> AuthedApp(onLogout = auth::logout)

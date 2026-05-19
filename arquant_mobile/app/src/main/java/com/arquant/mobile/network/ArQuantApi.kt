@@ -218,9 +218,34 @@ data class RegisterRequest(
     @SerialName("kis_app_secret") val kisAppSecret: String,
     @SerialName("kis_account_no") val kisAccountNo: String,
     @SerialName("kis_base_url") val kisBaseUrl: String = "https://openapi.koreainvestment.com:9443",
-    @SerialName("dart_key") val dartKey: String = "",
-    val label: String = "",
     val remember: Boolean = true,
+)
+
+// ─── Recovery (5-2: 아이디/비밀번호 찾기) ──────────────────────────────────
+@Serializable
+data class RecoverIdRequest(
+    @SerialName("kis_app_key") val kisAppKey: String,
+    @SerialName("kis_app_secret") val kisAppSecret: String,
+    @SerialName("openrouter_key") val openrouterKey: String,
+)
+
+@Serializable
+data class RecoverIdResponse(
+    val username: String = "",
+)
+
+@Serializable
+data class RecoverPwRequest(
+    val username: String,
+    @SerialName("kis_app_key") val kisAppKey: String,
+    @SerialName("kis_app_secret") val kisAppSecret: String,
+    @SerialName("openrouter_key") val openrouterKey: String,
+    @SerialName("new_password") val newPassword: String,
+)
+
+@Serializable
+data class RecoverPwResponse(
+    val ok: Boolean = false,
 )
 
 @Serializable
@@ -273,6 +298,13 @@ interface ArQuantApi {
 
     @GET("api/me")
     suspend fun me(): MeResponse
+
+    // ─── Recovery (5-2) ────────────────────────────────────────────────────
+    @POST("api/recover_id")
+    suspend fun recoverId(@Body req: RecoverIdRequest): RecoverIdResponse
+
+    @POST("api/recover_password")
+    suspend fun recoverPassword(@Body req: RecoverPwRequest): RecoverPwResponse
 
     @GET("api/status")
     suspend fun status(): StatusResponse
