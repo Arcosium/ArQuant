@@ -412,6 +412,33 @@ async def profile_delete_account(req: DeleteAccountReq, request: Request):
                        secure=_COOKIE_SECURE, httponly=True, samesite="lax")
     return resp
 
+class AdminDeleteReq(BaseModel):
+    username: str
+
+@app.get("/api/admin/members")
+async def admin_members(request: Request):
+    _require_admin(request)
+    return {"members": auth_store.list_members()}
+
+@app.post("/api/admin/members/delete")
+async def admin_member_delete(req: AdminDeleteReq, request: Request):
+    me = _require_admin(request)
+    target = auth_store.find_user_by_username((req.username or "").strip())
+    if not target:
+        raise HTTPException(404, "해당 회원을 찾을 수 없습니다.")
+    if target["id"] == me:
+        raise HTTPException(400, "본인 계정은 삭제할 수 없습니다.")
+    if target.get("is_admin"):
+        raise HTTPException(400, "ADMIN 계정은 삭제할 수 없습니다(단독 ADMIN 보호).")
+    auth_store.delete_user(target["id"])
+    import shutil
+    from pathlib import Path
+    shutil.rmtree(Path(__file__).resolve().parent.parent / "data" /
+                  "profiles" / str(target["id"]), ignore_errors=True)
+    auth_store.audit("admin_delete_member", username=req.username,
+                     ip=_client_ip(request), outcome="ok", detail="")
+    return {"ok": True}
+
 @app.get("/api/accounts")
 async def accounts():
     return {"accounts": auth_store.list_accounts(), "active": creds_layer.current()}
