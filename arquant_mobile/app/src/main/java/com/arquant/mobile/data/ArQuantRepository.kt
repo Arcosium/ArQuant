@@ -34,25 +34,22 @@ class ArQuantRepository @Inject constructor(
 
     // ─── Recovery (5-2) ────────────────────────────────────────────────────
     suspend fun recoverId(
-        kisAppKey: String,
+        kisAccountNo: String,
         kisAppSecret: String,
-        openrouterKey: String,
     ): RecoverIdResponse = api.recoverId(
-        RecoverIdRequest(kisAppKey = kisAppKey, kisAppSecret = kisAppSecret, openrouterKey = openrouterKey)
+        RecoverIdRequest(kisAccountNo = kisAccountNo, kisAppSecret = kisAppSecret)
     )
 
     suspend fun recoverPassword(
         username: String,
-        kisAppKey: String,
+        kisAccountNo: String,
         kisAppSecret: String,
-        openrouterKey: String,
         newPassword: String,
     ): RecoverPwResponse = api.recoverPassword(
         RecoverPwRequest(
             username = username,
-            kisAppKey = kisAppKey,
+            kisAccountNo = kisAccountNo,
             kisAppSecret = kisAppSecret,
-            openrouterKey = openrouterKey,
             newPassword = newPassword,
         )
     )

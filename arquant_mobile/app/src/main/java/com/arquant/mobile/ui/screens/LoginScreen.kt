@@ -115,8 +115,8 @@ fun LoginScreen(
     onToggleMode: (register: Boolean) -> Unit,
     onRecoveryToggle: (Boolean) -> Unit,
     onRecoveryTabChange: (RecoverTab) -> Unit,
-    onRecoverId: (kisAppKey: String, kisAppSecret: String, openrouterKey: String) -> Unit,
-    onRecoverPassword: (username: String, kisAppKey: String, kisAppSecret: String, openrouterKey: String, newPassword: String) -> Unit,
+    onRecoverId: (kisAccountNo: String, kisAppSecret: String) -> Unit,
+    onRecoverPassword: (username: String, kisAccountNo: String, kisAppSecret: String, newPassword: String) -> Unit,
 ) {
     val register = state.phase == AuthPhase.NEED_REGISTER
     var username by remember { mutableStateOf("") }
@@ -273,8 +273,8 @@ fun LoginScreen(
 private fun RecoveryPanel(
     recoveryState: RecoveryState,
     onTabChange: (RecoverTab) -> Unit,
-    onRecoverId: (String, String, String) -> Unit,
-    onRecoverPassword: (String, String, String, String, String) -> Unit,
+    onRecoverId: (String, String) -> Unit,
+    onRecoverPassword: (String, String, String, String) -> Unit,
 ) {
     // 탭 전환
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -304,15 +304,13 @@ private fun RecoverIdForm(
     busy: Boolean,
     message: String?,
     error: String?,
-    onSubmit: (kisAppKey: String, kisAppSecret: String, openrouterKey: String) -> Unit,
+    onSubmit: (kisAccountNo: String, kisAppSecret: String) -> Unit,
 ) {
-    var kisAppKey by remember { mutableStateOf("") }
+    var kisAccountNo by remember { mutableStateOf("") }
     var kisAppSecret by remember { mutableStateOf("") }
-    var openrouterKey by remember { mutableStateOf("") }
 
-    Field("한국투자증권 App Key", kisAppKey, { kisAppKey = it })
+    Field("한국투자증권 계좌번호", kisAccountNo, { kisAccountNo = it })
     Field("한국투자증권 App Secret", kisAppSecret, { kisAppSecret = it }, isPassword = true)
-    Field("OpenRouter API Key", openrouterKey, { openrouterKey = it })
 
     error?.let {
         Spacer(Modifier.height(8.dp))
@@ -333,8 +331,8 @@ private fun RecoverIdForm(
 
     Spacer(Modifier.height(10.dp))
     Button(
-        onClick = { onSubmit(kisAppKey, kisAppSecret, openrouterKey) },
-        enabled = !busy && kisAppKey.isNotBlank() && kisAppSecret.isNotBlank() && openrouterKey.isNotBlank(),
+        onClick = { onSubmit(kisAccountNo, kisAppSecret) },
+        enabled = !busy && kisAccountNo.isNotBlank() && kisAppSecret.isNotBlank(),
         modifier = Modifier.fillMaxWidth().height(42.dp),
         shape = RoundedCornerShape(9.dp),
         colors = ButtonDefaults.buttonColors(containerColor = AqColors.Primary),
@@ -348,19 +346,17 @@ private fun RecoverPwForm(
     busy: Boolean,
     message: String?,
     error: String?,
-    onSubmit: (username: String, kisAppKey: String, kisAppSecret: String, openrouterKey: String, newPassword: String) -> Unit,
+    onSubmit: (username: String, kisAccountNo: String, kisAppSecret: String, newPassword: String) -> Unit,
 ) {
     var username by remember { mutableStateOf("") }
-    var kisAppKey by remember { mutableStateOf("") }
+    var kisAccountNo by remember { mutableStateOf("") }
     var kisAppSecret by remember { mutableStateOf("") }
-    var openrouterKey by remember { mutableStateOf("") }
     var newPassword by remember { mutableStateOf("") }
     val pwErr = pwError(newPassword)
 
     Field("아이디", username, { username = it })
-    Field("한국투자증권 App Key", kisAppKey, { kisAppKey = it })
+    Field("한국투자증권 계좌번호", kisAccountNo, { kisAccountNo = it })
     Field("한국투자증권 App Secret", kisAppSecret, { kisAppSecret = it }, isPassword = true)
-    Field("OpenRouter API Key", openrouterKey, { openrouterKey = it })
     Field("새 비밀번호 (10자 이상 · 특수문자 1개 이상)", newPassword, { newPassword = it }, isPassword = true)
     if (newPassword.isNotEmpty()) {
         Text(
@@ -389,9 +385,9 @@ private fun RecoverPwForm(
 
     Spacer(Modifier.height(10.dp))
     Button(
-        onClick = { onSubmit(username, kisAppKey, kisAppSecret, openrouterKey, newPassword) },
-        enabled = !busy && username.isNotBlank() && kisAppKey.isNotBlank()
-            && kisAppSecret.isNotBlank() && openrouterKey.isNotBlank()
+        onClick = { onSubmit(username, kisAccountNo, kisAppSecret, newPassword) },
+        enabled = !busy && username.isNotBlank() && kisAccountNo.isNotBlank()
+            && kisAppSecret.isNotBlank()
             && pwErr == null && newPassword.isNotBlank(),
         modifier = Modifier.fillMaxWidth().height(42.dp),
         shape = RoundedCornerShape(9.dp),
