@@ -1402,7 +1402,8 @@ async function refreshBalance(force){
   try{const r=await fetch(API+'/api/balance');const d=await r.json();
   const bp=d.buying_power||{};const ok=bp.ok;
   const _now=new Intl.DateTimeFormat('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date());
-  document.getElementById('bpLine').textContent=(ok?`예수금 ${Math.round(bp.cash||0).toLocaleString()}원 · 총평가 ${Math.round(bp.total_eval||0).toLocaleString()}원 · 평가손익 ${((bp.pnl_ratio||0)*100).toFixed(1)}%`:'잔고 조회 실패')+` · ${_now} KST 갱신`;
+  const _ovKrw=bp.overseas_krw?` (해외 ${Math.round(bp.overseas_krw).toLocaleString()}원 포함)`:'';
+  document.getElementById('bpLine').textContent=(ok?`예수금 ${Math.round(bp.cash||0).toLocaleString()}원 · 총평가 ${Math.round(bp.total_eval||0).toLocaleString()}원${_ovKrw} · 평가손익 ${((bp.pnl_ratio||0)*100).toFixed(1)}%`:'잔고 조회 실패')+` · ${_now} KST 갱신`;
   const box=document.getElementById('holdings');box.innerHTML='';
   const hs=d.holdings||[];
   if(!hs.length){const e=document.createElement('div');e.className='cm system';e.style.background='var(--s2)';e.textContent=ok?'보유 종목 없음':'잔고 조회 실패 (KIS 계좌/토큰 확인)';box.appendChild(e);return}
@@ -1411,7 +1412,10 @@ async function refreshBalance(force){
     const L=document.createElement('span');L.className='hl';
     const badge=document.createElement('span');badge.textContent=cat;badge.style.cssText='font-size:9px;color:var(--dim);background:var(--bg);border-radius:3px;padding:1px 4px;margin-right:5px;white-space:nowrap';
     L.appendChild(badge);L.appendChild(document.createTextNode(`${h.name||h.code} (${h.code}) · ${h.qty}주`));
-    const R=document.createElement('span');R.className='hr';const pct=Number(h.pnl_pct||0);R.textContent=`평단 ${ccy}${Math.round(h.avg_price||0).toLocaleString()} → ${ccy}${Math.round(h.cur_price||0).toLocaleString()} (${pct>=0?'+':''}${pct.toFixed(1)}%)`;
+    const R=document.createElement('span');R.className='hr';const pct=Number(h.pnl_pct||0);
+    let rtxt=`평단 ${ccy}${Math.round(h.avg_price||0).toLocaleString()} → ${ccy}${Math.round(h.cur_price||0).toLocaleString()} (${pct>=0?'+':''}${pct.toFixed(1)}%)`;
+    if(h.ccy==='USD' && h.krw_value){rtxt+=` · ≈${Math.round(h.krw_value).toLocaleString()}원`;}
+    R.textContent=rtxt;
     R.style.color=pct>=0?'var(--grn)':'var(--red)';row.appendChild(L);row.appendChild(R);box.appendChild(row)})}catch(e){}}
 setInterval(refreshStatus,5000);refreshStatus();
 // 잔고/보유 종목: 10분에 한번씩 자동 갱신, 단 OFF_HOURS면 자동 폴링 스킵 (🔄 새로고침 버튼은 강제 갱신)

@@ -30,7 +30,7 @@ LEGACY_KRX_SIMULATOR_PATH = Path("/home/opc/projects/KRX Quant Simulator")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 MODEL_ASSIGNMENTS = {
-    "chief_orchestrator": "google/gemini-3.1-pro-preview",   # 사장 지시 2026-05-14 — 최종 매수 결정자, 고지능 모델로 격상
+    "chief_orchestrator": "deepseek/deepseek-v4-pro",   # 사장 지시 2026-05-19 — Kimi가 length-truncate/타임아웃으로 빈·degenerate 결정 빈발 → 안정적 deepseek-v4-pro로 교체
     "macro_analyst": "deepseek/deepseek-v4-flash",
     "quant_analyst": "deepseek/deepseek-v4-flash",          # 다양한 계량기법 — 무료 모델은 출력 망가짐 → flash로 상향
     "news_analyst": "deepseek/deepseek-v4-flash",           # 종목명 환각 방지 — flash로 상향
@@ -43,7 +43,7 @@ MODEL_ASSIGNMENTS = {
     "trader": "deepseek/deepseek-v4-flash",  # 사장 피드백 2026-05-15 (3차) — free 모델 말투 어색 → flash로 격상. 자연어 보고 품질 향상
     "risk_guard": "openrouter/free",                     # DART 공시 기반 재심 (룰 게이트는 파이썬, 파싱 실패 시 fail-open)
     # policy_filter 폐지(사장 피드백 2026-05-18) — 역할 risk_guard 통합
-    "post_manager": "google/gemini-3.1-pro-preview",         # 사장 지시 2026-05-14 — 매도 타이밍 결정자, 고지능 모델로 격상
+    "post_manager": "moonshotai/kimi-k2.6",         # 사장 지시 2026-05-14 — 매도 타이밍 결정자, 고지능 모델로 격상
     "ops_support": "deepseek/deepseek-v4-pro",  # 사장 피드백 2026-05-15 — DeepSeek V4 Pro로 변경 (운용지원실장은 분류·조정만; 실제 코딩은 산하 팀장 워커가 수행)
 }
 
@@ -57,9 +57,11 @@ MAX_VALIDATION_LOOP = 3             # 리스크 검증 재시도 최대 3회
 # Per-agent output token caps (replaces uniform 4096). Risk/Policy emit short
 # structured JSON; analysts need more room.
 AGENT_MAX_TOKENS = {
-    "chief_orchestrator": 3000,   # 2패스(6개 후보 + 근거 / 최종 선정 + 근거)로 출력량 증가
-    "macro_analyst":      1800,
-    "quant_analyst":      4096,   # 6개 후보에 대해 다양한 계량기법으로 평가 → 출력 큼
+    "chief_orchestrator": 12000,  # deepseek-v4-pro로 교체(2026-05-19) — 비-reasoning이라 자연 완료 시 즉시 반환,
+                                  # 12000은 안전한 상한(2패스 결정 출력 충분히 수용, 잠식 없음).
+    "macro_analyst":      8000,   # 4000으로는 상세 매크로 리포트가 중간에 끊김 (2026-05-19 관측).
+                                  # 6000으로 상향하여 완결된 응답 보장.
+    "quant_analyst":      8000,   # 5500으로도 5개 섹션 + 점수/진입가 줄이 잘리는 사례 발생 → 8000으로 재상향
     "news_analyst":       2600,   # 6개 후보 + 보유 종목 감성 분석
     "news_curator":        600,   # 큐레이터는 번호 목록만 → 작게
     "news_classifier":   12000,   # 사장 피드백 2026-05-15 (8차) — alibaba는 reasoning 모델 → 내부 사고 토큰 + JSON 응답 모두 수용
@@ -67,7 +69,7 @@ AGENT_MAX_TOKENS = {
     "trader":             1500,   # 사장 피드백 (3차) — 자연어 보고용. 체결 결과 요약 + 매매 이유 정리
     "risk_guard":         2200,   # DART 공시 읽고 종목별 재심 + 사유
     # policy_filter 폐지(2026-05-18)
-    "post_manager":       3000,   # 보유 종목별 매도/보유 판단 + 사유
+    "post_manager":      12000,   # moonshotai/kimi-k2.6 reasoning 모델 — chief_orchestrator와 동일 사유(2026-05-19)
     "ops_support":        8000,   # 코드 변경 JSON + 근거 설명 (사장 지시 2026-05-14 — 토큰 한도 상향)
 }
 ENABLE_PROMPT_CACHE = True            # Anthropic prompt caching via OpenRouter cache_control

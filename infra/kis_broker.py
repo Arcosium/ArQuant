@@ -412,10 +412,11 @@ class KISBroker:
         except (TypeError, ValueError): return 0
 
     async def _overseas_holdings(self) -> List[Dict]:
-        """해외주식 보유 종목 (NASD/NYSE/AMEX 통합). 실패/미보유 시 [].
-        사장 피드백 2026-05-20: 같은 종목이 여러 거래소에서 중복 반환되는 케이스(UUP 등) 방지 —
-        code 키로 dedupe하며 qty 합산·평균단가는 수량 가중평균, 손익은 합산."""
-        agg: Dict[str, Dict] = {}
+        """해외주식 보유 종목 (NASD/NYSE/AMEX 순회). 실패/미보유 시 [].
+        사장 피드백 2026-05-20(2차): KIS는 동일 보유분을 거래소별 inquire-balance 응답마다
+        중복 노출한다(예: UUP가 NASD·AMEX 양쪽에 등장). 따라서 code 기준으로 **중복 제거**(첫 건만)
+        해야 한다 — 이전엔 qty를 합산해 2주가 4주로 부풀던 버그. 실보유는 present-balance로 검증함."""
+        seen: Dict[str, Dict] = {}
         try:
             tok = await self.token(); s = await self._s(); c, p = self._acnt()
             for excd in ("NASD", "NYSE", "AMEX"):
@@ -430,35 +431,20 @@ class KISBroker:
                         if q <= 0:
                             continue
                         code = (h.get("ovrs_pdno") or "").strip()
-                        if not code:
-                            continue
-                        ap = self._num(h.get("pchs_avg_pric"))
-                        cur = self._num(h.get("now_pric2"))
-                        pnl_amt = self._num(h.get("frcr_evlu_pfls_amt") or h.get("evlu_pfls_amt"))
-                        pnl_pct = self._num(h.get("evlu_pfls_rt"))
-                        name = (h.get("ovrs_item_name") or "").strip() or code
-                        if code in agg:
-                            ex = agg[code]
-                            tot_qty = ex["qty"] + q
-                            # 수량 가중평균 단가 (qty=0 안전가드는 이미 q>0 보장)
-                            ex["avg_price"] = ((ex["avg_price"] * ex["qty"]) + (ap * q)) / tot_qty if tot_qty > 0 else ap
-                            ex["qty"] = tot_qty
-                            ex["pnl_amt"] = ex["pnl_amt"] + pnl_amt
-                            # cur_price/pnl_pct: 최신 거래소 응답값 유지(거래소별 차이는 미미)
-                            if cur > 0:
-                                ex["cur_price"] = cur
-                            if pnl_pct:
-                                ex["pnl_pct"] = pnl_pct
-                        else:
-                            agg[code] = {"code": code, "name": name, "qty": q,
-                                         "avg_price": ap, "cur_price": cur,
-                                         "pnl_amt": pnl_amt, "pnl_pct": pnl_pct,
-                                         "category": "해외주식", "ccy": "USD"}
+                        if not code or code in seen:
+                            continue   # 거래소 간 중복 노출 — 첫 건만 채택(합산 금지)
+                        seen[code] = {"code": code,
+                                      "name": (h.get("ovrs_item_name") or "").strip() or code,
+                                      "qty": q, "avg_price": self._num(h.get("pchs_avg_pric")),
+                                      "cur_price": self._num(h.get("now_pric2")),
+                                      "pnl_amt": self._num(h.get("frcr_evlu_pfls_amt") or h.get("evlu_pfls_amt")),
+                                      "pnl_pct": self._num(h.get("evlu_pfls_rt")),
+                                      "category": "해외주식", "ccy": "USD"}
                 except Exception:
                     continue
         except Exception:
             pass
-        return list(agg.values())
+        return list(seen.values())
 
     async def _bond_holdings(self) -> List[Dict]:
         """장내채권 보유 잔고. API 미지원/실패 시 []."""
@@ -490,6 +476,29 @@ class KISBroker:
         """펀드 보유 잔고. KIS OpenAPI는 종목 단위 펀드 잔고 조회를 공개하지 않아 빈 목록 반환(안전).
         (국내주식 inquire-balance의 FUND_STTL_ICLD_YN='Y'는 펀드결제분 '금액'만 포함하며 보유내역이 아님.)"""
         return []
+
+    async def _overseas_present_krw(self) -> Dict:
+        """해외주식 원화환산 평가합계 + 기준환율 (CTRP6504R inquire-present-balance).
+        사장 피드백 2026-05-20: 국내 inquire-balance 의 nass_amt(총평가)는 해외주식 평가를
+        포함하지 않으므로, 통합 총평가 보정에 쓸 해외 원화평가합계를 별도 조회한다.
+        실패/모의투자 미지원 시 {ok:False}. (실전 전용 — 모의 base_url 이면 시도하되 실패 허용.)"""
+        try:
+            tok = await self.token(); s = await self._s(); c, p = self._acnt()
+            async with s.get(f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-present-balance",
+                headers=self._h(tok, "CTRP6504R"),
+                params={"CANO":c,"ACNT_PRDT_CD":p,"WCRC_FRCR_DVSN_CD":"02","NATN_CD":"840",
+                        "TR_MKET_CD":"00","INQR_DVSN_CD":"00"}) as r:
+                d = await r.json()
+            if d.get("rt_cd") != "0":
+                return {"ok": False, "krw_value": 0.0, "exrt": 0.0}
+            o3 = d.get("output3") or {}
+            krw_value = self._num(o3.get("evlu_amt_smtl_amt"))   # 해외 평가금액합계(원화환산)
+            o2 = d.get("output2") or []
+            exrt = self._num(o2[0].get("frst_bltn_exrt")) if o2 else 0.0
+            return {"ok": True, "krw_value": krw_value, "exrt": exrt}
+        except Exception as e:
+            logger.warning(f"[해외원화평가] CTRP6504R 실패: {e}")
+            return {"ok": False, "krw_value": 0.0, "exrt": 0.0}
 
     async def portfolio_holdings(self) -> Dict:
         """대시보드 '종목 포트폴리오' — 국내주식 + 해외주식 + 국내채권 + 펀드 통합 잔고.
@@ -525,7 +534,22 @@ class KISBroker:
                     ex["pnl_pct"] = h.get("pnl_pct")
             else:
                 merged[key] = dict(h)
-        return {"buying_power": snap["buying_power"], "holdings": list(merged.values()),
+        holdings = list(merged.values())
+        # ── 통합 총평가 보정: 국내 nass_amt(buying_power.total_eval)는 해외주식 평가를 포함하지
+        #    않는다. USD 보유가 있으면 present-balance(원화환산 평가합계)를 더해 총자산을 맞춘다.
+        #    + 각 USD 종목에 원화환산 평가액(krw_value)을 부여(프론트 표시용). ──
+        bp = dict(snap["buying_power"])
+        if any(h.get("ccy") == "USD" for h in holdings):
+            pk = await self._overseas_present_krw()
+            if pk["ok"] and pk["krw_value"] > 0:
+                bp["total_eval"] = self._num(bp.get("total_eval")) + pk["krw_value"]
+                bp["overseas_krw"] = pk["krw_value"]
+                bp["fx_rate"] = pk["exrt"]
+                if pk["exrt"] > 0:
+                    for h in holdings:
+                        if h.get("ccy") == "USD":
+                            h["krw_value"] = round(self._num(h.get("qty")) * self._num(h.get("cur_price")) * pk["exrt"])
+        return {"buying_power": bp, "holdings": holdings,
                 "holdings_stale": snap.get("holdings_stale", False), "ok": snap.get("ok", False)}
 
     # ═══════════════════ 국내주식 순위/업종 ═══════════════════

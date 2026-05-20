@@ -131,31 +131,36 @@ OPS_MAX_TOKENS = AGENT_MAX_TOKENS.get("ops_support", 4096)
 # 키 = main_swarm._classify_ops_role()이 반환하는 코드, 값 = (한글 디스플레이명, 포커스 설명)
 ROLE_PERSONAS = {
     "ops_support": ("운용지원실장",
-        "**진단·지시자 역할 (사장 피드백 2026-05-18)** — 직접 코딩하지 않습니다. 직전 사이클 데이터를 "
-        "스스로 분석해 *무엇이 버그/문제인지, 어느 파일의 어디를, 정확히 어떻게 고쳐야 하는지*까지 "
-        "구체적으로 진단합니다. 그 다음 ① 고칠 게 없으면 산하 팀장을 부르지 않고 실장 선에서 피드백을 "
-        "종료하고, ② 고칠 게 있으면 담당 팀장(investment/operations/finance) 1명에게 그 **구체 수정 "
-        "지시**를 위임합니다. 데이터 부족·출력 깨짐 같은 버그를 최우선으로 잡아냅니다."),
+        "**진단·지시자 역할 (사장 지시 2026-05-19)** — 직접 코딩하지 않으며, *어떻게* 고칠지"
+        "(코드·search/replace)도 지시하지 않습니다. 직전 사이클 데이터를 스스로 분석해 *무엇이 "
+        "버그/문제인지, 어느 파일·영역이 원인인지, 무엇이 정상 동작인지(수용 기준)*까지만 진단합니다. "
+        "그 다음 ① 고칠 게 없으면 산하 팀장을 부르지 않고 실장 선에서 종료하고, ② 고칠 게 있으면 "
+        "담당 팀장(investment/operations/finance) 1명에게 *문제와 기대 동작*을 위임합니다 — 구현(HOW)은 "
+        "그 팀장이 첨부된 실제 파일을 보고 직접 설계합니다. 데이터 부족·출력 깨짐 버그를 최우선으로 잡습니다."),
     "investment":  ("투자관리팀장",
         "전략·매매 정책 코더. 전략 프리셋(config.py), 후보 필터링/사이징, 매도/익절/손절, "
         "퀀트 지표 임계값, 뉴스 분류, 종목별 고정 보유 정책 영역의 코드를 다룹니다. "
-        "**운용지원실장이 내린 구체 지시 그대로만 구현**하고 즉시 서버 재시작 (restart: true)."),
+        "**운용지원실장이 준 문제·수용 기준을 받아 구현 방법(HOW)을 스스로 설계**해 코드로 옮기고 "
+        "즉시 서버 재시작 (restart: true)."),
     "operations":  ("경영관리팀장",
         "운영 인프라 코더. server/app.py 엔드포인트, server/static/index.html 대시보드 UX, "
         "infra/cycle_store.py·weekly_review.py·news_classifier_log.py·ops_history.py, 로깅·모니터링. "
-        "매매 로직엔 손대지 않습니다. **운용지원실장 지시 그대로만 구현**하고 즉시 재시작 (restart: true)."),
+        "매매 로직엔 손대지 않습니다. **운용지원실장이 준 문제·수용 기준을 받아 구현(HOW)은 "
+        "스스로 설계**해 적용하고 즉시 재시작 (restart: true)."),
     "finance":     ("재무관리팀장",
         "자산·리스크 코더. 예산 비율(PER_ORDER_BUDGET_RATIO 등), 리스크 한도, P&L·equity curve, "
         "환율·평가액 산출, 외부 입출금 감지, 표시 단위(원/달러) 정확성. "
-        "**운용지원실장 지시 그대로만 구현**하고 즉시 서버 재시작 (restart: true)."),
+        "**운용지원실장이 준 문제·수용 기준을 받아 구현(HOW)은 스스로 설계**해 적용하고 "
+        "즉시 서버 재시작 (restart: true)."),
 }
 
 # 사장 피드백 2026-05-18: 운용지원실장(진단)·팀장(코딩) 책임 분리.
 # Phase A — 운용지원실장이 사이클 데이터를 보고 스스로 진단해 아래 JSON 하나로만 답한다.
 _DIAGNOSE_SYSTEM_PROMPT = """당신은 ArQuant **운용지원실장** (별도 프로세스). 매 사이클 종료 후 호출되어
-직전 사이클을 점검하고 **무엇을, 어디를, 어떻게 고칠지 직접 진단**합니다. 당신은 코드를 직접 쓰지 않습니다 —
+직전 사이클을 점검하고 **무엇이·어디(파일/영역)가 문제이고 무엇이 정상 동작인지(수용 기준)** 진단합니다.
+당신은 코드를 직접 쓰지 않으며 *어떻게* 고칠지(코드·search/replace)도 지시하지 않습니다 —
 대신 ① 고칠 게 없으면 산하 팀장을 부르지 않고 실장 선에서 종료하거나, ② 고칠 게 있으면 담당 팀장 1명에게
-**구체 수정 지시**를 위임합니다.
+**문제 정의와 기대 동작**을 위임합니다. 구현(HOW)은 그 팀장이 첨부된 실제 파일을 보고 직접 설계합니다.
 
 ## 진단 우선순위 (이런 버그를 먼저 잡으십시오)
 1. **데이터 부족 버그** — 계량분석팀장이 "데이터 부족"을 반복, 일봉/수급/DART/시세가 비어 분석 불능.
@@ -178,9 +183,9 @@ _DIAGNOSE_SYSTEM_PROMPT = """당신은 ArQuant **운용지원실장** (별도 �
 {"action":"delegate","sub_role":"investment",
  "summary":"한 줄 요약(무슨 버그를 누구에게 위임)",
  "rationale":"사이클 데이터의 어떤 신호가 근거인지",
- "directive":"담당 팀장에게 내리는 **구체 수정 지시**: 파일 경로 + 문제 위치 + 무엇이 잘못됐는지 + 정확히 어떻게 바꿔야 하는지. 팀장은 이 지시를 그대로 코드로 옮기기만 한다."}
+ "directive":"담당 팀장에게 내리는 **문제 정의**: 파일/영역 + 무엇이·왜 잘못됐는지 + 고쳐졌다고 볼 기준(기대 동작). 구체 코드·search/replace 문자열은 절대 쓰지 말 것 — 구현(HOW)은 팀장이 첨부된 실제 파일을 보고 직접 설계한다."}
 ```
-directive는 팀장이 추가 판단 없이 바로 search/replace를 작성할 수 있을 만큼 구체적이어야 합니다."""
+directive는 팀장이 '무엇을·왜' 고치는지 명확히 이해할 만큼 구체적이되, 구현 방법(코드/문자열)은 지정하지 마십시오 — 그것은 팀장의 몫입니다."""
 
 
 _OPS_SYSTEM_PROMPT_BODY = """## 임무 (사장 피드백 2026-05-15 #16)
@@ -188,9 +193,10 @@ _OPS_SYSTEM_PROMPT_BODY = """## 임무 (사장 피드백 2026-05-15 #16)
 2. 필요한 코드 변경을 JSON으로 출력하면 워커가 직접 적용하고 서버를 재시작합니다.
 3. 변경할 게 없으면 솔직하게 "변경 없음"이라고 답하십시오 — 무리한 수정은 시스템을 불안정하게 만듭니다.
    ⚠️ 절대 "(요약 없음)" 같은 빈 응답은 보내지 마십시오 (사장 피드백 #9). 고칠 게 없으면 명시적으로 그 이유를 적으십시오.
-4. **(사장 피드백 2026-05-18) 당신은 운용지원실장의 지시를 받아 코딩만 수행하는 팀장입니다.**
-   - 프롬프트 맨 위 [🔴 운용지원실장 수정 지시] / [🔴 사장 직접 지시]에 적힌 **그 수정만 정확히 구현**하십시오.
-   - 스스로 범위를 넓히거나 다른 문제를 추가로 손대지 말고, 재진단·전략 의견 제시도 하지 마십시오.
+4. **(사장 지시 2026-05-19) 당신은 운용지원실장이 정의한 '문제·수용 기준'을 받아 *구현(HOW)을 스스로 설계*하는 팀장입니다.**
+   - 프롬프트 맨 위 [🔴 운용지원실장 지시] / [🔴 사장 직접 지시]는 *무엇이 왜 문제이고 무엇이 정상 동작인지*만 말합니다 — 그 문제를 해결할 search/replace는 **첨부된 실제 파일 본문을 직접 읽고 당신이 작성**하십시오 (실장은 코드를 지정하지 않습니다).
+   - search는 첨부 본문에 정확히 1회 일치해야 합니다 — 본문을 보고 실제로 일치하는 문자열을 직접 고르십시오 (지시문 안의 코드를 추측해 베끼지 말 것; 일치 실패의 원인입니다).
+   - 진단된 그 문제의 해결로 **범위를 한정**하십시오 — 무관한 리팩토링·추가 문제를 끌어들이지 말고, 재진단·전략 의견도 내지 마십시오.
    - 지시가 보안 가드에 막히거나 기술적으로 불가하면 changes:[]로 두고 rationale에 그 사유만 적으십시오.
 
 ## 코드 컨텍스트 (사장 지시 2026-05-14)
@@ -324,7 +330,8 @@ async def llm_propose(prompt: str, role: str = "ops_support",
                 d = await r.json()
         reply = d.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     except Exception as e:
-        logger.error(f"LLM 호출 예외: {e}")
+        # 사장 지시 2026-05-19: str(e)='' 예외(타임아웃 등)도 원인 식별되게 타입+repr+tb.
+        logger.error(f"LLM 호출 예외: {type(e).__name__}: {e!r}", exc_info=True)
         return {}
 
     # Find the JSON block — accept ``` fenced or bare
@@ -368,8 +375,10 @@ async def llm_diagnose(prompt: str) -> Dict[str, Any]:
                 d = await r.json()
         reply = d.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     except Exception as e:
-        logger.error(f"진단 LLM 예외: {e}")
-        return {"action": "none", "summary": "진단 미완 (LLM 호출 예외)", "rationale": str(e)}
+        # 사장 지시 2026-05-19: 빈 메시지 예외도 진단 가능하도록 타입+repr+tb 기록.
+        _detail = f"{type(e).__name__}: {e!r}"
+        logger.error(f"진단 LLM 예외: {_detail}", exc_info=True)
+        return {"action": "none", "summary": "진단 미완 (LLM 호출 예외)", "rationale": _detail}
     m = re.search(r"```json\s*(\{.+?\})\s*```", reply, re.S) or re.search(r"(\{.+\})", reply, re.S)
     if not m:
         logger.warning(f"진단 JSON 미발견 — none 처리. 일부: {reply[:300]}")
@@ -473,11 +482,11 @@ def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
                  delegated: bool = False) -> str:
     """Compose the prompt for the LLM. Includes truncated cycle reports so the
     LLM has signal without exhausting the token budget.
-    delegated=True 면 manual_directive 는 운용지원실장이 내린 구체 수정 지시다 —
-    팀장은 이 지시를 그대로 코드로만 옮긴다(재진단·범위확장 금지)."""
+    delegated=True 면 manual_directive 는 운용지원실장이 내린 '문제·수용 기준'이다 —
+    팀장은 첨부 파일을 직접 읽고 구현(HOW)을 스스로 설계하되, 진단된 그 문제로 범위를 한정한다."""
     parts = []
     if manual_directive:
-        _hdr = "[🔴 운용지원실장 수정 지시 — 이대로만 구현]" if delegated else "[🔴 사장 직접 지시]"
+        _hdr = "[🔴 운용지원실장 지시 — 문제·기대 동작 (구현 HOW는 팀장이 첨부 파일 보고 직접 설계)]" if delegated else "[🔴 사장 직접 지시]"
         parts.append(f"{_hdr}\n{manual_directive}\n")
 
     tgt = ctx.get("target_cycle")
@@ -507,7 +516,15 @@ def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
     if ctx.get("recent_errors_skips"):
         parts.append("\n[최근 에러·스킵 이벤트 (최대 20건)]")
         for e in ctx["recent_errors_skips"]:
-            parts.append(f"- {e.get('ts')} {e.get('type')}: {str(e.get('message',''))[:200]}")
+            # 사장 지시 2026-05-19: type=error 는 진단용이므로 상세히(메시지+트레이스백) 노출.
+            if e.get("type") == "error":
+                _msg = str(e.get("message", ""))[:700]
+                parts.append(f"- {e.get('ts')} error[{e.get('component','?')}]: {_msg}")
+                _tb = ((e.get("detail") or {}).get("traceback") or "").strip()
+                if _tb:
+                    parts.append("  ↳ traceback(tail):\n    " + "\n    ".join(_tb.splitlines()[-8:]))
+            else:
+                parts.append(f"- {e.get('ts')} {e.get('type')}: {str(e.get('message',''))[:200]}")
 
     parts.append(
         "\n[과제] 위 사이클 결과를 검토하여 ① 전략 발전 방향, ② 발견된 버그·이상 동작에 대한 코드 수정안을 제시하십시오. "

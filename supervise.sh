@@ -1,9 +1,9 @@
 #!/bin/bash
 # Arquant v1.0 — watchdog. Keeps the uvicorn server AND the Cloudflare tunnel alive.
-# Run once in the background:  nohup /home/opc/projects/Arquant/supervise.sh > /tmp/arquant_supervise.log 2>&1 &
-# (or add to crontab:  @reboot /home/opc/projects/Arquant/supervise.sh >> /tmp/arquant_supervise.log 2>&1 )
+# Run once in the background:  nohup /home/opc/projects/ArQuant/supervise.sh > /tmp/arquant_supervise.log 2>&1 &
+# (or add to crontab:  @reboot /home/opc/projects/ArQuant/supervise.sh >> /tmp/arquant_supervise.log 2>&1 )
 set -u
-APP_DIR="/home/opc/projects/Arquant"
+APP_DIR="/home/opc/projects/ArQuant"
 PORT=8500
 APP_LOG="/tmp/arquant.log"
 TUN_LOG="/tmp/cloudflared_arquant.log"

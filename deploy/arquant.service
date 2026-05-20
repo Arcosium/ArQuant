@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=opc
-WorkingDirectory=/home/opc/projects/Arquant
+WorkingDirectory=/home/opc/projects/ArQuant
 ExecStart=/usr/bin/python3.11 -m uvicorn server.app:app --host 0.0.0.0 --port 8500
 Restart=always
 RestartSec=5

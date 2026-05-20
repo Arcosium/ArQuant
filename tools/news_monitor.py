@@ -311,6 +311,9 @@ class NaverFinanceMonitor:
         Returns the number of articles kept."""
         keep = max(0, int(keep))
         self._article_history = self._article_history[-keep:] if keep else []
+        # 사장 지시 2026-05-19: 초기화 시 대시보드·뉴스탭의 '누적' 개수도 리셋한다.
+        # total_articles_found는 get_status()로 노출되는 누적 카운터 — 남긴 건수에 맞춘다.
+        self.total_articles_found = len(self._article_history)
         try:
             self._save_persisted()
         except Exception as e:
