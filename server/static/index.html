@@ -288,11 +288,11 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
     </div>
   </div>
 </div>
-<!-- 사장 피드백 2026-05-20: 모바일에서 모달이 납작해보이는 버그 — vh가 URL bar/키보드/safe-area로
-     흔들리고 아코디언 접힌 상태에서 컨텐츠 짧으면 박스가 자연 높이로 줄어듬. 외부 오버레이에 명시적
-     100dvh + 내부 박스에 min-height로 최소 크기 보장. dvh 미지원 시 vh 폴백. -->
-<div id="profileOv" style="position:fixed;inset:0;z-index:9998;display:none;align-items:center;justify-content:center;background:#0b0f1af5;height:100vh;height:100dvh;width:100vw;padding:max(16px,env(safe-area-inset-top,0px)) 14px max(16px,env(safe-area-inset-bottom,0px));box-sizing:border-box">
-  <div style="background:#11161f;border:1px solid #2a3344;border-radius:14px;padding:22px;width:min(440px,100%);max-height:100%;min-height:min(520px,100%);overflow:auto;box-sizing:border-box;display:flex;flex-direction:column;gap:6px">
+<!-- 사장 피드백 2026-05-20(2차): 모바일 WebView에서 vh/dvh/%-height가 0으로 계산돼 모달이
+     납작해지고 위로 몰리던 버그. 뷰포트 단위를 완전히 버리고 박스를 position:fixed로 top+bottom
+     동시 지정 → 높이를 "화면−여백"으로 브라우저가 직접 계산(vh 측정 불필요). 가로는 left:50%+translateX. -->
+<div id="profileOv" style="position:fixed;inset:0;z-index:9998;display:none;background:#0b0f1af5">
+  <div style="position:fixed;top:max(16px,env(safe-area-inset-top,0px));bottom:max(16px,env(safe-area-inset-bottom,0px));left:50%;transform:translateX(-50%);width:min(440px,92vw);background:#11161f;border:1px solid #2a3344;border-radius:14px;padding:22px;overflow-y:auto;-webkit-overflow-scrolling:touch;box-sizing:border-box">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
       <div><b id="pf_user"></b> <span id="pf_admin" style="display:none;font-size:10px;color:#fbbf24;border:1px solid #fbbf24;border-radius:5px;padding:1px 6px;margin-left:6px">ADMIN</span></div>
       <button onclick="closeProfile()" class="btn btn-ghost">✕</button>
