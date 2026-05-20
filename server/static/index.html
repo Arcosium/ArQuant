@@ -334,8 +334,8 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <!-- 사장 피드백 2026-05-15: 최근 사이클 API 비용 (달러 추정) — STOPPED 배지 왼쪽 -->
       <!-- 사장 피드백 2026-05-18: 클릭 시 OpenRouter 크레딧 페이지로 이동 -->
       <a id="apiCost" href="https://openrouter.ai/settings/credits" target="_blank" rel="noopener" title="최근 사이클 API 추정 비용 (USD) — 클릭하면 OpenRouter 크레딧 페이지로 이동" style="font-size:11px;color:var(--dim);background:var(--s2);border-radius:6px;padding:3px 10px;border:1px solid var(--border);text-decoration:none;cursor:pointer">💵 $0.00/cycle</a>
-      <!-- 사장 피드백 2026-05-18: 운용지원실장 피드백 on/off 토글 (ADMIN 전용 — 기본 숨김) -->
-      <button id="opsToggle" onclick="toggleOpsFeedback()" title="운용지원실장 피드백(코드 자동 개선·재시작) on/off — ADMIN 전용" style="display:none;font-size:11px;color:var(--dim);background:var(--s2);border-radius:6px;padding:3px 10px;border:1px solid var(--border);cursor:pointer">🛠 운용지원 …</button>
+      <!-- 운용지원실장 피드백 on/off 토글 (프로필별 — 상태 로드 전 기본 숨김) -->
+      <button id="opsToggle" onclick="toggleOpsFeedback()" title="이 계정의 운용지원 피드백(전략 파라미터 자동 조정) on/off — 프로필별" style="display:none;font-size:11px;color:var(--dim);background:var(--s2);border-radius:6px;padding:3px 10px;border:1px solid var(--border);cursor:pointer">🛠 운용지원 …</button>
       <div id="acctChip" title="프로필">👤</div>
     </div>
   </header>
@@ -479,10 +479,10 @@ window.fetch=async(u,o={})=>{
   return r;
 };
 let _authed=false;
-// 사장 피드백 2026-05-18: 운용지원실장·산하 팀장은 ADMIN(hh09080) 전용.
-// default-deny — /api/me 로 admin 확인 전까지 숨김 처리한다.
+// 사장 지시 2026-05-20: 운용지원실장은 ADMIN·일반 유저 모두 사용 가능(프로필 한정 파라미터
+// 조정만 — 코드 자가수정·산하 팀장 폐지). 더 이상 사이드바/멘션에서 숨기지 않는다(빈 집합).
 let IS_ADMIN=false;
-const OPS_AGENT_NAMES=new Set(["운용지원실장","투자관리팀장","경영관리팀장","재무관리팀장"]);
+const OPS_AGENT_NAMES=new Set([]);
 async function boot(){
   try{const r=await _origFetch(API+'/api/auth_status');const d=await r.json();
     if(d.authenticated){_authed=true;hideLogin();startApp();renderAcct(d.active);}
@@ -657,19 +657,17 @@ async function pfDeleteAccount(){
   const r=await fetch(API+'/api/profile/delete_account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
   if(r.ok){alert('탈퇴 완료');location.reload();}else{const d=await r.json().catch(()=>({}));alert((d&&(d.detail||d.message))||('HTTP '+r.status));}}
 // ── 프로필 모달 끝 ────────────────────────────────────────────────────────────
-// 사장 피드백 2026-05-15 (4차): 사이드바 계층화 — 운용전략실장/운용지원실장 산하 팀장 들여쓰기 + '시스템' 제거.
+// 사이드바 계층화 — 운용전략실장 산하 팀장 들여쓰기. 설명은 일관된 한국어.
+// 사장 지시 2026-05-20: 산하 팀장(투자/경영/재무관리팀장) 및 코드 자가수정 폐지 — 사이드바에서 제거.
 const agents=[
-  {name:"운용전략실장",role:"Chief Strategy · 2패스 결정",color:"#6366f1",level:0},
-  {name:"전략리서치팀장",role:"Macro Research",color:"#06b6d4",level:1},
-  {name:"계량분석팀장",role:"Quant · 종목별 평가",color:"#10b981",level:1},
-  {name:"뉴스분석팀장",role:"News Sentiment",color:"#f59e0b",level:1},
-  {name:"트레이딩팀장",role:"Trader · 실행 보고",color:"#ef4444",level:1},
-  {name:"리스크관리실장",role:"Risk · DART 재심",color:"#8b5cf6",level:0},
-  {name:"사후관리실장",role:"Post-Mgmt · 매도",color:"#f43f5e",level:0},
-  {name:"운용지원실장",role:"Ops Support · 분류 위임",color:"#14b8a6",level:0},
-  {name:"투자관리팀장",role:"전략·종목·지표",color:"#0d9488",level:1},
-  {name:"경영관리팀장",role:"인프라·UX·로그",color:"#0f766e",level:1},
-  {name:"재무관리팀장",role:"예산·리스크·평가",color:"#115e59",level:1},
+  {name:"운용전략실장",role:"총괄 전략·종목 선정 (2패스)",color:"#6366f1",level:0},
+  {name:"전략리서치팀장",role:"거시·매크로 리서치",color:"#06b6d4",level:1},
+  {name:"계량분석팀장",role:"후보 종목 정량 평가",color:"#10b981",level:1},
+  {name:"뉴스분석팀장",role:"뉴스 감성·이벤트 분석",color:"#f59e0b",level:1},
+  {name:"트레이딩팀장",role:"주문 실행·결과 보고",color:"#ef4444",level:1},
+  {name:"리스크관리실장",role:"리스크 게이트·DART 재심",color:"#8b5cf6",level:0},
+  {name:"사후관리실장",role:"보유 종목 매도 판단",color:"#f43f5e",level:0},
+  {name:"운용지원실장",role:"진단·프로필 전략 조정",color:"#14b8a6",level:0},
 ];
 const al=document.getElementById('agentList');
 // 사장 피드백 2026-05-18: 운용지원 계열은 ADMIN 에게만 렌더. IS_ADMIN 갱신 시 재호출.
@@ -1040,24 +1038,22 @@ async function refreshStatus(){try{const r=await fetch(API+'/api/status');const 
     apiCostEl.textContent = _mob ? `💵 $${c.toFixed(3)}` : `💵 $${c.toFixed(3)}/h (${n}콜)`;
     apiCostEl.title = `최근 1시간 누적 API 비용: $${c.toFixed(4)} / 호출 ${n}회 (OpenRouter usage 기반 추정) — 클릭하면 OpenRouter 크레딧 페이지로 이동`;
   }
-  // 사장 피드백 2026-05-18: 운용지원실장 피드백 on/off 토글 — ADMIN 에게만 노출, 상태 반영
+  // 사장 지시 2026-05-20: 운용지원 피드백 토글 — 전 유저 노출(프로필별 on/off). 상태 반영.
   const opsBtn=document.getElementById('opsToggle');
   if(opsBtn){
-    if(IS_ADMIN){
-      const on=(d.ops_feedback_enabled!==false);
-      opsBtn.style.display='';
-      opsBtn.dataset.on=on?'1':'0';
-      opsBtn.textContent = on ? '🛠 운용지원 ON' : '🛠 운용지원 OFF';
-      opsBtn.style.color = on ? '#34d399' : '#fca5a5';
-      opsBtn.style.borderColor = on ? 'rgba(52,211,153,.45)' : 'rgba(252,165,165,.45)';
-    } else { opsBtn.style.display='none'; }
+    const on=(d.ops_feedback_enabled!==false);
+    opsBtn.style.display='';
+    opsBtn.dataset.on=on?'1':'0';
+    opsBtn.textContent = on ? '🛠 운용지원 ON' : '🛠 운용지원 OFF';
+    opsBtn.style.color = on ? '#34d399' : '#fca5a5';
+    opsBtn.style.borderColor = on ? 'rgba(52,211,153,.45)' : 'rgba(252,165,165,.45)';
   }
   if(d.current_state)updateBadge(d.current_state); // keep badge in sync even when no WS status event arrives (e.g. during cooldown)
   // Sync start/stop button state with server on reconnect (bug fix item 9)
   if(d.is_running){document.getElementById('startBtn').disabled=true;document.getElementById('stopBtn').disabled=false}
   else if(d.current_state==='STOPPED'||d.current_state==='IDLE'){document.getElementById('startBtn').disabled=false;document.getElementById('stopBtn').disabled=true}}catch(e){}}
 
-// 사장 피드백 2026-05-18: 운용지원실장 피드백 on/off 토글 (ADMIN 전용 — 서버가 권한 재검증)
+// 운용지원실장 피드백 on/off 토글 (프로필별 — 서버가 세션 유저 본인 계정에 반영)
 async function toggleOpsFeedback(){
   const btn=document.getElementById('opsToggle'); if(!btn)return;
   const next = btn.dataset.on!=='1';

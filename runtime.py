@@ -43,10 +43,16 @@ def profile_overrides() -> dict:
     return dict(_profile_overrides)
 
 
-# ── 운용지원실장 피드백 on/off (사장 피드백 2026-05-18) ───────────────────────
-# 대시보드 토글 버튼으로 켜고 끈다. 기본 ON(기존 동작 보존). 끄면 main_swarm 의
-# _spawn_ops_support_worker 마스터 게이트가 워커를 아예 띄우지 않는다(재시작 불필요).
-_ops_feedback = {"enabled": True, "since": datetime.now().isoformat(), "by": "default"}
+# ── 운용지원실장 피드백 on/off — 프로필(계정)별 (사장 지시 2026-05-20) ───────────
+# 계정마다 독립 토글. 기본 ON(기존 동작 보존). 끄면 그 프로필이 활성일 때 워커를
+# 띄우지 않는다(재시작 불필요). 저장 형식:
+#   {"_default": {enabled,since,by}, "<uid>": {enabled,since,by}, ...}
+# 구버전 flat 포맷({"enabled":...})은 로드 시 _default 로 자동 이관(하위호환).
+_ops_feedback: dict = {"_default": {"enabled": True, "since": datetime.now().isoformat(), "by": "default"}}
+
+
+def _ops_key(uid=None) -> str:
+    return str(int(uid)) if uid is not None else "_default"
 
 
 def _load_ops_feedback():
@@ -55,33 +61,44 @@ def _load_ops_feedback():
         if _OPS_FLAG.exists():
             d = json.loads(_OPS_FLAG.read_text(encoding="utf-8"))
             if isinstance(d, dict) and "enabled" in d:
-                _ops_feedback = {"enabled": bool(d["enabled"]),
-                                 "since": d.get("since", datetime.now().isoformat()),
-                                 "by": d.get("by", "load")}
+                # 구버전 flat 포맷 → _default 로 이관
+                _ops_feedback = {"_default": {"enabled": bool(d["enabled"]),
+                                              "since": d.get("since", datetime.now().isoformat()),
+                                              "by": d.get("by", "load")}}
+            elif isinstance(d, dict):
+                _ops_feedback = {k: v for k, v in d.items() if isinstance(v, dict) and "enabled" in v}
+                _ops_feedback.setdefault("_default", {"enabled": True,
+                                                      "since": datetime.now().isoformat(), "by": "default"})
     except Exception:
         pass
 
 
-def ops_feedback_enabled() -> bool:
-    return bool(_ops_feedback.get("enabled", True))
+def ops_feedback_enabled(uid=None) -> bool:
+    """프로필(uid)별 토글. 해당 프로필 설정 없으면 _default(기본 ON)로 폴백."""
+    st = _ops_feedback.get(_ops_key(uid)) or _ops_feedback.get("_default") or {}
+    return bool(st.get("enabled", True))
 
 
-def ops_feedback_state() -> dict:
-    return dict(_ops_feedback)
+def ops_feedback_state(uid=None) -> dict:
+    key = _ops_key(uid)
+    st = _ops_feedback.get(key) or _ops_feedback.get("_default") or {"enabled": True}
+    return {**dict(st), "uid": (None if key == "_default" else int(key))}
 
 
-def set_ops_feedback(enabled: bool, by: str = "dashboard") -> dict:
-    """운용지원실장 피드백 토글. 영속 + 히스토리 기록. 재시작 불필요."""
+def set_ops_feedback(enabled: bool, uid=None, by: str = "dashboard") -> dict:
+    """운용지원실장 피드백 토글 — 프로필(uid)별. uid=None 이면 기본값. 재시작 불필요."""
     global _ops_feedback
-    _ops_feedback = {"enabled": bool(enabled),
-                     "since": datetime.now().isoformat(), "by": by}
+    key = _ops_key(uid)
+    _ops_feedback[key] = {"enabled": bool(enabled),
+                          "since": datetime.now().isoformat(), "by": by}
     try:
         _OPS_FLAG.write_text(json.dumps(_ops_feedback, ensure_ascii=False, indent=2),
                              encoding="utf-8")
     except Exception:
         pass
-    _append_history({"ops_feedback": bool(enabled), "by": f"{by}:ops_feedback"})
-    return dict(_ops_feedback)
+    _append_history({"ops_feedback": bool(enabled),
+                     "uid": (None if key == "_default" else int(key)), "by": f"{by}:ops_feedback"})
+    return ops_feedback_state(uid)
 
 
 def _persist():

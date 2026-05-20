@@ -49,6 +49,22 @@ def test_valid_kr_buy_within_limits_is_approved():
     assert r["results"][0]["status"] == "APPROVED"
 
 
+def test_limit_entry_directive_preserved_through_validation():
+    """OPS#36 회귀: 계량분석팀장의 지정가(limit) 진입 지시가 리스크 검사 결과에 보존돼야 한다.
+
+    누락되면 실행부 r.get("entry_mode") 가 None→"market" 으로 떨어져 지정가가 무시되고
+    시장가로 체결된다(001450: 34,900 지정가가 36,250 시장가에 체결된 실거래 버그)."""
+    order = _order(ticker="001450", qty=1)
+    order.update({"entry_mode": "limit", "entry_limit": 34900.0, "entry_raw": "34900"})
+    r = validate_order_draft({"orders": [order]},
+                             buying_power=_bp(), price_map={"001450": 35_000})
+    assert r["approved"] is True
+    res = r["results"][0]
+    assert res["status"] == "APPROVED"
+    assert res.get("entry_mode") == "limit", "지정가 모드가 검사 결과에 보존돼야 한다"
+    assert res.get("entry_limit") == 34900.0, "지정가가 검사 결과에 보존돼야 한다"
+
+
 @pytest.mark.parametrize("qty,frag", [(0, "수량 비정상"), (-3, "수량 비정상"),
                                        (1500, "1회 한도")])
 def test_bad_quantity_rejected(qty, frag):

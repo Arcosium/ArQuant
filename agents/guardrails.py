@@ -148,7 +148,14 @@ def _check_single_order(o: Dict[str, Any], bp: Dict[str, Any], price_map: Dict[s
     if status == "APPROVED" and side == "buy":
         cycle_state["spent"] = cycle_state.get("spent", 0.0) + notional_krw
     return {"ticker": ticker, "side": side, "qty": qty, "price": price, "notional": notional,
-            "status": status, "issues": issues, "warnings": warnings}
+            "status": status, "issues": issues, "warnings": warnings,
+            # OPS#36: 계량분석팀장의 진입가 지시(limit)를 실행 단계까지 보존한다.
+            # 누락 시 실행부 r.get("entry_mode") 가 None→"market" 으로 떨어져 지정가가
+            # 무시되고 시장가로 체결된다(001450 34,900 지정가가 36,250 시장가에 체결된 버그).
+            # entry_watch_pct 는 의도적으로 전달하지 않는다 — 관망(watch) 모드는 현재 시장가
+            # 즉시 매수를 유지한다('주문 스킵 금지' 정책상 미체결 만료 위험 회피).
+            "entry_mode": o.get("entry_mode"), "entry_limit": o.get("entry_limit"),
+            "entry_raw": o.get("entry_raw")}
 
 
 def validate_order_draft(order_json: Any, balance_info: Any = "",

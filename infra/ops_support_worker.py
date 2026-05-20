@@ -129,29 +129,17 @@ OPS_MAX_TOKENS = AGENT_MAX_TOKENS.get("ops_support", 4096)
 # 사장 지시 2026-05-14: 운용지원실장 산하 팀장 분담.
 # 동일한 보안 가드(FORBIDDEN_PATTERNS/ALLOWED_EDITS)를 공유하되, 시스템 프롬프트의 역할 페르소나만 바꾼다.
 # 키 = main_swarm._classify_ops_role()이 반환하는 코드, 값 = (한글 디스플레이명, 포커스 설명)
+# 사장 지시 2026-05-20: 산하 팀장(investment/operations/finance) 및 코드 자가수정 기능 제거.
+# 운용지원실장 단일 역할만 남기며, 소스 코드는 절대 수정하지 않고 프로필 한정 전략 파라미터
+# (param_overrides) 조정안만 제시한다.
 ROLE_PERSONAS = {
     "ops_support": ("운용지원실장",
-        "**진단·지시자 역할 (사장 지시 2026-05-19)** — 직접 코딩하지 않으며, *어떻게* 고칠지"
-        "(코드·search/replace)도 지시하지 않습니다. 직전 사이클 데이터를 스스로 분석해 *무엇이 "
-        "버그/문제인지, 어느 파일·영역이 원인인지, 무엇이 정상 동작인지(수용 기준)*까지만 진단합니다. "
-        "그 다음 ① 고칠 게 없으면 산하 팀장을 부르지 않고 실장 선에서 종료하고, ② 고칠 게 있으면 "
-        "담당 팀장(investment/operations/finance) 1명에게 *문제와 기대 동작*을 위임합니다 — 구현(HOW)은 "
-        "그 팀장이 첨부된 실제 파일을 보고 직접 설계합니다. 데이터 부족·출력 깨짐 버그를 최우선으로 잡습니다."),
-    "investment":  ("투자관리팀장",
-        "전략·매매 정책 코더. 전략 프리셋(config.py), 후보 필터링/사이징, 매도/익절/손절, "
-        "퀀트 지표 임계값, 뉴스 분류, 종목별 고정 보유 정책 영역의 코드를 다룹니다. "
-        "**운용지원실장이 준 문제·수용 기준을 받아 구현 방법(HOW)을 스스로 설계**해 코드로 옮기고 "
-        "즉시 서버 재시작 (restart: true)."),
-    "operations":  ("경영관리팀장",
-        "운영 인프라 코더. server/app.py 엔드포인트, server/static/index.html 대시보드 UX, "
-        "infra/cycle_store.py·weekly_review.py·news_classifier_log.py·ops_history.py, 로깅·모니터링. "
-        "매매 로직엔 손대지 않습니다. **운용지원실장이 준 문제·수용 기준을 받아 구현(HOW)은 "
-        "스스로 설계**해 적용하고 즉시 재시작 (restart: true)."),
-    "finance":     ("재무관리팀장",
-        "자산·리스크 코더. 예산 비율(PER_ORDER_BUDGET_RATIO 등), 리스크 한도, P&L·equity curve, "
-        "환율·평가액 산출, 외부 입출금 감지, 표시 단위(원/달러) 정확성. "
-        "**운용지원실장이 준 문제·수용 기준을 받아 구현(HOW)은 스스로 설계**해 적용하고 "
-        "즉시 서버 재시작 (restart: true)."),
+        "**진단·프로필 튜닝 제안자 (사장 지시 2026-05-20)** — 직접 코딩하지 않으며 소스 코드도 "
+        "수정하지 않습니다(코드 자가수정 기능 제거됨). 직전 사이클·주간 실제 데이터를 분석해 *무엇이 "
+        "문제이고 무엇이 정상 동작인지*를 진단하고, 개선이 필요하면 **이 프로필에만 적용되는 전략 튜닝 "
+        "파라미터(param_overrides)** 로만 조정안을 제시합니다. 조정 범위는 사용자가 전략 커스터마이즈에서 "
+        "바꿀 수 있는 '적용 가능 전략' 파라미터에 한정됩니다(계정마다 프로필 분리). 데이터 부족·출력 깨짐 "
+        "버그를 최우선으로 진단하되, 소스 변경이 필요해 보이면 '제안'으로만 기록하고 자동 적용하지 않습니다."),
 }
 
 # 사장 피드백 2026-05-18: 운용지원실장(진단)·팀장(코딩) 책임 분리.
@@ -546,6 +534,10 @@ def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
 
 
 # ─── Change application ──────────────────────────────────────────────────
+# 사장 지시 2026-05-20: 코드 자가수정 기능 제거(RETIRED). 아래 apply_changes()/
+# restart_server() 와 위임용 llm_diagnose()/_spawn_subordinate() 는 run() 에서 더 이상
+# 호출되지 않는다(소스 편집·서버 재시작·팀장 위임 전면 비활성). 정의는 가드 단위 테스트
+# (test_ops_worker_guards.py) 보존 및 향후 복구 가능성을 위해 남겨두되, 실행 경로에서 분리됨.
 def _violates_pattern(rel_path: str, payload: str) -> Optional[str]:
     """Return the failing pattern description if `payload` violates any FORBIDDEN_PATTERN for `rel_path`."""
     for fpath, rx in FORBIDDEN_PATTERNS:
@@ -722,8 +714,9 @@ def restart_server() -> str:
 # ─── Main ─────────────────────────────────────────────────────────────────
 def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
                       started: str, trigger: str, cycle_id: Optional[int]) -> None:
-    """비관리자 경로: 공유 소스·서버 절대 불가침.
-    param_overrides 만 프로필 한정으로 반영하고, changes 는 '제안'으로만 기록한다."""
+    """운용지원 단일 경로(사장 지시 2026-05-20): 소스 코드·서버 절대 불가침.
+    param_overrides 만 프로필 한정으로 반영하고, changes 는 '제안'으로만 기록한다.
+    ADMIN·일반 유저 모두 동일하게 이 경로를 탄다(코드 자가수정 제거)."""
     display = ROLE_PERSONAS.get(role, ROLE_PERSONAS["ops_support"])[0]
     summary = plan.get("summary") or "변경 사항 없음"
     rationale = plan.get("rationale", "") or ""
@@ -747,13 +740,13 @@ def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
     if applied_ov:
         head = f"✅ 이 프로필 전용 튜닝 {len(applied_ov)}건 반영 (소스/서버 불변, 다음 로그인 시 활성화)"
     elif proposed:
-        head = f"📝 소스 변경 제안 {len(proposed)}건 — 비관리자라 미적용 (ADMIN만 전체 반영)"
+        head = f"📝 소스 변경 제안 {len(proposed)}건 — 자동 적용 안 함 (코드 자가수정 비활성)"
     elif "변경 없음" in summary or "변경 사항 없음" in summary:
         head = "ℹ️ 변경 없음 — 점검 결과 손볼 곳 없음"
     else:
         head = summary
 
-    msg_lines = [f"🛠 [OPS#{cycle_id or 'manual'}] {display} (비관리자 프로필): {head}"]
+    msg_lines = [f"🛠 [OPS#{cycle_id or 'manual'}] {display}: {head}"]
     if rationale and not ("변경 없음" in summary and not applied_ov and not proposed):
         msg_lines.append(f"근거: {rationale[:500]}")
     for k, v in applied_ov.items():
@@ -762,7 +755,7 @@ def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
         msg_lines.append("소스 변경 제안(미적용):")
         for s in proposed[:5]:
             msg_lines.append(f"  • {s}")
-    msg_lines.append("ℹ️ 공유 소스 코드·서버 재시작은 ADMIN(hh09080) 계정에서만 전체 반영됩니다.")
+    msg_lines.append("ℹ️ 코드 자가수정·서버 재시작 기능은 비활성화됨 — 프로필 한정 파라미터 조정만 반영됩니다.")
     message = "\n".join(msg_lines)
     logger.info(f"--- 비관리자 요약 ---\n{message}\n----------")
 
@@ -806,15 +799,13 @@ async def run(cycle_id: Optional[int], manual: Optional[str], role: str = "ops_s
                 f"manual={'있음' if manual else '없음'}, delegated={delegated}, "
                 f"actor_uid={actor_uid}, admin={actor_admin}) ===")
 
-    # 사장 피드백 2026-05-18: 운용지원실장·산하 팀장은 ADMIN(hh09080) 전용.
-    # 비관리자면 LLM 호출·컨텍스트 수집도 하기 전에 **즉시 종료** — 샌드박스/프로필
-    # 오버라이드조차 수행하지 않는다(완전 비활성). 정상 경로(main_swarm)는 애초에
-    # spawn 하지 않으므로 이는 CLI 직접 실행 등 우회 경로에 대한 default-deny 방어선.
-    if not actor_admin:
-        logger.warning(f"비관리자 계정(uid={actor_uid}) — 운용지원 워커 전면 비활성, 즉시 종료")
-        return
+    # 사장 지시 2026-05-20: 코드 자가수정·서버 재시작 기능 제거. 운용지원실장은 ADMIN·일반
+    # 유저 구분 없이 ① 진단 + ② 프로필 한정 파라미터(param_overrides) 조정 + ③ 소스 변경
+    # '제안' 기록만 수행한다. apply_changes()/restart_server() 미호출(코드 자가수정 차단),
+    # 산하 팀장(investment/operations/finance) 위임 경로도 제거. 조정 범위는
+    # '적용 가능 전략·전략 커스터마이즈' 수준의 프로필 파라미터에 한정된다(사람마다 프로필 분리).
 
-    # 사장 지시 2026-05-14: trigger 분류 — 주간 리뷰 키워드 감지
+    # trigger 분류 — 주간 리뷰 키워드 감지
     trigger = "weekly" if (manual and "주간 피드백 루프" in manual) else ("manual" if manual else "cycle")
 
     ctx = fetch_cycle_context(cycle_id)
@@ -822,83 +813,14 @@ async def run(cycle_id: Optional[int], manual: Optional[str], role: str = "ops_s
         logger.info("분석할 사이클 데이터 없음 — 종료")
         return
 
-    # ── Phase A: 운용지원실장 진단 (사이클 자동 트리거 & 사장 직접지시 아님) ──
-    # 사장 피드백 2026-05-18: 실장이 스스로 무엇/어디/어떻게를 진단 →
-    #   고칠 게 없으면 팀장 안 부르고 실장 선에서 종료, 있으면 담당 팀장에게 구체 지시 위임.
-    if role == "ops_support" and trigger == "cycle" and not manual and not delegated:
-        diag_prompt = build_prompt(ctx, None)
-        logger.info(f"진단 프롬프트 길이: {len(diag_prompt)} chars")
-        dx = await llm_diagnose(diag_prompt)
-        d_summary = dx.get("summary") or "사이클 점검 완료"
-        d_rationale = dx.get("rationale") or ""
-        sub_role = (dx.get("sub_role") or "").strip()
-        directive = (dx.get("directive") or "").strip()
-        if dx.get("action") == "delegate" and sub_role in ("investment", "operations", "finance") and directive:
-            ok = _spawn_subordinate(sub_role, directive, cycle_id, actor_uid)
-            sub_kr = ROLE_PERSONAS.get(sub_role, (sub_role,))[0]
-            if ok:
-                _write_summary(
-                    started,
-                    f"{d_summary} → {sub_kr}에게 코딩 위임",
-                    f"{d_rationale}\n\n[{sub_kr}에게 내린 구체 수정 지시]\n{directive}",
-                    [], [], None, trigger=trigger, cycle_id=cycle_id,
-                    compile_errors=[], role="ops_support")
-            else:
-                _write_summary(started, f"{d_summary} (위임 spawn 실패 — 보류)",
-                               d_rationale, [], [], None, trigger=trigger,
-                               cycle_id=cycle_id, compile_errors=[], role="ops_support")
-            return
-        # action == none → 실장 선에서 피드백 종료 (팀장 미호출)
-        logger.info("진단 결과: 고칠 것 없음 — 실장 선에서 종료")
-        _write_summary(started,
-                       d_summary if "변경 없음" in d_summary or "없음" in d_summary
-                       else f"변경 없음 — {d_summary}",
-                       d_rationale, [], [], None, trigger=trigger,
-                       cycle_id=cycle_id, compile_errors=[], role="ops_support")
-        return
-
-    prompt = build_prompt(ctx, manual, delegated=delegated)
+    prompt = build_prompt(ctx, manual, delegated=False)
     logger.info(f"LLM 프롬프트 길이: {len(prompt)} chars")
+    # non_admin=True: LLM 에게 '프로필 한정 param_overrides 만, 소스 변경은 제안으로만 기록,
+    # 서버 재시작 없음'을 지시한다. 코드 자가수정(apply_changes)·재시작·팀장 위임 경로는 제거됨.
+    plan = await llm_propose(prompt, role="ops_support", non_admin=True)
 
-    # 여기 도달 = ADMIN 확정(상단 default-deny 가드 통과). 비관리자 분기는 제거됨.
-    plan = await llm_propose(prompt, role=role, non_admin=False)
-
-    # 사장 피드백 2026-05-15 (#9): "(요약 없음)" 대신 명시적 메시지 — 변경 사항이 없으면 그렇다고 말하기.
-    summary = plan.get("summary") or "변경 사항 없음 — 현 사이클에서 즉시 고칠 버그·개선점이 식별되지 않음 (사장 피드백 #9)"
-    rationale = plan.get("rationale", "")
-    changes = plan.get("changes") or []
-    want_restart = bool(plan.get("restart"))
-
-    logger.info(f"LLM 제안: {summary}")
-    if rationale:
-        logger.info(f"근거: {rationale[:500]}")
-
-    if not changes:
-        logger.info("변경 사항 없음 — 종료")
-        _write_summary(started, summary, rationale, [], [], None,
-                       trigger=trigger, cycle_id=cycle_id, compile_errors=[], role=role)
-        return
-
-    logger.info(f"변경 {len(changes)}건 검토 중...")
-    result = apply_changes(plan)
-    for line in result["applied"]: logger.info(line)
-    for line in result["rejected"]: logger.warning(line)
-    for line in result["compile_errors"]: logger.error(line)
-
-    # 컴파일 실패 시 롤백은 이제 apply_changes 가 플랜 전체를 원장 역순으로
-    # 원복(부분 적용 불일치 차단)한다. 여기서는 그 결과만 로깅한다.
-    for line in result.get("rolled_back", []):
-        logger.warning(line)
-
-    restart_msg = None
-    if want_restart and result["applied"] and not result["compile_errors"]:
-        restart_msg = restart_server()
-        logger.info(restart_msg)
-    elif want_restart and result["compile_errors"]:
-        logger.warning("재시작 요청됐으나 구문 오류로 인해 보류")
-
-    _write_summary(started, summary, rationale, result["applied"], result["rejected"], restart_msg,
-                   trigger=trigger, cycle_id=cycle_id, compile_errors=result.get("compile_errors") or [], role=role)
+    # 진단 + 프로필 한정 파라미터(param_overrides) 조정 + 소스 변경 '제안' 기록만 수행.
+    _handle_non_admin(plan, actor_uid, "ops_support", started, trigger, cycle_id)
 
 
 def _write_summary(started: str, summary: str, rationale: str, applied: List[str], rejected: List[str], restart: Optional[str],

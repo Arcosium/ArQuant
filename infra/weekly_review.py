@@ -137,6 +137,22 @@ def trigger_if_due() -> bool:
     with a 주간 리뷰 directive. Returns True if triggered."""
     if not should_run_now():
         return False
+    # 활성 계정(프로필) 조회 — 주간 조정은 이 프로필에 적용된다.
+    try:
+        from infra import credentials as _creds
+        _act = _creds.current()
+        _auid, _admin = _act.get("user_id"), bool(_act.get("is_admin"))
+    except Exception as _e:
+        logger.warning(f"활성 계정 조회 실패 — uid 없이 진행: {_e}")
+        _auid, _admin = None, False
+    # 운용지원 on/off 토글(프로필별) 존중 — 이 프로필이 OFF면 주간 피드백도 스킵.
+    try:
+        import runtime as _rt
+        if not _rt.ops_feedback_enabled(_auid):
+            logger.info(f"주간 피드백 스킵 — 운용지원 피드백 토글 OFF (uid={_auid})")
+            return False
+    except Exception:
+        pass
     summary = build_review_summary()
     # 결정론 진단을 directive 최상단에 배치 — LLM 이 약해도 행동 가능한 구체 신호.
     try:
@@ -149,30 +165,20 @@ def trigger_if_due() -> bool:
     directive = (
         "[주간 피드백 루프] 다음은 지난 7일간의 ArQuant 운영 통계입니다. "
         "이 데이터를 검토하여 ① 뉴스 분류 키워드 가중치, ② 퀀트점수 임계값, "
-        "③ 사후관리실장 매도 룰, ④ 후보 사전 필터 cap 등의 조정안을 제시하십시오. "
-        "필요한 코드 변경을 JSON으로 답하면 자동 적용됩니다. 변경이 필요 없으면 솔직하게 답하세요.\n\n"
+        "③ 사후관리실장 매도 룰, ④ 후보 사전 필터 cap 등에 대해 **이 프로필에 적용할 전략 튜닝 "
+        "파라미터(param_overrides)** 조정안을 제시하십시오. 코드 자가수정·서버 재시작은 하지 않습니다. "
+        "변경이 필요 없으면 솔직하게 답하세요.\n\n"
         f"★ 결정론 진단(우선 검토): {diag}\n\n"
         f"통계:\n{json.dumps(summary, ensure_ascii=False, indent=2)}"
     )
     worker = PROJECT_ROOT / "infra" / "ops_support_worker.py"
     log_path = PROJECT_ROOT / "data" / "weekly_review.log"
-    # 사장 피드백 2026-05-18: 주간 피드백 루프도 코드 수정·재시작을 유발하므로
-    # ADMIN(hh09080) 활성 계정에서만 진행. 비관리자/판단불가 → default-deny(스킵).
-    try:
-        from infra import credentials as _creds
-        _act = _creds.current()
-        _auid, _admin = _act.get("user_id"), bool(_act.get("is_admin"))
-    except Exception as _e:
-        logger.warning(f"활성 계정 조회 실패 — 주간 피드백 스킵(비관리자 처리): {_e}")
-        _auid, _admin = None, False
-    if not _admin:
-        logger.info(f"주간 피드백 스킵 — 비관리자 활성 계정(uid={_auid}) · ADMIN(hh09080) 전용")
-        return False
+    # 코드 자가수정 제거 후 주간 피드백은 프로필 한정 파라미터 조정만 — ADMIN·일반 공통.
     try:
         f = open(log_path, "a", encoding="utf-8", buffering=1)
-        f.write(f"\n=== {datetime.now(KST):%Y-%m-%d %H:%M:%S} 주간 피드백 트리거 (admin uid={_auid}) ===\n")
+        f.write(f"\n=== {datetime.now(KST):%Y-%m-%d %H:%M:%S} 주간 피드백 트리거 (uid={_auid}, admin={_admin}) ===\n")
         f.write(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
-        _cmd = ["python3.11", str(worker), "--manual", directive, "--actor-admin", "1"]
+        _cmd = ["python3.11", str(worker), "--manual", directive, "--actor-admin", "1" if _admin else "0"]
         if _auid is not None:
             _cmd += ["--actor-user", str(int(_auid))]
         subprocess.Popen(

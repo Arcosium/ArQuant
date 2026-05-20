@@ -13,11 +13,16 @@ ArQuant — 계정별 상시 지시사항 (사장 피드백 2026-05-19 ITEM6)
   uid 별로 분리된 파일. 운용전략실장 프롬프트에는 활성 계정의 uid 지시만 삽입됨.
   다른 계정의 지시는 절대 섞이지 않는다.
 
-시드 sentinel 불변식:
-  data/profiles/<uid>/.standing_seed_done 이 존재하면 seed_admin_directive()는
-  즉시 반환(no-op)한다. 지시사항의 현재 존재 여부와 무관하게 재시드하지 않는다.
-  이는 사용자가 remove_directive/clear_directives 로 지시를 삭제한 경우
-  다음 재시작에서 지시가 부활하지 않음을 보장한다(영구 삭제 보장).
+삭제 영속 (tombstone) 모델 — 사장 지시 2026-05-20:
+  • 사용자가 지시를 명시적으로 삭제(remove_directive/clear_directives)하면
+    그 지시 id 를 **tombstone**(삭제 표식)으로 기록한다.
+  • seed_admin_directive() 는 매 부팅 시 admin 지시를 멱등 보장(append)하되,
+    해당 지시가 tombstone 되어 있으면 재시드하지 않는다.
+      → "명시 삭제 = 영구 삭제", "삭제 안 함 + 재부팅 = 다시 채워짐".
+  • tombstone 은 data/directive_tombstones.json (data/ 최상위)에 저장한다.
+    프로필 디렉토리(data/profiles/<uid>)가 리셋되어도 삭제 의사가 보존되도록
+    **프로필 폴더 바깥**에 둔다. (과거 sentinel 을 profiles/<uid> 안에 둬서
+    프로필 리셋 시 함께 소실 → 재시드로 부활하던 버그를 근본 수정.)
 """
 from __future__ import annotations
 
@@ -34,7 +39,7 @@ KST = timezone(timedelta(hours=9))
 _DATA_DIR = Path(__file__).parent.parent / "data"
 _PROFILES_DIR = _DATA_DIR / "profiles"
 _DIRECTIVES_FILENAME = "standing_directives.json"
-_SEED_SENTINEL_FILENAME = ".standing_seed_done"  # 계정당 시드 완료 마커
+_TOMBSTONE_FILENAME = "directive_tombstones.json"  # data/ 최상위 — 명시 삭제 영속(프로필 리셋 생존)
 _MAX_DIRECTIVES = 50  # 계정당 최대 저장 건수
 
 
@@ -98,14 +103,20 @@ def append_directive(uid: int, text: str) -> bool:
     if len(existing) > _MAX_DIRECTIVES:
         existing = existing[-_MAX_DIRECTIVES:]
     _save(uid, existing)
+    # 같은 지시를 다시 추가 = 삭제 의사 철회 → tombstone 해제.
+    _remove_tombstone(uid, did)
     logger.info("상시지시 추가(uid=%s id=%s)", uid, did)
     return True
 
 
 def clear_directives(uid: int) -> int:
-    """uid 계정의 모든 상시 지시사항 삭제. 삭제된 건수 반환."""
+    """uid 계정의 모든 상시 지시사항 삭제. 삭제된 건수 반환.
+    명시 삭제이므로 각 지시 id 를 tombstone 처리 → 재부팅 부활 방지."""
     existing = load(uid)
     count = len(existing)
+    for d in existing:
+        if d.get("id"):
+            _add_tombstone(uid, d["id"])
     try:
         p = _directives_path(uid)
         if p.exists():
@@ -116,12 +127,14 @@ def clear_directives(uid: int) -> int:
 
 
 def remove_directive(uid: int, directive_id: str) -> bool:
-    """특정 id의 지시 1건 삭제. 반환: True=삭제됨."""
+    """특정 id의 지시 1건 삭제. 반환: True=삭제됨.
+    명시 삭제이므로 tombstone 처리 → 재부팅 부활 방지."""
     existing = load(uid)
     new_list = [d for d in existing if d.get("id") != directive_id]
     if len(new_list) == len(existing):
         return False
     _save(uid, new_list)
+    _add_tombstone(uid, directive_id)
     return True
 
 
@@ -154,28 +167,65 @@ def build_orchestrator_directive_block(uid: Optional[int]) -> str:
     return "\n".join(lines)
 
 
-# ─── 시드 sentinel 헬퍼 ────────────────────────────────────────────────────────
+# ─── 삭제 tombstone 헬퍼 (data/ 최상위 — 프로필 리셋에도 생존) ──────────────────
 
-def _seed_sentinel_path(uid: int) -> Path:
-    return _profile_dir(uid) / _SEED_SENTINEL_FILENAME
-
-
-def _seed_sentinel_exists(uid: int) -> bool:
-    """uid 계정의 시드 sentinel 파일이 존재하면 True."""
-    return _seed_sentinel_path(uid).exists()
+def _tombstones_path() -> Path:
+    return _DATA_DIR / _TOMBSTONE_FILENAME
 
 
-def _write_seed_sentinel(uid: int, seeded_ids: list) -> None:
-    """시드 완료 sentinel 파일 기록. 한 번만 실행됨을 보장하는 마커."""
+def _load_tombstones() -> Dict[str, List[str]]:
+    """{ "<uid>": ["<directive_id>", ...] } 형태의 삭제 표식 맵. 없으면 {}."""
+    p = _tombstones_path()
+    if not p.exists():
+        return {}
     try:
-        _seed_sentinel_path(uid).write_text(
-            json.dumps({"seeded_ids": seeded_ids, "ts": _now_kst()},
-                       ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        logger.info("seed sentinel 기록(uid=%s ids=%s)", uid, seeded_ids)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except Exception as e:
-        logger.warning("seed sentinel 기록 실패(uid=%s): %s", uid, e)
+        logger.warning("tombstone 로드 실패: %s", e)
+        return {}
+
+
+def _save_tombstones(data: Dict[str, List[str]]) -> None:
+    try:
+        _tombstones_path().parent.mkdir(parents=True, exist_ok=True)
+        _tombstones_path().write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning("tombstone 저장 실패: %s", e)
+
+
+def _is_tombstoned(uid: int, directive_id: str) -> bool:
+    """uid 계정에서 directive_id 가 명시 삭제(tombstone)된 적 있으면 True."""
+    return directive_id in _load_tombstones().get(str(int(uid)), [])
+
+
+def _add_tombstone(uid: int, directive_id: str) -> None:
+    """directive_id 를 uid 의 삭제 표식에 추가 (멱등). 명시 삭제 시 호출."""
+    data = _load_tombstones()
+    key = str(int(uid))
+    ids = data.get(key, [])
+    if directive_id not in ids:
+        ids.append(directive_id)
+        data[key] = ids
+        _save_tombstones(data)
+        logger.info("tombstone 기록(uid=%s id=%s) — 명시 삭제 영구 보존", uid, directive_id)
+
+
+def _remove_tombstone(uid: int, directive_id: str) -> None:
+    """directive_id 의 삭제 표식 제거 (사용자가 같은 지시를 다시 추가 = 삭제 의사 철회)."""
+    data = _load_tombstones()
+    key = str(int(uid))
+    ids = data.get(key, [])
+    if directive_id in ids:
+        ids = [i for i in ids if i != directive_id]
+        if ids:
+            data[key] = ids
+        else:
+            data.pop(key, None)
+        _save_tombstones(data)
+        logger.info("tombstone 해제(uid=%s id=%s)", uid, directive_id)
 
 
 # ─── Admin 계정 시드 ───────────────────────────────────────────────────────────
@@ -197,12 +247,14 @@ MACRO_COLLAPSE_DIRECTIVE = (
 # 결정론적 파이썬 리스크/guardrail 게이트는 영향받지 않으며(guardrails.py 미참조)
 # 지시가 안전 게이트를 우회해 실매매를 강제할 수 없다.
 def seed_admin_directive() -> None:
-    """부팅 시 1회 호출: admin(hh09080) 계정에 매크로 붕괴 지시사항을 멱등 삽입.
+    """부팅 시 호출: admin(hh09080) 계정에 매크로 붕괴 지시사항을 멱등 보장.
 
-    sentinel 불변식:
-      data/profiles/<uid>/.standing_seed_done 이 존재하면 즉시 반환(no-op).
-      현재 지시 존재 여부와 무관하게 재시드하지 않는다.
-      사용자가 삭제한 지시는 영구 삭제 상태로 유지된다(부활 없음).
+    tombstone 모델:
+      사용자가 명시 삭제(remove_directive/clear_directives)하면 지시 id 가
+      tombstone 된다. tombstone 이 있으면 재시드하지 않는다(명시 삭제 = 영구 삭제).
+      tombstone 이 없으면 매 부팅 append(멱등)로 지시를 보장한다
+      (삭제 안 함 + 재부팅 → 다시 채워짐). tombstone 은 data/ 최상위라
+      프로필 리셋(data/profiles/<uid> 삭제)에도 생존한다.
 
     admin 계정이 DB에 없으면 'data/profiles/admin_pending/' 에 대기 파일을 저장하고
     크래시 없이 종료 (안전한 no-op). 다음 부팅 시 계정이 생성되면 재시도된다.
@@ -248,20 +300,20 @@ def seed_admin_directive() -> None:
         return
 
     uid = user["id"]
+    macro_id = _directive_id(MACRO_COLLAPSE_DIRECTIVE)
 
-    # sentinel 확인: 이미 시드된 계정이면 즉시 반환 (부활 방지 핵심 게이트)
-    if _seed_sentinel_exists(uid):
+    # tombstone 확인: 사용자가 명시 삭제한 지시면 재시드하지 않음 (영구 삭제 보존).
+    # tombstone 은 data/ 최상위에 있어 프로필 리셋에도 생존한다 — 부활 버그 근본 차단.
+    if _is_tombstoned(uid, macro_id):
         logger.info(
-            "seed_admin_directive: sentinel 존재(uid=%s) — 재시드 생략 (사용자 삭제 보호)", uid
+            "seed_admin_directive: tombstone 존재(uid=%s id=%s) — 재시드 생략 (명시 삭제 영구 보존)",
+            uid, macro_id,
         )
         return
 
-    # 최초 시드: 지시 추가(멱등) 후 sentinel 기록
+    # 삭제하지 않았으면 매 부팅 멱등 보장(append). 이미 있으면 생략.
     added = append_directive(uid, MACRO_COLLAPSE_DIRECTIVE)
     if added:
-        logger.info("seed_admin_directive: 매크로 붕괴 지시 admin uid=%s 에 삽입 완료", uid)
+        logger.info("seed_admin_directive: 매크로 붕괴 지시 admin uid=%s 에 보장 삽입", uid)
     else:
-        logger.info("seed_admin_directive: 매크로 붕괴 지시 이미 존재(uid=%s) — 중복 생략", uid)
-
-    # sentinel 기록 — 이후 모든 재시작에서 재시드 차단
-    _write_seed_sentinel(uid, [_directive_id(MACRO_COLLAPSE_DIRECTIVE)])
+        logger.info("seed_admin_directive: 매크로 붕괴 지시 이미 존재(uid=%s) — 생략", uid)

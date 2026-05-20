@@ -834,44 +834,30 @@ class ArquantOrchestrator:
             "트레이딩팀장": self.trader, "리스크관리실장": self.risk_guard,
             "사후관리실장": self.post_manager, "운용지원실장": self.ops_support,
         }
-        # 사장 지시 2026-05-14: 운용지원실장 산하 팀장 — 실제 객체는 없고 멘션 → role 매핑만 한다.
-        # @투자관리팀장/@경영관리팀장/@재무관리팀장 호출은 ops_support_worker를 해당 role로 spawn.
-        self._ops_team_leaders = {
-            "투자관리팀장": "investment",
-            "경영관리팀장": "operations",
-            "재무관리팀장": "finance",
-        }
+        # 사장 지시 2026-05-20: 산하 팀장(investment/operations/finance) 및 코드 자가수정 폐지.
+        # 운용지원실장 단일 역할만 남으며, 팀장 멘션 라우팅은 빈 매핑으로 비활성화한다.
+        self._ops_team_leaders: Dict[str, str] = {}
 
     async def ceo_directive(self, message: str) -> str:
-        # 사장 피드백 2026-05-18: 운용지원실장·산하 팀장은 ADMIN(hh09080) 전용 —
-        # 비관리자에겐 '존재하지 않는 에이전트'로 취급(보이지도·불리지도 않음).
+        # 사장 지시 2026-05-20: 운용지원실장은 ADMIN·일반 유저 모두 사용 가능
+        # (프로필 한정 파라미터 조정만 — 코드 자가수정·산하 팀장 폐지).
         _auid, _admin = self._active_actor()
-        _ops_names = set(self._ops_team_leaders) | {"운용지원실장"}
         mention = re.search(r"@(\S+)", message)
         if mention:
             name = mention.group(1)
-            if (name in _ops_names) and not _admin:
-                visible = [n for n in self._agents_map if n not in _ops_names]
-                logger.info(f"운용지원 계열 멘션 거부(비관리자 uid={_auid}): @{name}")
-                return f"에이전트 '{name}' 없음. 가능: {', '.join(visible)}"
-            # 사장 지시 2026-05-14: 운용지원실장 산하 팀장(@투자관리팀장 등) — 동일 워커를 해당 role로 spawn
-            if name in self._ops_team_leaders:
-                return await self._ops_support_execute(message, role=self._ops_team_leaders[name])
+            # 사장 지시 2026-05-20: 운용지원실장은 ADMIN·일반 유저 모두 사용 가능(프로필 한정
+            # 파라미터 조정만). 산하 팀장 멘션 라우팅은 폐지(빈 매핑) — 일반 경로로 흐른다.
             agent = self._agents_map.get(name)
             if agent:
                 # 운용지원실장: 자동 분류 후 적절한 팀장 role로 spawn
                 if name == "운용지원실장":
                     return await self._ops_support_execute(message)
-                # 일반 에이전트는 대화 페르소나 — 설정/코드는 못 바꿈.
-                # ADMIN 계정에서만 운용지원실장 라인을 언급/안내 (비관리자에겐 그 라인 자체가 비공개).
-                if _admin:
-                    _guide = ("(참고: 당신은 시스템 설정·소스코드를 직접 변경할 수 없습니다. 만약 이 지시가 설정/매매규칙/코드 변경을 요구하는 것이라면 "
-                              "의견·이유는 자유롭게 답하시되, '시스템에 적용하려면 운용지원실장 라인을 자동 체이닝하겠다'라는 식으로 진행 의도를 명확히 표시하십시오. "
-                              "단순 질의·분석 요청이면 평소 역할대로 답하십시오. '절대 규칙' 같은 말로 무성의하게 거절하지 마십시오.)")
-                else:
-                    _guide = ("(참고: 당신은 시스템 설정·소스코드를 직접 변경할 수 없습니다. 이 지시가 설정/매매규칙/코드 변경을 요구하면 "
-                              "의견·이유는 자유롭게 답하되, 이 계정에서는 시스템 반영이 불가능함을 간단히 알리십시오. "
-                              "단순 질의·분석 요청이면 평소 역할대로 답하십시오. 무성의하게 거절하지 마십시오.)")
+                # 일반 에이전트는 대화 페르소나 — 설정/코드는 직접 못 바꿈.
+                # 전략/예산 조정이 필요하면 운용지원실장 라인이 '이 프로필 전용' 파라미터로 반영.
+                _guide = ("(참고: 당신은 시스템 설정·소스코드를 직접 변경할 수 없습니다. 이 지시가 전략/예산/매매규칙 "
+                          "조정을 요구하면 의견·이유는 자유롭게 답하시되, '운용지원실장 라인을 통해 이 프로필 전용 "
+                          "파라미터로 반영하겠다'라는 식으로 진행 의도를 밝히십시오. 단순 질의·분석이면 평소 역할대로 "
+                          "답하고, 무성의하게 거절하지 마십시오.)")
                 # 사장 지시 2026-05-19: 포지션 인지 에이전트(트레이딩팀장·사후관리실장)가
                 # 실시간 잔고 없이 '보유 0주·이미 정리됨' 같은 환각을 답한 사례(한화시스템
                 # 272210: 09:14 매수 1주 보유 중인데 09:39 "정리됨"이라 거짓 보고)를 차단 —
@@ -886,18 +872,15 @@ class ArquantOrchestrator:
                                      "'확인 불가'로 답하십시오.")
                 resp = await agent.think(f"[🔴 사장 직접 지시] {message}\n\n{_guide}", context=_live_ctx)
                 await _broadcast({"type":"agent_msg","agent":name,"message":resp})
-                # 자동 체이닝은 ADMIN 계정에서만 — 비관리자는 운용지원실장 라인 자체가 비활성
-                if _admin and self._needs_ops_chain(resp):
+                # 자동 체이닝 — 운용지원실장(프로필 한정 파라미터 조정)으로 (ADMIN·일반 공통).
+                if self._needs_ops_chain(resp):
                     await self._auto_chain_to_ops(message, source_agent=name, source_response=resp)
                 return resp
-            _avail = [n for n in self._agents_map if (_admin or n not in _ops_names)]
-            if _admin:
-                _avail = _avail + list(self._ops_team_leaders.keys())
-            return f"에이전트 '{name}' 없음. 가능: {', '.join(_avail)}"
+            return f"에이전트 '{name}' 없음. 가능: {', '.join(self._agents_map.keys())}"
         resp = await self.orchestrator.think(f"[🔴 사장 직접 지시] {message}")
         await _broadcast({"type":"agent_msg","agent":"운용전략실장","message":resp})
-        # 사장 지시 2026-05-14: 운용전략실장도 자동 체이닝 — 단 ADMIN 계정에서만
-        if _admin and self._needs_ops_chain(resp):
+        # 운용전략실장 응답도 자동 체이닝 — 운용지원실장(프로필 한정 조정)으로 (ADMIN·일반 공통).
+        if self._needs_ops_chain(resp):
             await self._auto_chain_to_ops(message, source_agent="운용전략실장", source_response=resp)
         return resp
 
@@ -951,33 +934,23 @@ class ArquantOrchestrator:
 
     def _spawn_ops_support_worker(self, cycle_id: Optional[int] = None, manual_directive: Optional[str] = None,
                                   role: str = "ops_support"):
-        """Spawn the standalone 운용지원실장 (or sub-leader) worker — fire-and-forget.
+        """Spawn the standalone 운용지원실장 worker — fire-and-forget.
 
-        The worker runs in a *separate Python process* so it can edit code without
-        racing the running interpreter (which has main_swarm.py already loaded).
-        After applying changes, it may trigger start_server.sh, which leaves a
-        RESUME_ON_BOOT marker so the new server auto-resumes the watch loop.
-
-        사장 지시 2026-05-14: role 인자로 페르소나 선택 — ops_support(기본) / investment / operations / finance."""
+        사장 지시 2026-05-20: 코드 자가수정·서버 재시작·산하 팀장 위임 폐지. 워커는 별도
+        프로세스에서 진단 + **프로필 한정 전략 파라미터(param_overrides)** 조정·제안만
+        수행한다. ADMIN·일반 유저 모두 spawn 되며 적용은 각자 프로필로 분리되고,
+        안전성은 워커가 소스 코드·서버를 절대 건드리지 않음으로써 보장된다."""
         worker = _Path(__file__).parent / "infra" / "ops_support_worker.py"
         if not worker.exists():
             logger.warning(f"ops_support_worker.py 없음 — 스킵 ({worker})")
             return
-        # 사장 피드백 2026-05-18: 운용지원실장·산하 팀장은 ADMIN(hh09080) 전용 기능.
-        # 비관리자 활성 계정에서는 워커를 **아예 spawn 하지 않는다** — 코드 수정·서버
-        # 재시작·프로필 샌드박스까지 전부 차단(원천 봉쇄). 모든 진입점(@멘션 / 자동
-        # 체이닝 / 사이클 후 자동)이 이 한 곳을 통과하므로 여기가 마스터 게이트다.
         _auid, _admin = self._active_actor()
-        if not _admin:
-            logger.info(f"운용지원 워커 spawn 거부 — 비관리자 계정(uid={_auid}) "
-                        f"role={role}, cycle_id={cycle_id} · ADMIN(hh09080) 전용")
-            return
-        # 사장 피드백 2026-05-18: 운용지원실장 피드백 on/off 토글 — OFF면 spawn 안 함.
+        # 운용지원실장 피드백 on/off 토글(프로필별) — 활성 계정 토글이 OFF면 spawn 안 함.
         try:
             import runtime as _rt
-            if not _rt.ops_feedback_enabled():
+            if not _rt.ops_feedback_enabled(_auid):
                 logger.info(f"운용지원 워커 spawn 스킵 — 피드백 토글 OFF "
-                            f"(role={role}, cycle_id={cycle_id})")
+                            f"(uid={_auid}, cycle_id={cycle_id})")
                 return
         except Exception as _e:
             logger.warning(f"ops_feedback 토글 조회 실패 — 그대로 진행: {_e}")
@@ -988,7 +961,9 @@ class ArquantOrchestrator:
             cmd += ["--manual", manual_directive]
         if _auid is not None:
             cmd += ["--actor-user", str(int(_auid))]
-        cmd += ["--actor-admin", "1"]  # 위 게이트에서 ADMIN 확인 완료
+        # 워커는 더 이상 actor-admin 으로 동작을 분기하지 않지만(코드 자가수정 제거),
+        # 로깅·호환을 위해 실제 값 전달.
+        cmd += ["--actor-admin", "1" if _admin else "0"]
         log_path = _Path(__file__).parent / "data" / "ops_support.spawn.log"
         try:
             f = open(log_path, "a", encoding="utf-8", buffering=1)
@@ -1001,29 +976,8 @@ class ArquantOrchestrator:
 
     @staticmethod
     def _classify_ops_role(directive: str) -> str:
-        """사장 지시 2026-05-14: 자유 텍스트 지시를 팀장 역할로 분류 (키워드 기반).
-        매칭이 없으면 'ops_support'(통합 책임자)로 fallback."""
-        d = (directive or "").lower()
-        # 재무관리팀장 — 자산/리스크/예산
-        finance_kw = ("예산", "비율", "한도", "리스크", "손절", "익절", "stop_loss", "take_profit",
-                      "수익률", "p&l", "pnl", "환율", "평가액", "현금", "입출금", "max_daily")
-        # 투자관리팀장 — 전략/매매 정책/종목
-        invest_kw = ("전략", "프리셋", "preset", "rsi", "macd", "adx", "vwap", "지표", "후보",
-                     "종목", "비중", "보유", "매수", "매도", "사이징", "size", "ticker",
-                     "anthropic", "tsla", "nvda", "aapl", "msft", "googl", "amzn",
-                     "etf", "테마", "섹터", "퀀트", "분석", "신호")
-        # 경영관리팀장 — 인프라/UX/모니터링
-        ops_kw    = ("대시보드", "ui", "화면", "탭", "버튼", "표시", "출력", "로그", "logging",
-                     "엔드포인트", "endpoint", "api", "서버", "모니터", "monitor", "차트", "차트색",
-                     "주간 리뷰", "weekly", "cycle_store", "ops_history", "news_classifier",
-                     "재시작", "restart", "프로세스", "subprocess", "supervisor")
-        # 우선순위: investment > finance > operations.
-        # 이유: 사용자 지시는 보통 종목·전략 맥락에서 예산 비율을 함께 언급한다
-        # (예: "Anthropic 종목 예산 10% 비중 보유" — '예산' 키워드가 있어도 본질은 종목 정책).
-        # 순수 예산·리스크 한도 변경은 investment 키워드가 없으므로 자연히 finance로 떨어진다.
-        if any(k in d for k in invest_kw):  return "investment"
-        if any(k in d for k in finance_kw): return "finance"
-        if any(k in d for k in ops_kw):     return "operations"
+        """사장 지시 2026-05-20: 산하 팀장 폐지 — 모든 지시는 운용지원실장(ops_support)이
+        프로필 한정 파라미터 조정·진단으로 단일 처리한다(코드 역할 분류 없음)."""
         return "ops_support"
 
     async def _ops_support_execute(self, message: str, role: Optional[str] = None) -> str:
@@ -1035,14 +989,9 @@ class ArquantOrchestrator:
         운용지원실장 산하 팀장은 모두 동일 워커를 다른 페르소나(--role)로 실행한다 — 보안 가드는 공유."""
         query_keywords = ("이력", "히스토리", "수정한", "변경한", "어떤 코드", "고친", "고친게",
                           "수정 내역", "변경 내역", "한 게 있", "한게 있", "리스트", "list", "history")
-        # 사장 피드백 2026-05-18: 운용지원실장·산하 팀장은 ADMIN(hh09080) 전용.
-        # 비관리자 계정에서는 이 라인을 **완전 비활성**으로 취급 — 에이전트로서
-        # 어떤 응답·브로드캐스트도 하지 않고, 호출자에게만 사용 불가를 알린다.
+        # 사장 지시 2026-05-20: 운용지원실장은 ADMIN·일반 유저 모두 사용 가능
+        # (프로필 한정 파라미터 조정·진단만 — 코드 자가수정 없음). 산하 팀장 라인은 폐지됨.
         _auid, _admin = self._active_actor()
-        if not _admin:
-            logger.info(f"운용지원실장 호출 거부 — 비관리자(uid={_auid})")
-            return ("⚠️ 운용지원실장·투자관리팀장·경영관리팀장·재무관리팀장은 "
-                    "ADMIN(hh09080) 전용 기능이며 이 계정에서는 비활성화되어 있습니다.")
 
         if any(kw in message for kw in query_keywords):
             from infra import ops_history
@@ -1061,37 +1010,25 @@ class ArquantOrchestrator:
         # (과거 이력 조회는 위에서 이미 처리되므로 영향 없음 — 끄면 '안내'만).
         try:
             import runtime as _rt
-            if not _rt.ops_feedback_enabled():
-                msg = ("⏸ 운용지원실장 피드백이 현재 **꺼짐(OFF)** 상태입니다. "
+            if not _rt.ops_feedback_enabled(_auid):
+                msg = ("⏸ 이 계정의 운용지원실장 피드백이 현재 **꺼짐(OFF)** 상태입니다. "
                        "대시보드의 '운용지원 피드백' 토글을 켜면 지시·자동 사이클 분석이 재개됩니다.")
                 await _broadcast({"type": "agent_msg", "agent": "운용지원실장", "message": msg})
                 return msg
         except Exception:
             pass
 
-        # role이 명시되지 않았으면 키워드 분류 — 매칭 없으면 ops_support로 떨어짐
-        if role is None:
-            role = self._classify_ops_role(message)
-        ROLE_DISPLAY = {"ops_support": "운용지원실장", "investment": "투자관리팀장",
-                        "operations": "경영관리팀장", "finance": "재무관리팀장"}
-        display = ROLE_DISPLAY.get(role, "운용지원실장")
+        # 팀장 폐지(2026-05-20) — 모든 지시는 운용지원실장 단일 역할로 처리.
+        display = "운용지원실장"
 
-        # 사장 피드백 2026-05-16: 사장이 팀장에게 직접 내린 지시 원문도 대시보드 로그에 남긴다
-        # (지금까지는 워커 spawn 알림만 보여서 '무슨 지시였는지' 추적 불가했음).
+        # 사장이 내린 지시 원문도 대시보드 로그에 남긴다.
         await _broadcast({"type":"agent_msg","agent":"사장",
                           "message": f"🗣 [사장 → {display}] {message}"})
-        self._spawn_ops_support_worker(cycle_id=None, manual_directive=message, role=role)
-        if _admin:
-            msg = (f"🛠 {display}: 위 지시를 받아 별도 워커가 분석·코드수정·재시작을 수행합니다 (role={role}). "
-                   f"결과는 같은 로그에 곧 표시됩니다. "
-                   f"('@운용지원실장 수정한 코드 이력 보여줘'로 누적 변경 사항 조회 가능)")
-        else:
-            msg = (f"🛠 {display}: 위 지시를 분석합니다 (role={role}). "
-                   f"⚠️ 이 계정은 ADMIN이 아니므로 공유 소스 코드·서버 재시작은 변경되지 않습니다 "
-                   f"(전체 유저 영향 방지). 전략·예산·익절/손절 같은 튜닝 파라미터만 "
-                   f"**이 프로필 전용**으로 반영되며, 다음 로그인/계정 적용 시 활성화됩니다. "
-                   f"소스 구조 변경이 필요하면 ADMIN(hh09080)에게 요청하세요. "
-                   f"('@운용지원실장 이력 보여줘'로 이 프로필 반영 내역 조회 가능)")
+        self._spawn_ops_support_worker(cycle_id=None, manual_directive=message)
+        msg = (f"🛠 {display}: 위 지시를 분석해 **이 프로필 전용** 전략 튜닝 파라미터로 조정안을 "
+               f"제시합니다. 코드 자가수정·서버 재시작은 하지 않으며(기능 폐지), 전략·예산·익절/손절 "
+               f"같은 '적용 가능 전략' 파라미터만 이 프로필에 반영되어 다음 로그인 시 활성화됩니다. "
+               f"('@운용지원실장 이력 보여줘'로 이 프로필 반영 내역 조회 가능)")
         await _broadcast({"type":"agent_msg","agent":display,"message":msg})
         return msg
 

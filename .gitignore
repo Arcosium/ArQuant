@@ -66,6 +66,8 @@ data/.active_account
 data/.resume_on_boot
 # data/news_history.json — 뉴스 영속 캐시 (재시작 후 목록 유지)
 data/news_history.json
+# data/directive_tombstones.json — 상시지시 명시삭제 표식 (프로필 리셋 생존, 런타임 상태)
+data/directive_tombstones.json
 
 # ============================================================================
 # 로그 / 임시

@@ -15,6 +15,9 @@ from infra.rate_limit import SlidingWindowLimiter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 app = FastAPI(title="ArQuant v1.0", version="1.0.0")
+# 계정 프로필 디렉토리 루트. 모듈 상수로 둬서 테스트가 격리(monkeypatch)할 수 있게 한다.
+# (과거 엔드포인트가 실경로를 직접 계산해 테스트가 실데이터 profiles/<uid> 를 삭제하던 버그 방지)
+_PROFILES_DIR = Path(__file__).resolve().parent.parent / "data" / "profiles"
 # 사장 피드백 2026-05-20: 배포 전 보안 점검 — wildcard + credentials 동시 허용은 안티패턴.
 # 프로덕션 도메인 + 로컬 개발(에뮬레이터/localhost)만 허용. 추가 origin은 ARQUANT_EXTRA_ORIGINS(콤마 구분)로 주입.
 _ALLOWED_ORIGINS = [
@@ -419,10 +422,8 @@ async def profile_delete_account(req: DeleteAccountReq, request: Request):
     # Audit BEFORE deletion (need creds["username"])
     auth_store.audit("delete_account", username=creds["username"], ip=ip, outcome="ok", detail="")
     import shutil
-    from pathlib import Path
     auth_store.delete_user(uid)
-    shutil.rmtree(Path(__file__).resolve().parent.parent / "data" /
-                  "profiles" / str(uid), ignore_errors=True)
+    shutil.rmtree(_PROFILES_DIR / str(uid), ignore_errors=True)
     resp = JSONResponse(content={"ok": True})
     resp.delete_cookie(auth_store.SESSION_COOKIE, path="/",
                        secure=_COOKIE_SECURE, httponly=True, samesite="lax")
@@ -454,9 +455,7 @@ async def admin_member_delete(req: AdminDeleteReq, request: Request):
         raise HTTPException(400, "ADMIN 계정은 삭제할 수 없습니다(단독 ADMIN 보호).")
     auth_store.delete_user(target["id"])
     import shutil
-    from pathlib import Path
-    shutil.rmtree(Path(__file__).resolve().parent.parent / "data" /
-                  "profiles" / str(target["id"]), ignore_errors=True)
+    shutil.rmtree(_PROFILES_DIR / str(target["id"]), ignore_errors=True)
     auth_store.audit("admin_delete_member", username=target["username"],
                      ip=_client_ip(request), outcome="ok", detail=f"uid={target['id']}")
     return {"ok": True}
@@ -488,10 +487,12 @@ async def status():
         s["api_cost"] = get_api_cost_last_cycle(seconds_back=3600.0)
     except Exception:
         s["api_cost"] = {"cost_usd": 0.0, "calls": 0, "window_sec": 3600.0}
-    # 사장 피드백 2026-05-18: 운용지원실장 피드백 on/off 토글 상태 (UI 버튼 표시용)
+    # 운용지원실장 피드백 on/off 토글 상태 (프로필별) — 봇이 구동 중인 활성 계정 기준.
     try:
         import runtime
-        s["ops_feedback_enabled"] = runtime.ops_feedback_enabled()
+        from infra import credentials as _creds
+        _auid = (_creds.current() or {}).get("user_id")
+        s["ops_feedback_enabled"] = runtime.ops_feedback_enabled(_auid)
     except Exception:
         s["ops_feedback_enabled"] = True
     return s
@@ -571,59 +572,50 @@ async def news_clear():
 @app.get("/api/agents")
 async def agents(request: Request):
     from config import MODEL_ASSIGNMENTS
+    # 설명은 일관된 한국어 (사장 지시 2026-05-20). 산하 팀장(투자/경영/재무관리팀장)은 폐지되어 명단에 없음.
     roster = [
-        {"name":"운용전략실장","role":"Chief Strategy","model":MODEL_ASSIGNMENTS["chief_orchestrator"]},
-        {"name":"전략리서치팀장","role":"Macro Research","model":MODEL_ASSIGNMENTS["macro_analyst"]},
-        {"name":"계량분석팀장","role":"Quant Analyst","model":MODEL_ASSIGNMENTS["quant_analyst"]},
-        {"name":"뉴스분석팀장","role":"News Analyst","model":MODEL_ASSIGNMENTS["news_analyst"]},
-        {"name":"트레이딩팀장","role":"Trader (fallback only)","model":MODEL_ASSIGNMENTS["trader"]},
-        {"name":"리스크관리실장","role":"Risk Guard (결정론 룰 + DART 재심)","model":f"룰 엔진(Python) + {MODEL_ASSIGNMENTS['risk_guard']}"},
-        {"name":"사후관리실장","role":"Post-Management (보유 종목 매도 판단)","model":MODEL_ASSIGNMENTS["post_manager"]},
-        {"name":"운용지원실장","role":"Ops Support","model":MODEL_ASSIGNMENTS["ops_support"]},
+        {"name":"운용전략실장","role":"총괄 전략·종목 선정 (2패스)","model":MODEL_ASSIGNMENTS["chief_orchestrator"]},
+        {"name":"전략리서치팀장","role":"거시·매크로 리서치","model":MODEL_ASSIGNMENTS["macro_analyst"]},
+        {"name":"계량분석팀장","role":"후보 종목 정량 평가","model":MODEL_ASSIGNMENTS["quant_analyst"]},
+        {"name":"뉴스분석팀장","role":"뉴스 감성·이벤트 분석","model":MODEL_ASSIGNMENTS["news_analyst"]},
+        {"name":"트레이딩팀장","role":"주문 실행·결과 보고","model":MODEL_ASSIGNMENTS["trader"]},
+        {"name":"리스크관리실장","role":"리스크 게이트·DART 재심","model":f"룰 엔진(Python) + {MODEL_ASSIGNMENTS['risk_guard']}"},
+        {"name":"사후관리실장","role":"보유 종목 매도 판단","model":MODEL_ASSIGNMENTS["post_manager"]},
+        {"name":"운용지원실장","role":"진단·프로필 전략 조정","model":MODEL_ASSIGNMENTS["ops_support"]},
     ]
-    # 사장 피드백 2026-05-18: 운용지원실장(+산하 팀장)은 ADMIN(hh09080) 전용.
-    # 비관리자에겐 명단에서 제외 → 클라이언트가 알 수도, 멘션할 수도 없게 한다.
-    _admin = False
-    try:
-        _admin = auth_store.is_admin(getattr(request.state, "user_id", None))
-    except Exception:
-        _admin = False  # default-deny
-    if not _admin:
-        roster = [a for a in roster if a["name"] != "운용지원실장"]
+    # 사장 지시 2026-05-20: 운용지원실장은 ADMIN·일반 유저 모두 사용 가능(프로필 한정 파라미터 조정).
     return {"agents": roster}
 
 # 사장 피드백 2026-05-18: 운용지원실장 피드백 on/off 토글 (ADMIN 전용).
 @app.get("/api/ops_feedback")
 async def ops_feedback_get(request: Request):
+    # 사장 지시 2026-05-20: 운용지원 토글은 프로필별 — 요청 유저 본인 계정 상태를 반환.
     import runtime
+    uid = getattr(request.state, "user_id", None)
     _admin = False
     try:
-        _admin = auth_store.is_admin(getattr(request.state, "user_id", None))
+        _admin = auth_store.is_admin(uid)
     except Exception:
         _admin = False
-    st = runtime.ops_feedback_state()
+    st = runtime.ops_feedback_state(uid)
     return {"enabled": bool(st.get("enabled", True)), "since": st.get("since"),
-            "by": st.get("by"), "is_admin": _admin}
+            "by": st.get("by"), "is_admin": _admin, "uid": st.get("uid")}
 
 @app.post("/api/ops_feedback")
 async def ops_feedback_set(request: Request, req: dict):
+    # 사장 지시 2026-05-20: 운용지원 토글은 프로필별 — 각 유저가 본인 계정 것만 켜고 끈다
+    # (코드 자가수정 폐지로 더 이상 ADMIN 전용일 필요 없음).
     import runtime
     from main_swarm import _broadcast
-    # 운용지원실장 자체가 ADMIN 전용이므로 토글도 ADMIN 만 변경 가능.
-    try:
-        _admin = auth_store.is_admin(getattr(request.state, "user_id", None))
-    except Exception:
-        _admin = False
-    if not _admin:
-        raise HTTPException(403, "운용지원 피드백 토글은 ADMIN(hh09080) 전용입니다.")
+    uid = _uid_or_403(request)
     enabled = bool((req or {}).get("enabled"))
-    st = runtime.set_ops_feedback(enabled, by="dashboard")
+    st = runtime.set_ops_feedback(enabled, uid=uid, by="dashboard")
     try:
         await _broadcast({"type": "status", "state": "IDLE",
-                          "message": f"🛠 운용지원실장 피드백 {'켜짐(ON)' if enabled else '꺼짐(OFF)'}"})
+                          "message": f"🛠 운용지원실장 피드백 {'켜짐(ON)' if enabled else '꺼짐(OFF)'} (이 계정)"})
     except Exception:
         pass
-    return {"enabled": bool(st.get("enabled", True)), "since": st.get("since")}
+    return {"enabled": bool(st.get("enabled", True)), "since": st.get("since"), "uid": st.get("uid")}
 
 
 # ── Coresight 수신함 — ADMIN(hh09080) 전용 (Implementation.md §3.3) ───────────

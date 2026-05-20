@@ -18,7 +18,9 @@ def client(tmp_path, monkeypatch):
     tok = a.create_session(uid)
     import infra.standing_directives as sd
     monkeypatch.setattr(sd, "_PROFILES_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(sd, "_DATA_DIR", tmp_path)  # tombstone 격리 — 실 data/ 오염 방지
     import server.app as app_mod
+    monkeypatch.setattr(app_mod, "_PROFILES_DIR", tmp_path / "profiles")  # rmtree 격리 — 실 profiles/<uid> 삭제 방지
     c = TestClient(app_mod.app)
     c.headers.update({"X-Session": tok})
     return c, a, uid
@@ -78,7 +80,9 @@ def admin_client(tmp_path, monkeypatch):
     tok = a.create_session(uid)
     import infra.standing_directives as sd
     monkeypatch.setattr(sd, "_PROFILES_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(sd, "_DATA_DIR", tmp_path)  # tombstone 격리 — 실 data/ 오염 방지
     import server.app as app_mod
+    monkeypatch.setattr(app_mod, "_PROFILES_DIR", tmp_path / "profiles")  # rmtree 격리 — 실 profiles/<uid> 삭제 방지
     c = TestClient(app_mod.app)
     c.headers.update({"X-Session": tok})
     return c, a, uid

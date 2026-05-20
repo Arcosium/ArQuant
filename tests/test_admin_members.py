@@ -15,6 +15,8 @@ def _mk(tmp_path, monkeypatch):
                  ("_FERNET_RAW", None), ("_BIDX_KEY", None)]:
         monkeypatch.setattr(a, n, v, raising=False)
     a.init()
+    import server.app as app_mod
+    monkeypatch.setattr(app_mod, "_PROFILES_DIR", tmp_path / "profiles")  # rmtree 격리 — 실 profiles/<uid> 삭제 방지
     return a
 
 
@@ -43,8 +45,9 @@ def test_admin_list_and_delete(tmp_path, monkeypatch):
     assert c.post("/api/admin/members/delete",
                   json={"username": "hh09080"}).status_code == 400
 
-    # Create a real profile dir (with sentinel file) so rmtree has something to remove
-    profile_dir = _REPO_ROOT / "data" / "profiles" / str(victim_uid)
+    # Create a profile dir (with sentinel file) so rmtree has something to remove.
+    # 격리된 _PROFILES_DIR(tmp) 하위에 생성 — 실 data/profiles 를 건드리지 않는다.
+    profile_dir = tmp_path / "profiles" / str(victim_uid)
     profile_dir.mkdir(parents=True, exist_ok=True)
     sentinel = profile_dir / "sentinel.txt"
     sentinel.write_text("test")
