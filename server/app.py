@@ -15,7 +15,19 @@ from infra.rate_limit import SlidingWindowLimiter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 app = FastAPI(title="ArQuant v1.0", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# 사장 피드백 2026-05-20: 배포 전 보안 점검 — wildcard + credentials 동시 허용은 안티패턴.
+# 프로덕션 도메인 + 로컬 개발(에뮬레이터/localhost)만 허용. 추가 origin은 ARQUANT_EXTRA_ORIGINS(콤마 구분)로 주입.
+_ALLOWED_ORIGINS = [
+    "https://arquant.ai-ve.uk",
+    "http://localhost:8500", "http://127.0.0.1:8500",
+    "http://10.0.2.2:8500",  # Android emulator host loopback
+]
+_extra = os.getenv("ARQUANT_EXTRA_ORIGINS", "").strip()
+if _extra:
+    _ALLOWED_ORIGINS += [o.strip() for o in _extra.split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_ALLOWED_ORIGINS, allow_credentials=True,
+                   allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+                   allow_headers=["Content-Type", "Authorization", "X-Session"])
 
 
 @app.exception_handler(auth_store.FernetKeyLost)

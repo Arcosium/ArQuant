@@ -16,6 +16,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.arquant.mobile.BuildConfig
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -148,8 +149,8 @@ fun WebDashboardScreen(
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
-            // chrome://inspect 로 원격 디버깅 가능 (까만 화면 원인 추적용).
-            WebView.setWebContentsDebuggingEnabled(true)
+            // 사장 피드백 2026-05-20: 릴리스 빌드는 원격 디버깅 비활성화(웹뷰 인스펙터 차단).
+            WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
             WebView(ctx).apply {
                 state.view = this
                 // 페이지 로드 전 다크 배경 — 흰 깜빡임/검은 공백 대신 테마색.
