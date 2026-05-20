@@ -126,3 +126,9 @@ node_modules/
 
 # 학술 참고자료(코드 무관) — 디스크/깃 제외
 Implementation/
+
+# APK 빌드 임시 로그
+build.log
+
+# QEMU 빌드 코어 덤프
+*.core
