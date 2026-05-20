@@ -412,8 +412,10 @@ class KISBroker:
         except (TypeError, ValueError): return 0
 
     async def _overseas_holdings(self) -> List[Dict]:
-        """해외주식 보유 종목 (NASD/NYSE/AMEX 통합). 실패/미보유 시 []."""
-        out: List[Dict] = []
+        """해외주식 보유 종목 (NASD/NYSE/AMEX 통합). 실패/미보유 시 [].
+        사장 피드백 2026-05-20: 같은 종목이 여러 거래소에서 중복 반환되는 케이스(UUP 등) 방지 —
+        code 키로 dedupe하며 qty 합산·평균단가는 수량 가중평균, 손익은 합산."""
+        agg: Dict[str, Dict] = {}
         try:
             tok = await self.token(); s = await self._s(); c, p = self._acnt()
             for excd in ("NASD", "NYSE", "AMEX"):
@@ -427,18 +429,36 @@ class KISBroker:
                         q = self._int(h.get("ovrs_cblc_qty"))
                         if q <= 0:
                             continue
-                        out.append({"code": (h.get("ovrs_pdno") or "").strip(),
-                                    "name": (h.get("ovrs_item_name") or "").strip() or (h.get("ovrs_pdno") or "").strip(),
-                                    "qty": q, "avg_price": self._num(h.get("pchs_avg_pric")),
-                                    "cur_price": self._num(h.get("now_pric2")),
-                                    "pnl_amt": self._num(h.get("frcr_evlu_pfls_amt") or h.get("evlu_pfls_amt")),
-                                    "pnl_pct": self._num(h.get("evlu_pfls_rt")),
-                                    "category": "해외주식", "ccy": "USD"})
+                        code = (h.get("ovrs_pdno") or "").strip()
+                        if not code:
+                            continue
+                        ap = self._num(h.get("pchs_avg_pric"))
+                        cur = self._num(h.get("now_pric2"))
+                        pnl_amt = self._num(h.get("frcr_evlu_pfls_amt") or h.get("evlu_pfls_amt"))
+                        pnl_pct = self._num(h.get("evlu_pfls_rt"))
+                        name = (h.get("ovrs_item_name") or "").strip() or code
+                        if code in agg:
+                            ex = agg[code]
+                            tot_qty = ex["qty"] + q
+                            # 수량 가중평균 단가 (qty=0 안전가드는 이미 q>0 보장)
+                            ex["avg_price"] = ((ex["avg_price"] * ex["qty"]) + (ap * q)) / tot_qty if tot_qty > 0 else ap
+                            ex["qty"] = tot_qty
+                            ex["pnl_amt"] = ex["pnl_amt"] + pnl_amt
+                            # cur_price/pnl_pct: 최신 거래소 응답값 유지(거래소별 차이는 미미)
+                            if cur > 0:
+                                ex["cur_price"] = cur
+                            if pnl_pct:
+                                ex["pnl_pct"] = pnl_pct
+                        else:
+                            agg[code] = {"code": code, "name": name, "qty": q,
+                                         "avg_price": ap, "cur_price": cur,
+                                         "pnl_amt": pnl_amt, "pnl_pct": pnl_pct,
+                                         "category": "해외주식", "ccy": "USD"}
                 except Exception:
                     continue
         except Exception:
             pass
-        return out
+        return list(agg.values())
 
     async def _bond_holdings(self) -> List[Dict]:
         """장내채권 보유 잔고. API 미지원/실패 시 []."""
@@ -473,7 +493,9 @@ class KISBroker:
 
     async def portfolio_holdings(self) -> Dict:
         """대시보드 '종목 포트폴리오' — 국내주식 + 해외주식 + 국내채권 + 펀드 통합 잔고.
-        kr_account_snapshot()의 국내주식 잔고를 기준으로 나머지를 best-effort 병합한다."""
+        kr_account_snapshot()의 국내주식 잔고를 기준으로 나머지를 best-effort 병합한다.
+        사장 피드백 2026-05-20: (code, category) 키로 최종 dedupe — 외부 거래 종목도 KIS 잔고가
+        신뢰원천이므로 자동 포함되지만, 중복 노출만 방지(같은 카테고리 내 같은 code 합치기)."""
         snap = await self.kr_account_snapshot()
         kr = [{**h, "category": "국내주식", "ccy": "KRW"} for h in (snap.get("holdings") or [])]
         extra: List[Dict] = []
@@ -482,7 +504,28 @@ class KISBroker:
                 extra += await fn()
             except Exception:
                 pass
-        return {"buying_power": snap["buying_power"], "holdings": kr + extra,
+        merged: Dict = {}
+        for h in kr + extra:
+            code = (h.get("code") or "").strip()
+            cat = h.get("category") or ""
+            if not code:
+                continue
+            key = (code, cat)
+            if key in merged:
+                ex = merged[key]
+                q1, q2 = self._int(ex.get("qty")), self._int(h.get("qty"))
+                tot = q1 + q2
+                if tot > 0:
+                    ex["avg_price"] = ((self._num(ex.get("avg_price")) * q1) + (self._num(h.get("avg_price")) * q2)) / tot
+                ex["qty"] = tot
+                ex["pnl_amt"] = self._num(ex.get("pnl_amt")) + self._num(h.get("pnl_amt"))
+                if self._num(h.get("cur_price")) > 0:
+                    ex["cur_price"] = self._num(h.get("cur_price"))
+                if h.get("pnl_pct"):
+                    ex["pnl_pct"] = h.get("pnl_pct")
+            else:
+                merged[key] = dict(h)
+        return {"buying_power": snap["buying_power"], "holdings": list(merged.values()),
                 "holdings_stale": snap.get("holdings_stale", False), "ok": snap.get("ok", False)}
 
     # ═══════════════════ 국내주식 순위/업종 ═══════════════════
