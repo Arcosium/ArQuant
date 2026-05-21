@@ -135,7 +135,8 @@ def test_sell_order_skips_buy_gates():
     r = validate_order_draft({"orders": [_order(side="sell", reason="목표가 도달로 전량 이익 실현")]},
                              buying_power=_bp(ok=False), price_map={})
     assert r["results"][0]["status"] == "APPROVED"
-    assert any("매도 주문" in w for w in r["results"][0]["warnings"])
+    # 사장 지시 2026-05-21: 매도 경고("보유수량 확인은 브로커 단에서 수행") 출력 제거 → 더 이상 경고 없음
+    assert not any("보유수량 확인은 브로커" in w for w in r["results"][0]["warnings"])
 
 
 # ── 통화 분리 회귀 (사장 피드백 2026-05-16) ─────────────────────────────

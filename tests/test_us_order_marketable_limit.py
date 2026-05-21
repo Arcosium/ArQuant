@@ -46,16 +46,17 @@ class _FakeResp:
 
 class _FakeSession:
     """aiohttp 세션 대역 — post 의 json 바디를 캡처한다."""
-    def __init__(self):
+    def __init__(self, resp_payload=None):
         self.posted = []
+        self._resp = resp_payload or {"rt_cd": "0", "msg1": "정상처리 되었습니다."}
     def post(self, url, headers=None, json=None):
         self.posted.append({"url": url, "json": json})
-        return _FakeResp({"rt_cd": "0", "msg1": "정상처리 되었습니다."})
+        return _FakeResp(self._resp)
 
 
-def _broker_with_fakes(monkeypatch, *, last_price, daily_rows=None):
+def _broker_with_fakes(monkeypatch, *, last_price, daily_rows=None, resp_payload=None):
     b = KISBroker()
-    fake = _FakeSession()
+    fake = _FakeSession(resp_payload)
 
     async def _tok():
         return "TESTTOKEN"
@@ -133,6 +134,53 @@ def test_us_sell_market_sends_marketable_limit_not_zero(monkeypatch):
     assert float(unpr) <= 27.80, "매도 체결가능 지정가는 현재가 이하여야"
     assert float(unpr) >= 27.80 * 0.95, "매도 버퍼 과대(슬리피지)"
     assert body["OVRS_EXCG_CD"] == "AMEX"
+
+
+# ── rt_cd 거부 판정 (밤사이 OXY "주문가능금액 초과" 유령 체결 회귀) ──────────
+# 버그(2026-05-21 로그): us_buy/us_sell 가 rt_cd 를 안 보고 msg1 만 반환해,
+# KIS 가 거부한 주문("주문가능금액을 초과 했습니다", rt_cd≠0)이 성공과 동일 포맷으로
+# 돌아왔다. 호출부 accepted 휴리스틱(실패/에러/거부/예외/REJECT 문자열 매칭)이 못 잡아
+# US 는 ok=accepted 로 잠정 체결 카운트 → 유령 체결. KR(kr_buy/kr_sell)은 rt_cd 로
+# [실패] 프리픽스를 붙여 정상 판정하므로, US 도 동일 대칭이어야 한다.
+_ACCEPTED_BLOCKLIST = ("실패", "에러", "거부", "예외", "REJECT", "초당", "거래건수")
+
+
+def _accepted(res: str) -> bool:
+    """main_swarm 실행부의 accepted 휴리스틱 복제 — 회귀 의도 고정용."""
+    return all(bad not in res for bad in _ACCEPTED_BLOCKLIST)
+
+
+def test_us_buy_rejection_is_flagged_as_failure(monkeypatch):
+    b, fake = _broker_with_fakes(
+        monkeypatch, last_price=57.0,
+        resp_payload={"rt_cd": "1", "msg1": "주문가능금액을 초과 했습니다."})
+
+    res = asyncio.run(b.us_buy("OXY", 8, price=0))
+
+    assert "실패" in res, f"rt_cd≠0 거부는 [실패] 로 표기돼야: {res!r}"
+    assert not _accepted(res), f"거부 주문이 accepted 로 오판되면 안 됨: {res!r}"
+
+
+def test_us_sell_rejection_is_flagged_as_failure(monkeypatch):
+    b, fake = _broker_with_fakes(
+        monkeypatch, last_price=57.0,
+        resp_payload={"rt_cd": "1", "msg1": "주문가능수량을 초과 했습니다."})
+
+    res = asyncio.run(b.us_sell("OXY", 8, price=0))
+
+    assert "실패" in res, f"rt_cd≠0 거부는 [실패] 로 표기돼야: {res!r}"
+    assert not _accepted(res)
+
+
+def test_us_buy_success_is_not_flagged_as_failure(monkeypatch):
+    b, fake = _broker_with_fakes(
+        monkeypatch, last_price=57.0,
+        resp_payload={"rt_cd": "0", "msg1": "정상처리 되었습니다."})
+
+    res = asyncio.run(b.us_buy("OXY", 8, price=0))
+
+    assert "실패" not in res, f"정상 주문에 실패 표기되면 안 됨: {res!r}"
+    assert _accepted(res), f"정상(rt_cd=0)은 accepted 여야: {res!r}"
 
 
 def test_us_buy_explicit_limit_price_is_honored(monkeypatch):

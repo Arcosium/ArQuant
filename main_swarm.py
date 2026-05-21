@@ -215,39 +215,14 @@ def _parse_ts_any(ts_str) -> Optional[datetime]:
             return None
 
 def _detect_external_flow(prev: Optional[Dict], curr: Dict) -> float:
-    """Return the inferred external cashflow (deposit +, withdrawal -) between two equity snapshots.
-    Heuristic: if holdings map is identical (same codes & same qty) and total_eval delta is large
-    AND mostly comes from cash (not stock price moves), treat the cash component as a deposit/withdrawal.
-    Returns 0.0 when not detectable / not significant (< 50,000원).
-    Conservative — we'd rather miss a deposit than wrongly mask a real P&L move."""
-    if not prev:
-        return 0.0
-    try:
-        prev_h = prev.get("holdings") or {}
-        curr_h = curr.get("holdings") or {}
-    except Exception:
-        return 0.0
-    # need both snapshots to have holdings recorded (older entries don't)
-    if not prev_h or not curr_h:
-        return 0.0
-    # holdings must be identical (same codes & quantities) — any trade-driven change disqualifies
-    if set(prev_h.items()) != set(curr_h.items()):
-        return 0.0
-    try:
-        d_total = float(curr.get("total_eval", 0.0)) - float(prev.get("total_eval", 0.0))
-        d_cash = float(curr.get("cash", 0.0)) - float(prev.get("cash", 0.0))
-    except Exception:
-        return 0.0
-    # threshold: small drift is just price/fx — don't tag as flow
-    THRESHOLD = 50_000.0  # KRW
-    if abs(d_cash) < THRESHOLD:
-        return 0.0
-    # cash jump must explain most of the total_eval move (else it's mostly price action)
-    if abs(d_total) < THRESHOLD * 0.5:
-        return 0.0
-    if abs(d_total - d_cash) > max(abs(d_cash) * 0.20, 20_000.0):
-        return 0.0  # significant stock-value swing too — not a clean deposit
-    return d_cash
+    """입출금(외부 현금흐름) 자동 감지 — 사장 지시 2026-05-21 비활성화.
+
+    KIS 총평가/예수금이 폴 간 일시적으로 크게 흔들릴 때(해외종목 시세 일시 0/누락 추정)
+    이를 '입금'으로 오탐해 누적 보정값을 오염시켰다: 2026-05-20 15:44 +3,263,616원 유령
+    입금이 누적되어 자산곡선이 실제 ~3.76M 대신 ~415K로 표시됨(사장 보고). 금액 임계값으로는
+    진짜 입금과 이 변동을 구분할 수 없어, 신뢰 불가한 자동 감지를 끈다.
+    이제 adj_total_eval == total_eval (실계좌 총평가) 라 그래프가 실제 자산을 그대로 표시한다."""
+    return 0.0
 
 def record_equity(bp: dict, source: str = "poll", holdings: Optional[List[Dict]] = None):
     """Append a {ts,total_eval,cash,pnl_ratio,holdings,external_flow_cum} point — at most one per 60s.
@@ -396,6 +371,106 @@ def get_equity_series(limit: int = 500, view: str = "realtime") -> list:
             label = dt.strftime("%m-%d %H:") + f"{(dt.minute // 10) * 10:02d}"
             out.append({**p, "label": label, "ts_kst": dt.strftime("%Y-%m-%d %H:%M")})
     return out[-max(1, int(limit)):]
+
+
+def performance_kpis(raw_equity: Optional[list] = None, trades: Optional[list] = None,
+                     now: Optional[datetime] = None) -> dict:
+    """수익률 탭 KPI 카드용 요약 (사장 지시 2026-05-21).
+
+    equity_curve 의 입출금 보정값(adj total) 기준으로 누적·오늘·이번주·이번달 수익(원/%)
+    과 최대낙폭(MDD)을, 거래 FIFO 실현손익 기준으로 승률·평균 보유일을 계산한다.
+    `raw_equity`/`trades`/`now` 를 주입하면 디스크 없이 순수 계산 — 단위 테스트용."""
+    now = now or datetime.now(KST)
+    if raw_equity is None:
+        try:
+            raw_equity = json.loads(_EQUITY_LOG.read_text(encoding="utf-8")) if _EQUITY_LOG.exists() else []
+            if not isinstance(raw_equity, list):
+                raw_equity = []
+        except Exception:
+            raw_equity = []
+
+    pts = []
+    for p in raw_equity:
+        if not isinstance(p, dict) or not p.get("total_eval"):
+            continue
+        dt = _ts_to_kst(p.get("ts", ""))
+        if not dt:
+            continue
+        try:
+            ext = float(p.get("external_flow_cum", 0.0) or 0.0)
+        except Exception:
+            ext = 0.0
+        try:
+            pts.append((dt, float(p["total_eval"]) - ext))
+        except Exception:
+            continue
+    pts.sort(key=lambda x: x[0])
+
+    kpi: Dict[str, Any] = {"has_equity": False, "has_trades": False}
+    if pts:
+        cur = pts[-1][1]
+        first = pts[0][1]
+        peak = pts[0][1]
+        mdd = 0.0
+        for _, v in pts:
+            if v > peak:
+                peak = v
+            if peak > 0:
+                mdd = min(mdd, v / peak - 1.0)
+        today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week0 = today0 - timedelta(days=today0.weekday())
+        month0 = today0.replace(day=1)
+
+        def _base(boundary):
+            b = None
+            for dt, v in pts:
+                if dt < boundary:
+                    b = v
+            return b if b is not None else first
+
+        def _pct(c, b):
+            return ((c / b - 1.0) * 100.0) if b else 0.0
+
+        kpi.update({
+            "has_equity": True, "current": cur, "start": first, "points": len(pts),
+            "cumulative_pnl": cur - first, "cumulative_pct": _pct(cur, first),
+            "today_pnl": cur - _base(today0), "today_pct": _pct(cur, _base(today0)),
+            "week_pnl": cur - _base(week0), "week_pct": _pct(cur, _base(week0)),
+            "month_pnl": cur - _base(month0), "month_pct": _pct(cur, _base(month0)),
+            "mdd_pct": mdd * 100.0,
+        })
+
+    if trades is None:
+        try:
+            trades = get_trade_history(limit=2000)
+        except Exception:
+            trades = []
+    wins = total = 0
+    hold_days: List[float] = []
+    for e in (trades or []):
+        if str(e.get("side") or "").lower() != "sell":
+            continue
+        det = e.get("detail") or {}
+        pnl = det.get("realized_pnl")
+        if pnl is None:
+            pnl = det.get("total_pnl")
+        if pnl is None:
+            continue
+        total += 1
+        if pnl > 0:
+            wins += 1
+        sell_dt = _ts_to_kst(e.get("ts", ""))
+        for m in (det.get("matched") or []):
+            bdt = _ts_to_kst(m.get("buy_ts", ""))
+            if sell_dt and bdt:
+                hold_days.append(max(0.0, (sell_dt - bdt).total_seconds() / 86400.0))
+    if total > 0:
+        kpi.update({
+            "has_trades": True, "sell_count": total, "win_count": wins,
+            "win_rate_pct": wins / total * 100.0,
+            "avg_hold_days": (sum(hold_days) / len(hold_days)) if hold_days else None,
+        })
+    return kpi
 
 def _enrich_trade_history(events: list) -> list:
     """사장 피드백 2026-05-15 (5차): 거래 내역 상세보기용 enrich.
@@ -767,6 +842,51 @@ def _parse_entry_directive(text: str, code: str) -> Dict[str, Any]:
     # 인식 실패 → 시장가 폴백
     return {"mode": "market", "limit_price": None, "watch_pct": None, "raw": raw}
 
+# 체결 미확인 주문을 다시 확인하기까지의 대기 시간(초). 모듈 상수로 둬서 테스트가
+# 5분 실대기 없이 재확인 로직을 검증할 수 있게 한다(seam).
+_REVERIFY_DELAY_SEC = 300
+
+
+def _trade_event_type(ok: bool) -> str:
+    """체결 이벤트 타입을 누적 카운트 기준(ok)과 일치시킨다.
+    ok=True 면(체결 확인 또는 US 잠정 접수) trade_executed, 아니면 trade_failed.
+    이전엔 filled 기준이라 US 접수만(ok=True, filled=False) 주문이 카운트엔 포함되면서도
+    이벤트는 trade_failed 로 나가 거래내역이 불일치했다(2026-05-21 회귀)."""
+    return "trade_executed" if ok else "trade_failed"
+
+
+async def _llm_is_standing_directive(message: str, response: str) -> bool:
+    """사장 지시 2026-05-21: 사장 지시가 '앞으로 매 운용에 지속 적용할 상시 원칙'인지(STANDING)
+    아니면 '일회성 질문·조회·단발 명령'인지(ONESHOT) 경량 LLM으로 판단. 실패 시 보수적으로 False.
+    체크박스(수동 저장)를 대체하는 자동 판단기."""
+    try:
+        from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, MODEL_ASSIGNMENTS
+        if not OPENROUTER_API_KEY:
+            return False
+        import aiohttp
+        model = MODEL_ASSIGNMENTS.get("news_curator") or "deepseek/deepseek-v4-flash"
+        sys_p = ("당신은 분류기입니다. 사장이 운용역에게 내린 지시가 '앞으로 매 운용에 지속 적용해야 할 "
+                 "상시 원칙·정책'인지, 아니면 '일회성 질문·현황 조회·단발 명령'인지 판단하세요. "
+                 "포트폴리오 비중·자산배분·매매규칙·익절/손절·금지/우선 종목·리스크 한도처럼 지속 적용할 "
+                 "원칙이면 STANDING. 단순 질문·현재 현황 조회·1회성 실행 요청이면 ONESHOT. "
+                 "오직 한 단어로만 답하세요: STANDING 또는 ONESHOT.")
+        usr_p = f"[사장 지시]\n{message}\n\n[운용역 응답 요지]\n{(response or '')[:600]}"
+        payload = {"model": model, "max_tokens": 8, "temperature": 0.0,
+                   "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}]}
+        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
+                   "HTTP-Referer": "https://arquant.ai-ve.uk", "X-Title": "ArQuant-DirectiveClassifier"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+            async with s.post(f"{OPENROUTER_BASE_URL}/chat/completions", json=payload, headers=headers) as r:
+                if r.status != 200:
+                    return False
+                d = await r.json()
+        reply = ((d.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "") or ""
+        return "STANDING" in reply.upper()
+    except Exception as _e:
+        logger.warning(f"상시지시 분류 실패(보수적 미저장): {_e}")
+        return False
+
+
 class ArquantOrchestrator:
     def __init__(self):
         self.orchestrator = BaseAgent(name="운용전략실장", role="chief_orchestrator", model_key="chief_orchestrator",
@@ -875,6 +995,7 @@ class ArquantOrchestrator:
                 # 자동 체이닝 — 운용지원실장(프로필 한정 파라미터 조정)으로 (ADMIN·일반 공통).
                 if self._needs_ops_chain(resp):
                     await self._auto_chain_to_ops(message, source_agent=name, source_response=resp)
+                asyncio.create_task(self._auto_persist_directive(message, resp))   # 체크박스 대체: 자동 판단 저장
                 return resp
             return f"에이전트 '{name}' 없음. 가능: {', '.join(self._agents_map.keys())}"
         resp = await self.orchestrator.think(f"[🔴 사장 직접 지시] {message}")
@@ -882,7 +1003,35 @@ class ArquantOrchestrator:
         # 운용전략실장 응답도 자동 체이닝 — 운용지원실장(프로필 한정 조정)으로 (ADMIN·일반 공통).
         if self._needs_ops_chain(resp):
             await self._auto_chain_to_ops(message, source_agent="운용전략실장", source_response=resp)
+        asyncio.create_task(self._auto_persist_directive(message, resp))   # 체크박스 대체: 자동 판단 저장
         return resp
+
+    async def _auto_persist_directive(self, message: str, response: str) -> None:
+        """사장 지시 2026-05-21: 체크박스 제거 — 지시가 '지속 적용 상시 원칙'인지 LLM이 판단해
+        활성 계정의 standing_directive 로 자동 저장한다. 질문·일회성·에러응답은 저장하지 않는다."""
+        try:
+            _auid, _ = self._active_actor()
+            if _auid is None:
+                return
+            if not (message or "").strip():
+                return
+            if (response or "").startswith("["):   # 에이전트 에러 응답이면 판단 보류
+                return
+            if not await _llm_is_standing_directive(message, response):
+                return
+            text = message.strip()
+            if text.startswith("@"):               # 선두 @멘션 토큰 제거
+                parts = text.split(None, 1)
+                text = parts[1] if len(parts) > 1 else ""
+            if not text:
+                return
+            from infra.standing_directives import append_directive
+            if append_directive(_auid, text):
+                await _broadcast({"type": "agent_msg", "agent": "시스템",
+                                  "message": "📌 위 지시를 '지속 운영 원칙'으로 판단해 상시 지시로 저장했습니다 "
+                                             "— 프로필 › 지시사항 관리에서 확인·삭제할 수 있습니다."})
+        except Exception as _e:
+            logger.warning(f"지시 자동 저장 판단 실패: {_e}")
 
     @staticmethod
     def _needs_ops_chain(response_text: str) -> bool:
@@ -998,10 +1147,8 @@ class ArquantOrchestrator:
             text = ops_history.summary_text(limit=20, only_with_changes=True)
             st = ops_history.stats()
             stats_line = (f"\n\n📊 전체 통계: 워커 실행 {st['runs']}회 / "
-                          f"실제 변경 발생 {st['runs_with_changes']}회 / "
-                          f"서버 재시작 {st['runs_restarted']}회 / "
-                          f"적용된 변경 {st['total_applied_changes']}건 / "
-                          f"거부된 변경 {st['total_rejected_changes']}건")
+                          f"실제 조정 발생 {st['runs_with_changes']}회 / "
+                          f"반영된 파라미터 {st['total_applied_changes']}건")
             full = text + stats_line
             await _broadcast({"type": "agent_msg", "agent": "운용지원실장", "message": full})
             return full
@@ -1026,8 +1173,8 @@ class ArquantOrchestrator:
                           "message": f"🗣 [사장 → {display}] {message}"})
         self._spawn_ops_support_worker(cycle_id=None, manual_directive=message)
         msg = (f"🛠 {display}: 위 지시를 분석해 **이 프로필 전용** 전략 튜닝 파라미터로 조정안을 "
-               f"제시합니다. 코드 자가수정·서버 재시작은 하지 않으며(기능 폐지), 전략·예산·익절/손절 "
-               f"같은 '적용 가능 전략' 파라미터만 이 프로필에 반영되어 다음 로그인 시 활성화됩니다. "
+               f"제시합니다. 전략·예산·익절/손절 같은 '적용 가능 전략' 파라미터가 이 프로필에 "
+               f"반영되어 다음 로그인 시 활성화됩니다. "
                f"('@운용지원실장 이력 보여줘'로 이 프로필 반영 내역 조회 가능)")
         await _broadcast({"type":"agent_msg","agent":display,"message":msg})
         return msg
@@ -1305,7 +1452,12 @@ class ArquantOrchestrator:
         report = (quant_report or "") + "\n" + (news_report or "")
         snap = await self.broker.kr_account_snapshot()
         bp = snap["buying_power"]; holdings = holdings or snap.get("holdings") or []
-        record_equity(bp, "cycle", holdings=holdings)
+        # 사장 지시 2026-05-21: 자산곡선은 KR+US 통합 총평가로 기록한다(주문 사이징은 KR 기준 bp 유지).
+        try:
+            _pf = await self.broker.portfolio_holdings()
+            record_equity(_pf.get("buying_power") or bp, "cycle", holdings=_pf.get("holdings") or holdings)
+        except Exception:
+            record_equity(bp, "cycle", holdings=holdings)
         cash = float(bp.get("cash", 0.0) or 0.0)
         total = float(bp.get("total_eval", 0.0) or 0.0) or cash
         # 사장 지시 2026-05-14: 1주 예산은 **총평가액** 기준 (실제 spend는 cash로 캡).
@@ -1633,11 +1785,12 @@ class ArquantOrchestrator:
                         filled = True; fill_note = f"보유 {before_qty}→{after_qty}주"
                 except Exception as _e:
                     fill_note = f"체결확인 실패({_e})"
-            if filled or (not is_kr and accepted):
+            _ok = filled or (not is_kr and accepted)
+            if _ok:
                 self._trades_executed += 1
                 self._trade_log.append({"ts": _now_kst_iso(), "ticker": ticker, "side": "buy",
                                         "qty": qty, "result": res, "filled": filled, "ok": True, "watch": True})
-            await _broadcast({"type": "trade_executed" if filled else "trade_failed",
+            await _broadcast({"type": _trade_event_type(_ok),
                 "message": f"{badge} — {ticker} {qty}주: {res}" + (f" | {fill_note}" if fill_note else ""),
                 "ticker": ticker, "side": "buy", "qty": qty, "filled": filled,
                 "trades_total": self._trades_executed})
@@ -1659,17 +1812,23 @@ class ArquantOrchestrator:
         체결 안 됐다고 판단되면 trades_executed 카운트 차감 + 보정 메시지 broadcast.
         호가 미체결 주문은 KIS 측에서 장 마감 시 자동 취소되므로 별도 cancel API 호출은 불필요."""
         try:
-            await asyncio.sleep(300)  # 5분 대기
+            await asyncio.sleep(_REVERIFY_DELAY_SEC)  # 5분 대기 (테스트는 0으로 단축)
             self.broker._acct_snap = None  # force fresh read
-            after = await self.broker.kr_holdings()
+            after_kr = await self.broker.kr_holdings()
+            # 사장 지시 2026-05-21: US 도 보강한다. 이전엔 US 티커를 continue 로 스킵해
+            # (KR만 6자리 숫자 매칭) 잠정 체결로 카운트된 US 주문이 영구히 차감되지 않았다.
+            try:
+                after_us = await self.broker._overseas_holdings()
+            except Exception:
+                after_us = []
             adjustments = []
             for e in pending:
                 tk = str(e.get("ticker","")).strip()
                 side = e.get("side","buy")
-                if not (tk.isdigit() and len(tk) == 6):
-                    continue  # KR만 보강 (US는 별도 API 필요)
-                before_qty = next((h["qty"] for h in (baseline_holdings or []) if h["code"] == tk), 0)
-                after_qty = next((h["qty"] for h in after if h["code"] == tk), 0)
+                is_kr_tk = tk.isdigit() and len(tk) == 6
+                after = after_kr if is_kr_tk else after_us
+                before_qty = next((h["qty"] for h in (baseline_holdings or []) if h.get("code") == tk), 0)
+                after_qty = next((h["qty"] for h in after if h.get("code") == tk), 0)
                 truly_filled = (side == "buy" and after_qty > before_qty) or \
                                (side == "sell" and after_qty < before_qty)
                 if truly_filled:
@@ -1700,7 +1859,9 @@ class ArquantOrchestrator:
         Without this the chart would show 9-hour gaps overnight (관측된 버그 2026-05-14)."""
         while not self._stop_event.is_set():
             try:
-                snap = await self.broker.kr_account_snapshot()
+                # 사장 지시 2026-05-21: 자산곡선을 KR+US 통합 총평가로 — portfolio_holdings 가
+                # 국내 nass_amt 에 해외주식 원화환산 평가를 더한 총평가를 돌려준다.
+                snap = await self.broker.portfolio_holdings()
                 bp = snap.get("buying_power") or {}
                 if bp.get("ok"):
                     record_equity(bp, "poll", holdings=snap.get("holdings") or [])
@@ -1796,7 +1957,8 @@ class ArquantOrchestrator:
                         await _broadcast({"type": "news", "count": len(unique_added), "ts": self.news_monitor.last_crawl_time,
                             "message": (f"📰 +{len(unique_added)}건 (KR 누적 {len(self._pending_news_kr)} / "
                                         f"US 누적 {len(self._pending_news_us)}) | 크롤 {self.news_monitor.last_crawl_time or ''}"),
-                            "articles": [a["title"] for a in unique_added[:5]]})
+                            "articles": [{"title": a.get("title", ""), "market": a.get("market", "BOTH"),
+                                          "link": a.get("link", "")} for a in unique_added[:5]]})
 
                 # ── cycle trigger: (a) ▶ 실행 직후 첫 회, (b) a market just opened, or
                 #                  (c) ≥ PERIODIC_CYCLE_SEC since last cycle — 모두 '장중일 때'만 ──
@@ -2464,6 +2626,19 @@ class ArquantOrchestrator:
                 _ap_sells = [r for r in approved_orders if (r.get("side") or "buy") == "sell"]
                 _ap_buys  = [r for r in approved_orders if (r.get("side") or "buy") != "sell"]
                 _exec_list = _ap_sells + _ap_buys[:int(_max_trades or 2)]
+                # 사장 지시 2026-05-21: US 체결 재확인용 '주문 직전' 해외 보유 스냅샷.
+                # cycle 의 holdings 는 kr_holdings() 라 US 가 없어, 이미 보유 중인 US 종목의
+                # before_qty 가 0으로 잡혀 false-positive(미체결을 체결로 오판)가 날 수 있다.
+                # US 주문이 있을 때만 1회 조회해 _reverify_fills baseline 에 합친다.
+                _us_baseline: List[Dict] = []
+                def _is_us_tk(_t: str) -> bool:
+                    _t = (_t or "").strip()
+                    return not (_t.isdigit() and len(_t) == 6)
+                if any(_is_us_tk(r.get("ticker")) for r in _exec_list):
+                    try:
+                        _us_baseline = await self.broker._overseas_holdings()
+                    except Exception:
+                        _us_baseline = []
                 for r in _exec_list:
                     tk = str(r.get("ticker") or "").strip()
                     qty = max(1, int(r.get("qty") or 1))
@@ -2581,7 +2756,7 @@ class ArquantOrchestrator:
                         self._trades_executed += 1
                         self._trade_log.append({"ts": _now_kst_iso(), **rec})
                     badge = "✅ 실매매 체결확인" if filled else ("📨 주문 접수(체결 미확인 — 5분 후 재확인)" if accepted else "⚠ 주문 실패")
-                    await _broadcast({"type": "trade_executed" if filled else "trade_failed",
+                    await _broadcast({"type": _trade_event_type(ok),
                         "message": f"{badge} — {res}" + (f" | {fill_note}" if fill_note else ""),
                         "ticker": tk, "side": od.side, "qty": qty, "filled": filled,
                         "fill_price": fill_price, "fill_currency": ("USD" if is_us else "KRW"),
@@ -2601,7 +2776,7 @@ class ArquantOrchestrator:
                 # accepted=True/filled=False인 주문이 실제로 안 채워졌으면 trades_executed 카운트 차감.
                 _unconfirmed = [e for e in exec_results if e.get("accepted") and not e.get("filled")]
                 if _unconfirmed:
-                    asyncio.create_task(self._reverify_fills(_unconfirmed, list(holdings or [])))
+                    asyncio.create_task(self._reverify_fills(_unconfirmed, list(holdings or []) + _us_baseline))
             elif risk_approved and not LIVE_TRADING:
                 await _broadcast({"type":"execution_ready","message":"✅ 리스크 승인 (LIVE_TRADING=False — 실주문 생략)","draft":order_draft})
             else:

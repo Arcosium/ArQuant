@@ -6,11 +6,14 @@ import json
 import logging
 import time
 import aiohttp
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 
 from infra.error_log import record_error  # 사장 지시 2026-05-19 — 상세 에러를 운용지원실장이 열람 가능하게
 
 logger = logging.getLogger("AGENT")
+KST = timezone(timedelta(hours=9))
 
 # 사장 피드백 2026-05-15: API 비용 추적 — OpenRouter usage 필드를 모델별 단가에 곱해 추정.
 # 단가는 대략적인 OpenRouter 공시가 (input/output USD per 1M tokens). 정확도는 ±20% 수준.
@@ -27,6 +30,15 @@ _DEFAULT_PRICING = (0.50, 1.50)  # 모르는 모델은 보수적으로 deepseek-
 _API_CALL_LOG: List[Dict] = []   # {ts, model, prompt_tokens, completion_tokens, cost_usd, agent}
 _API_LOG_CAP = 500
 
+# 사장 지시 2026-05-21: 비용 표시를 시간(/h)·일(/d)·월(/m)·총누적 으로 선택 가능하게.
+#   • /h(회전식 최근 1시간)는 위 인메모리 _API_CALL_LOG 로 충분(재시작 시 0부터).
+#   • /d·/m·총누적은 재시작에도 살아남아야 하므로 일/월/누적 버킷을 롤업 파일에 O(1) 갱신.
+#     (매 폴링마다 거대한 로그를 재집계하지 않도록 — base_agent 는 서버 프로세스 단일 writer.)
+_COST_ROLLUP_PATH = Path(__file__).resolve().parent.parent / "data" / "api_cost_rollup.json"
+_COST_DAY_KEEP = 90  # 일 버킷 보존 일수 (월/누적은 항상 보존)
+_cost_rollup: Optional[Dict[str, Any]] = None  # 지연 로드 캐시 (None=미로드)
+
+
 def get_api_cost_since(epoch_secs: float) -> float:
     """epoch_secs 이후의 누적 API 비용(USD)."""
     return sum(e.get("cost_usd", 0.0) for e in _API_CALL_LOG if e.get("ts", 0) >= epoch_secs)
@@ -41,6 +53,92 @@ def get_api_cost_last_cycle(seconds_back: float = 3600.0) -> Dict[str, Any]:
 
 def reset_api_cost_log():
     _API_CALL_LOG.clear()
+
+
+# ── 영속 롤업 (일/월/누적) ──────────────────────────────────────────────────────
+
+def _load_cost_rollup() -> Dict[str, Any]:
+    base = {"total": {"usd": 0.0, "calls": 0}, "day": {}, "month": {}}
+    try:
+        if _COST_ROLLUP_PATH.exists():
+            d = json.loads(_COST_ROLLUP_PATH.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                base["total"] = d.get("total") or base["total"]
+                base["day"] = d.get("day") or {}
+                base["month"] = d.get("month") or {}
+    except Exception as e:
+        logger.warning("api_cost_rollup 로드 실패: %s", e)
+    return base
+
+
+def _save_cost_rollup() -> None:
+    try:
+        _COST_ROLLUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _COST_ROLLUP_PATH.write_text(json.dumps(_cost_rollup, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning("api_cost_rollup 저장 실패: %s", e)
+
+
+def _ensure_rollup_loaded() -> None:
+    global _cost_rollup
+    if _cost_rollup is None:
+        _cost_rollup = _load_cost_rollup()
+
+
+def _reset_cost_rollup() -> None:
+    """인메모리 롤업 캐시 해제 → 다음 접근 시 파일에서 재로드 (테스트·재로드용)."""
+    global _cost_rollup
+    _cost_rollup = None
+
+
+def _bump_rollup(cost_usd: float, ts: float) -> None:
+    _ensure_rollup_loaded()
+    dt = datetime.fromtimestamp(ts, KST)
+    day, mon = dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m")
+    r = _cost_rollup
+    r["total"]["usd"] = round(r["total"]["usd"] + cost_usd, 8)
+    r["total"]["calls"] += 1
+    d = r["day"].setdefault(day, {"usd": 0.0, "calls": 0})
+    d["usd"] = round(d["usd"] + cost_usd, 8); d["calls"] += 1
+    m = r["month"].setdefault(mon, {"usd": 0.0, "calls": 0})
+    m["usd"] = round(m["usd"] + cost_usd, 8); m["calls"] += 1
+    if len(r["day"]) > _COST_DAY_KEEP:
+        for k in sorted(r["day"])[:-_COST_DAY_KEEP]:
+            r["day"].pop(k, None)
+    _save_cost_rollup()
+
+
+def _record_api_call(model: str, agent: str, prompt_tokens: int, completion_tokens: int,
+                     ts: Optional[float] = None) -> float:
+    """OpenRouter usage → 모델 단가로 비용 추정 → 회전식 로그 + 영속 롤업에 적재. 비용(USD) 반환."""
+    ts = ts if ts is not None else time.time()
+    in_rate, out_rate = _MODEL_PRICING.get(model, _DEFAULT_PRICING)
+    cost = (prompt_tokens / 1_000_000.0) * in_rate + (completion_tokens / 1_000_000.0) * out_rate
+    _API_CALL_LOG.append({"ts": ts, "model": model, "agent": agent,
+                          "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                          "cost_usd": cost})
+    if len(_API_CALL_LOG) > _API_LOG_CAP:
+        del _API_CALL_LOG[:len(_API_CALL_LOG) - _API_LOG_CAP]
+    _bump_rollup(cost, ts)
+    return cost
+
+
+def cost_summary() -> Dict[str, Any]:
+    """우상단 표시용 — 시간(/h, 회전식)·일(/d)·월(/m)·총누적 비용·호출 수."""
+    _ensure_rollup_loaded()
+    now = time.time()
+    cut = now - 3600.0
+    hcalls = [e for e in _API_CALL_LOG if e.get("ts", 0) >= cut]
+    dt = datetime.fromtimestamp(now, KST)
+    r = _cost_rollup
+    d = r["day"].get(dt.strftime("%Y-%m-%d"), {"usd": 0.0, "calls": 0})
+    m = r["month"].get(dt.strftime("%Y-%m"), {"usd": 0.0, "calls": 0})
+    return {
+        "h": {"usd": sum(e.get("cost_usd", 0.0) for e in hcalls), "calls": len(hcalls)},
+        "d": {"usd": d["usd"], "calls": d["calls"]},
+        "m": {"usd": m["usd"], "calls": m["calls"]},
+        "total": {"usd": r["total"]["usd"], "calls": r["total"]["calls"]},
+    }
 
 
 class BaseAgent:
@@ -193,17 +291,12 @@ class BaseAgent:
                     record_error(self.name, _re, context=(
                         f"빈응답 재시도 예외 | model={self.model} | max_tokens={_retry_max}"))
 
-            # 사장 피드백 2026-05-15: API 사용량 → 비용 추정 → 글로벌 로그 적재
+            # 사장 피드백 2026-05-15: API 사용량 → 비용 추정 → 회전식 로그 + 영속 롤업 적재
             try:
                 _usage = (data.get("usage") or {})
                 _pt = int(_usage.get("prompt_tokens", 0) or 0)
                 _ct = int(_usage.get("completion_tokens", 0) or 0)
-                _in_rate, _out_rate = _MODEL_PRICING.get(self.model, _DEFAULT_PRICING)
-                _cost = (_pt / 1_000_000.0) * _in_rate + (_ct / 1_000_000.0) * _out_rate
-                _API_CALL_LOG.append({"ts": time.time(), "model": self.model, "agent": self.name,
-                                      "prompt_tokens": _pt, "completion_tokens": _ct, "cost_usd": _cost})
-                if len(_API_CALL_LOG) > _API_LOG_CAP:
-                    del _API_CALL_LOG[:len(_API_CALL_LOG) - _API_LOG_CAP]
+                _record_api_call(self.model, self.name, _pt, _ct)
             except Exception as _ue:
                 # 클린코드 2026-05-19: 비용 추적 실패가 debug라 운영에서 안 보였음 → warning 승격.
                 logger.warning(f"[{self.name}] 사용량 추적 실패: {type(_ue).__name__}: {_ue!r}")

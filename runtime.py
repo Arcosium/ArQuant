@@ -101,6 +101,52 @@ def set_ops_feedback(enabled: bool, uid=None, by: str = "dashboard") -> dict:
     return ops_feedback_state(uid)
 
 
+# ── API 비용 표시 모드 — 프로필(계정)별 (사장 지시 2026-05-21) ───────────────────
+# 우상단 API 비용 표시를 시간(/h)·일(/d)·월(/m)·총누적(total) 중 하나로 프로필별 선택.
+# 저장 형식: {"_default": {"mode": "h"}, "<uid>": {"mode": ...}}  — ops_feedback 와 동일 패턴.
+_COST_MODE_FILE = _DIR / "api_cost_mode.json"
+_COST_MODES = ("h", "d", "m", "total")
+_cost_mode: dict = {"_default": {"mode": "h"}}
+
+
+def _cost_key(uid=None) -> str:
+    return str(int(uid)) if uid is not None else "_default"
+
+
+def _load_cost_mode():
+    global _cost_mode
+    try:
+        if _COST_MODE_FILE.exists():
+            d = json.loads(_COST_MODE_FILE.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                _cost_mode = {k: v for k, v in d.items()
+                              if isinstance(v, dict) and v.get("mode") in _COST_MODES}
+                _cost_mode.setdefault("_default", {"mode": "h"})
+    except Exception:
+        pass
+
+
+def cost_display_mode(uid=None) -> str:
+    """프로필(uid)별 비용 표시 모드. 미설정 시 _default(기본 'h')."""
+    st = _cost_mode.get(_cost_key(uid)) or _cost_mode.get("_default") or {}
+    mode = st.get("mode", "h")
+    return mode if mode in _COST_MODES else "h"
+
+
+def set_cost_display_mode(mode: str, uid=None) -> str:
+    """비용 표시 모드 변경 — 프로필(uid)별. uid=None 이면 기본값. 재시작 불필요."""
+    global _cost_mode
+    if mode not in _COST_MODES:
+        raise ValueError(f"잘못된 비용 표시 모드: {mode!r} (가능: {_COST_MODES})")
+    _cost_mode[_cost_key(uid)] = {"mode": mode, "since": datetime.now().isoformat()}
+    try:
+        _COST_MODE_FILE.write_text(json.dumps(_cost_mode, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+    except Exception:
+        pass
+    return mode
+
+
 def _persist():
     try:
         _STATE.write_text(json.dumps(_state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -135,6 +181,7 @@ def _load():
 
 _load()
 _load_ops_feedback()
+_load_cost_mode()
 if not _HIST.exists():
     _append_history({"name": _state["name"], "params": _state["params"], "by": "init"})
 

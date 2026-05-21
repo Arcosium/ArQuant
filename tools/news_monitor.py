@@ -189,6 +189,19 @@ class NaverFinanceMonitor:
         if "news_read" not in href and "article_id" not in href and "/article/" not in href:
             return None
         link = urljoin("https://finance.naver.com", href)
+        # 사장 지시 2026-05-21: 구 finance.naver.com/news/news_read.naver 는 폐기돼 '실시간 속보
+        # 목록'으로 리다이렉트되고, href의 &section_id 가 &sect; HTML 엔티티로 디코딩돼 쿼리도
+        # 깨진다. office_id/article_id 를 뽑아 최신 기사 URL로 재구성해 개별 기사로 정확히 연결한다.
+        _oid = (re.search(r"office_id=(\d+)", href) or [None, None])
+        _aid = (re.search(r"article_id=(\d+)", href) or [None, None])
+        oid = _oid.group(1) if hasattr(_oid, "group") else None
+        aid = _aid.group(1) if hasattr(_aid, "group") else None
+        if not (oid and aid):
+            m = re.search(r"/article/(?:mnews/)?(\d+)/(\d+)", href)
+            if m:
+                oid, aid = m.group(1), m.group(2)
+        if oid and aid:
+            link = f"https://n.news.naver.com/article/{oid}/{aid}"
         if link in self._seen_links:
             return None
         compact = re.sub(r"\s+", "", title)

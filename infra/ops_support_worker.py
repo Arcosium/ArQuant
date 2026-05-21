@@ -38,6 +38,11 @@ from typing import List, Dict, Optional, Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# 사장 지시 2026-05-21: 워커의 LLM 호출 예외(타임아웃 등)를 claude_response.json 에
+# type="error" 로 표면화 → 다음 사이클 운용지원실장이 '지난 진단 실패'를 인지한다.
+# error_log 는 top-level 의존성이 가벼우며(main_swarm 은 record_error 내부 지연 import).
+from infra.error_log import record_error
+
 KST = timezone(timedelta(hours=9))
 LOG_DIR = PROJECT_ROOT / "data"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -134,12 +139,11 @@ OPS_MAX_TOKENS = AGENT_MAX_TOKENS.get("ops_support", 4096)
 # (param_overrides) 조정안만 제시한다.
 ROLE_PERSONAS = {
     "ops_support": ("운용지원실장",
-        "**진단·프로필 튜닝 제안자 (사장 지시 2026-05-20)** — 직접 코딩하지 않으며 소스 코드도 "
-        "수정하지 않습니다(코드 자가수정 기능 제거됨). 직전 사이클·주간 실제 데이터를 분석해 *무엇이 "
+        "**진단·프로필 튜닝 제안자** — 직전 사이클·주간 실제 데이터를 분석해 *무엇이 "
         "문제이고 무엇이 정상 동작인지*를 진단하고, 개선이 필요하면 **이 프로필에만 적용되는 전략 튜닝 "
-        "파라미터(param_overrides)** 로만 조정안을 제시합니다. 조정 범위는 사용자가 전략 커스터마이즈에서 "
+        "파라미터(param_overrides)** 로 조정안을 제시합니다. 조정 범위는 사용자가 전략 커스터마이즈에서 "
         "바꿀 수 있는 '적용 가능 전략' 파라미터에 한정됩니다(계정마다 프로필 분리). 데이터 부족·출력 깨짐 "
-        "버그를 최우선으로 진단하되, 소스 변경이 필요해 보이면 '제안'으로만 기록하고 자동 적용하지 않습니다."),
+        "버그를 최우선으로 진단하고, 그 외 개선점은 '제안'으로 기록합니다."),
 }
 
 # 사장 피드백 2026-05-18: 운용지원실장(진단)·팀장(코딩) 책임 분리.
@@ -309,17 +313,19 @@ async def llm_propose(prompt: str, role: str = "ops_support",
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
                "HTTP-Referer": "https://arquant.ai-ve.uk", "X-Title": "ArQuant-OpsSupport-Worker"}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as s:
             async with s.post(f"{OPENROUTER_BASE_URL}/chat/completions", json=payload, headers=headers) as r:
                 if r.status != 200:
                     txt = await r.text()
                     logger.error(f"LLM HTTP {r.status}: {txt[:300]}")
+                    record_error("ops_support.llm_propose", context=f"HTTP {r.status}: {txt[:200]}")
                     return {}
                 d = await r.json()
         reply = d.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
     except Exception as e:
         # 사장 지시 2026-05-19: str(e)='' 예외(타임아웃 등)도 원인 식별되게 타입+repr+tb.
         logger.error(f"LLM 호출 예외: {type(e).__name__}: {e!r}", exc_info=True)
+        record_error("ops_support.llm_propose", e, context=f"role={role}, prompt_len={len(prompt)}")
         return {}
 
     # Find the JSON block — accept ``` fenced or bare
@@ -354,11 +360,12 @@ async def llm_diagnose(prompt: str) -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
                "HTTP-Referer": "https://arquant.ai-ve.uk", "X-Title": "ArQuant-OpsSupport-Diagnose"}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as s:
             async with s.post(f"{OPENROUTER_BASE_URL}/chat/completions", json=payload, headers=headers) as r:
                 if r.status != 200:
                     txt = await r.text()
                     logger.error(f"진단 LLM HTTP {r.status}: {txt[:300]}")
+                    record_error("ops_support.llm_diagnose", context=f"HTTP {r.status}: {txt[:200]}")
                     return {"action": "none", "summary": "진단 미완 (LLM HTTP 오류)", "rationale": f"HTTP {r.status}"}
                 d = await r.json()
         reply = d.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
@@ -366,6 +373,7 @@ async def llm_diagnose(prompt: str) -> Dict[str, Any]:
         # 사장 지시 2026-05-19: 빈 메시지 예외도 진단 가능하도록 타입+repr+tb 기록.
         _detail = f"{type(e).__name__}: {e!r}"
         logger.error(f"진단 LLM 예외: {_detail}", exc_info=True)
+        record_error("ops_support.llm_diagnose", e, context=f"prompt_len={len(prompt)}")
         return {"action": "none", "summary": "진단 미완 (LLM 호출 예외)", "rationale": _detail}
     m = re.search(r"```json\s*(\{.+?\})\s*```", reply, re.S) or re.search(r"(\{.+\})", reply, re.S)
     if not m:
@@ -740,7 +748,7 @@ def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
     if applied_ov:
         head = f"✅ 이 프로필 전용 튜닝 {len(applied_ov)}건 반영 (소스/서버 불변, 다음 로그인 시 활성화)"
     elif proposed:
-        head = f"📝 소스 변경 제안 {len(proposed)}건 — 자동 적용 안 함 (코드 자가수정 비활성)"
+        head = f"📝 개선 제안 {len(proposed)}건 — 참고용 (자동 적용 안 함)"
     elif "변경 없음" in summary or "변경 사항 없음" in summary:
         head = "ℹ️ 변경 없음 — 점검 결과 손볼 곳 없음"
     else:
@@ -752,10 +760,9 @@ def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
     for k, v in applied_ov.items():
         msg_lines.append(f"  • {k} = {v}  (이 프로필 한정)")
     if proposed:
-        msg_lines.append("소스 변경 제안(미적용):")
+        msg_lines.append("개선 제안(참고용):")
         for s in proposed[:5]:
             msg_lines.append(f"  • {s}")
-    msg_lines.append("ℹ️ 코드 자가수정·서버 재시작 기능은 비활성화됨 — 프로필 한정 파라미터 조정만 반영됩니다.")
     message = "\n".join(msg_lines)
     logger.info(f"--- 비관리자 요약 ---\n{message}\n----------")
 

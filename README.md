@@ -2,14 +2,14 @@
 
 > **https://arquant.ai-ve.uk** | 앱 자체 로그인 (아이디/비밀번호 — 사장 피드백 2026-05-16, Cloudflare Access 제거)
 >
-> 9명의 AI 에이전트(+ 운용지원실장 산하 팀장 3명 + 뉴스 분류·큐레이터)가 협업하여 **글로벌 지수(매크로) + Tavily 실시간 시황·해설 + 3년치 일봉/수급 + 실시간 분봉 + DART 공시·재무제표 + 네이버 금융 증권 속보**를 종합 분석하고,
+> 8명의 AI 에이전트(+ 뉴스 분류·큐레이터)가 협업하여 **글로벌 지수(매크로) + 실시간 시황·해설 + 3년치 일봉/수급 + 실시간 분봉 + DART 공시·재무제표 + 네이버 금융 증권 속보**를 종합 분석하고,
 > **국내주식 · 해외주식 · 국내채권 · 펀드** 보유분을 통합 관리하며 실거래(KIS OpenAPI)를 수행하는 풀스택 시스템.
 >
 > 의사결정은 **운용전략실장의 2패스 흐름**(① 뉴스 분석 기반 후보 6개 → ② 종목별 계량 평가(통일 5섹션 양식) → 최종 1~3개 매수)으로 진행되며,
 > 계량분석팀장이 진입가/관망 지시를 내리면 **트레이딩팀장이 분봉 단위로 모니터링**하다가 트리거 도달 시 매수합니다.
 > 주문서(OrderDraft)와 1차 리스크 검증은 **결정론적 파이썬**이, 매수 2차 재심은 **DART 공시 + 직전연도 요약재무 기반 AI**가, 보유 종목 매도는 **사후관리실장**이 담당합니다.
 > 운용전략실장 산하 트레이딩팀장이 **실행 직후** 체결 결과(실제 체결가 포함)를 한국어 산문으로 보고합니다.
-> 운용지원실장은 **직접 코딩하지 않고** 사이클 결과를 도메인(investment/operations/finance)별로 분류해 산하 팀장 워커에 위임합니다.
+> 운용지원실장은 **코드를 수정하지 않고**(2026-05-20 자가수정 폐지) 사이클 결과를 진단해 프로필 한정 전략 파라미터 조정을 제안합니다.
 
 ---
 
@@ -31,7 +31,7 @@ Arquant/
 │   ├── user_presets.json      # 사용자 정의 프리셋 (전략 탭 커스터마이즈에서 저장)
 │   ├── cycles.db              # SQLite — 분석 사이클 영속화 (백테스트·장기 분석용)
 │   ├── news_classifier.db     # SQLite — 뉴스 분류 결과 vs 실 매매 결과 학습 로그
-│   ├── ops_history.json       # 운용지원실장(+ 산하 팀장 3명) 자동 수정 이력
+│   ├── ops_history.json       # 운용지원실장 진단·조정 제안 이력 (코드 자가수정 폐지 후)
 │   ├── ops_support.log/.spawn.log  # 워커 실행 로그
 │   ├── equity_curve.json      # 평가금액 추이 시계열 (60s 최소 간격, 2000pt cap)
 │   ├── daily_*.csv            # 종목별 3년 일봉 OHLCV
@@ -43,7 +43,7 @@ Arquant/
 │   └── guardrails.py          # validate_order_draft() 결정론 검증 (KR=원/US=$ 분리) + risk_guard(DART + 재무 재심) / policy 페르소나
 ├── infra/
 │   ├── kis_broker.py          # KIS OpenAPI — 국내/해외 주식·채권 시세·주문·잔고, 멀티거래소 시세, 토큰 파일 캐시
-│   ├── ops_support_worker.py  # 운용지원실장 + 산하 팀장 3명 — 별도 프로세스로 코드 수정 및 서버 재시작 (FORBIDDEN_PATTERNS 가드)
+│   ├── ops_support_worker.py  # 운용지원실장 — 별도 프로세스 진단·파라미터 조정 제안 (코드 자가수정·재시작 RETIRED 2026-05-20)
 │   ├── cycle_store.py         # cycles.db CRUD + 보유기간 추적
 │   ├── news_classifier_log.py # 뉴스 분류 학습 로그 (주간 리뷰에서 키워드 가중치 조정에 활용)
 │   ├── ops_history.py         # 운용지원실장 변경 이력 누적
@@ -84,7 +84,7 @@ Arquant/
 
 ---
 
-## 🏛️ 에이전트 조직도 (9 + 1 + 3)
+## 🏛️ 에이전트 조직도 (8 — 2026-05-20: 운용지원실장 산하 팀장 3명·코드 자가수정 폐지)
 
 | # | 에이전트 | 역할 | 모델 | LLM 호출 |
 |---|---------|------|------|---------|
@@ -99,17 +99,14 @@ Arquant/
 | 6 | **리스크관리실장** | Risk Guard — ① 파이썬 결정론 룰 게이트(KR=원/US=$ 자동 분리 표기) → ② 통과한 **매수** 종목의 **DART 최근 공시 + 직전연도 요약재무(재무상태표/손익계산서) 재심** | 룰 엔진 (Python) + `openrouter/free` | ✅ 매수 있을 때 |
 | 7 | **사후관리실장** | Post-Management — **현재 세션 시장의 보유 종목**만 자유 재결정, 반대편 시장 종목은 자동 `보유`. 매크로 → 계량 → 뉴스 → 평가손익 순 가중 (`매도결정: 코드=전량/절반/보유`) | `moonshotai/kimi-k2.6` | ✅ 보유 있을 때 |
 | 8 | **수탁자책임실장** | Policy Filter — 수탁자 책임·정책 적합성 필터 (간단 분류) | `openrouter/free` | ✅ |
-| 9 | **운용지원실장** | Ops Support **조정자** — 사이클 결과 → 도메인 자동 분류(investment/operations/finance) → 산하 팀장 워커에 위임. spawn↔완료 메시지를 **`OPS#N` 마커**로 시각적 연결. 직접 코드 수정 X | `deepseek/deepseek-v4-pro` | ✅ 사이클 후 |
-| 9a | **투자관리팀장** | Investment Sub-lead — 전략 프리셋, 후보 필터링/사이징, 매도/익절/손절 로직, 퀀트 임계값. 코드 수정 후 즉시 서버 재시작 | `deepseek/deepseek-v4-pro` | ✅ 위임 시 |
-| 9b | **경영관리팀장** | Operations Sub-lead — server/app.py 엔드포인트, 대시보드 UX, 로깅·모니터링·자동 재시작 흐름 | `deepseek/deepseek-v4-pro` | ✅ 위임 시 |
-| 9c | **재무관리팀장** | Finance Sub-lead — 예산 비율, 리스크 한도, P&L·equity curve 정확성, **리스크 표시 단위(원/달러)**, 환율·평가액 산출 | `deepseek/deepseek-v4-pro` | ✅ 위임 시 |
+| 8 | **운용지원실장** | Ops Support — 사이클 결과를 진단하고 **프로필 한정 전략 파라미터 조정**을 제안. **코드 자가수정·서버 재시작·산하 팀장 위임은 2026-05-20 폐지(RETIRED)**. ADMIN·일반 유저 모두 사용(본인 프로필 파라미터만). | `deepseek/deepseek-v4-pro` | ✅ 사이클 후 |
 
 **모델 배정 원칙** (config.py:MODEL_ASSIGNMENTS)
 - 최종 매수 결정자 (운용전략실장·사후관리실장) → **Kimi K2.6** (3000 tok) — 고지능 추론
 - 매크로·계량·뉴스·트레이더 → **DeepSeek V4 Flash** (1800/4096/2600/1500 tok) — 빠르고 저렴
 - **뉴스 분류기** → **`tencent/hy3-preview`** (12K tok, reasoning 모델) — 정확한 KR/US/BOTH 분류
 - 리스크·정책 → **`openrouter/free`** — 비용 0, 폴백·단순 분류
-- 운용지원실장 + 산하 팀장 → **DeepSeek V4 Pro** (8000 tok) — 코드 변경의 정확성 우선
+- 운용지원실장 → **DeepSeek V4 Pro** (8000 tok) — 진단·파라미터 조정 제안의 정확성 우선
 - 변경: `config.py`의 `MODEL_ASSIGNMENTS` / `AGENT_MAX_TOKENS` 한 곳에서.
 
 **사이드바 계층 표시** (사장 피드백 2026-05-15 4차)
@@ -122,27 +119,18 @@ Arquant/
 리스크관리실장           ← 독립
 사후관리실장             ← 독립
 수탁자책임실장           ← 독립
-운용지원실장              ← 최상위
-  └ 투자관리팀장
-  └ 경영관리팀장
-  └ 재무관리팀장
+운용지원실장              ← 독립 (산하 팀장 3명 폐지 2026-05-20)
 ```
 '시스템' 라벨은 사이드바에서 제거됨. 시스템 broadcast는 적절한 에이전트 이름으로 재배정 (지수 수집 → 전략리서치팀장, 데이터 수집 → 계량분석팀장, 후보 사전 필터 → 운용전략실장 PASS1 메시지에 통합).
 
-### 운용지원실장 위임 구조 (사장 피드백 #16)
-1. 사이클 종료 직후 `main_swarm._classify_ops_role()`이 실행 결과를 분석해 도메인 판정:
-   - **investment**: 주문 실패/거부, 종목·전략 변경, 퀀트 지표 임계값 → 투자관리팀장
-   - **operations**: UI/로그/API/모니터링 → 경영관리팀장
-   - **finance**: 예산 초과, 예수금 부족, $/원 단위 문제 → 재무관리팀장
-   - 매칭 안 되면 통합 책임자(ops_support) 직접 처리
-2. `infra/ops_support_worker.py`를 별도 프로세스로 spawn (`--role investment|operations|finance|ops_support`)
-3. 산하 팀장 워커가 본인 도메인 안에서 보호 패턴(`FORBIDDEN_PATTERNS`) 가드를 통과하면 코드 수정 → 서버 재시작
-
-### 운용지원실장 안전 규칙 (수정 금지 대상 — 변경 불가)
-- `main_swarm.py`의 핵심 매매 로직: `_run_analysis_cycle`, `_build_orders`, `start_continuous`
-- `config.py`의 API 키 / 계좌번호 (`KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO`)
-- `infra/kis_broker.py`의 주문 집행부: `place_order`, `kr_buy`, `kr_sell`, `us_buy`, `us_sell`
-- 위험·불가능하면 `"수정 없음 — 사유"`로 명시 응답 (`"(요약 없음)"` 같은 빈 응답 금지).
+### 운용지원실장 동작 (2026-05-20 — 코드 자가수정 폐지)
+사장 지시로 **코드 자가수정·서버 재시작·산하 팀장(investment/operations/finance) 위임을 전면 폐지**했다.
+이제 운용지원실장은 **읽기 전용 진단 + 프로필 한정 전략 파라미터 조정 제안**만 수행한다.
+- 사이클 종료 후 또는 `@운용지원실장` 멘션 시 `infra/ops_support_worker.py`를 별도 프로세스로 spawn하되,
+  **코드를 쓰지 않고** 사이클 결과를 진단해 해당 유저 프로필의 전략 파라미터(프리셋 값) 조정안을 제시한다.
+- `apply_changes()`/`restart_server()`/`llm_diagnose()`/`_spawn_subordinate()`는 코드에 남아 있으나
+  `run()`에서 **더 이상 호출되지 않음**(RETIRED — `ops_support_worker.py` 상단 주석 참조).
+- 따라서 핵심 매매 로직(`main_swarm`)·주문 집행부(`kis_broker`)·자격증명(`config`)을 건드릴 경로가 원천 차단된다.
 
 ### 리스크 게이트 — 결정론적 (LLM 미사용)
 `agents/guardrails.py::validate_order_draft()`가 매 사이클 주문 배치를 검증합니다. 규칙이 전부 결정론적 수치 비교이므로 LLM을 안 거칩니다.
@@ -293,12 +281,10 @@ DART 결과를 `DartResult` 데이터클래스의 **3-state**로 구분한다(`t
        ↓
 [10] 운용전략실장 사이클 요약 → 곧장 감시 상태 복귀 (쿨다운 없음)
        ↓
-[11] 운용지원실장  →  도메인 자동 분류 → 산하 팀장 워커 spawn (investment/operations/finance)
-         · 사이클 결과(실행 결과, 에러 패턴)로 도메인 판정
-         · **`OPS#N` 마커**로 spawn 메시지 ↔ 완료 메시지 시각적 연결 (사장 피드백 4차)
-         · spawn 메시지에 분류 근거·사이클 요약·예상 소요(1~3분) 명시
-         · 완료 메시지는 분류된 결과로 첫 줄 헤드라인 (`✅ N건 수정 완료` / `ℹ️ 변경 없음` / `⛔ 보호 패턴 거부` / `⚠️ JSON 파싱 실패`)
-         · 보호 패턴 가드 통과 시 코드 수정 → 서버 재시작 (`RESUME_ON_BOOT` 마커로 감시 자동 재개)
+[11] 운용지원실장  →  사이클 결과 진단 + 프로필 전략 파라미터 조정 제안 (2026-05-20: 코드 자가수정·서버 재시작 폐지)
+         · 사이클 결과(실행 결과, 에러 패턴)를 읽기 전용으로 진단
+         · 해당 유저 프로필 한정 전략 파라미터(프리셋 값) 조정안 제시 — 코드는 쓰지 않음
+         · 산하 팀장 위임·`OPS#N` 마커 spawn·`RESUME_ON_BOOT` 자동 재기동은 모두 폐지됨
 ```
 
 **에이전트 발언 → 의사결정 반영 경로 (요약)**
@@ -318,7 +304,7 @@ DART 결과를 `DartResult` 데이터클래스의 **3-state**로 구분한다(`t
 | 사후관리실장(`매도결정:`) | **현재 세션 시장 보유 종목** 매도/보유 (반대편은 자동 보유) |
 | 리스크관리실장(`최종승인:`) | 결정론 룰 통과한 매수의 DART + 재무 재심 결과 |
 | **트레이딩팀장** (자연어, 실행 후) | 체결 결과·실제 체결가·매매 사유 한국어 보고 (대시보드 통신 로그) |
-| 운용지원실장 분류 | `OPS#N` 마커로 spawn → 도메인 판정 → investment/operations/finance/ops_support 중 1개 워커 spawn |
+| 운용지원실장 진단 | 사이클 결과 읽기 전용 진단 → 프로필 한정 전략 파라미터 조정 제안 (코드 수정·위임 폐지) |
 
 ---
 
@@ -655,10 +641,17 @@ KIS 시장가 주문은 응답에 정확한 체결가를 안 주지만, **주문
   상시 지시가 안전 게이트를 우회해 실매매를 강제할 수 없다(프롬프트-only 영향).
 - **표현 강도**: "참고 지침 — 다른 신호·리스크 게이트와 균형 있게 반영"으로 프레이밍.
   파이썬 리스크/guardrail이 항상 최종 우선임을 footer에 명시.
-- **영구 삭제 보장**: 최초 시드 시 `.standing_seed_done` sentinel 기록 →
-  사용자가 `clear/remove`로 지시를 지우면 재시작해도 **부활하지 않음**(`a05f1f7`).
+- **영구 삭제 보장 — tombstone 모델 (2026-05-20 재설계)**: 사용자가 `clear/remove`로
+  지시를 명시 삭제하면 그 지시 id를 **tombstone**(삭제 표식)으로 기록 → 부팅 시드가
+  해당 지시를 **재시드하지 않음**. "명시 삭제 = 영구 삭제", "삭제 안 함 + 재부팅 = 다시 채워짐".
+  - tombstone은 `data/directive_tombstones.json`(`data/` **최상위**, `.gitignore`)에 저장 —
+    프로필 폴더(`data/profiles/<uid>`)가 리셋돼도 삭제 의사가 보존되도록 폴더 **바깥**에 둔다.
+    (과거 sentinel을 profiles/<uid> 안에 둬서 프로필 리셋 시 함께 소실→재시드 부활하던 버그의 근본 수정.)
+  - 같은 지시를 다시 추가하면 tombstone 자동 해제(삭제 의사 철회).
+  - ⚠️ tombstone은 서버 로컬 런타임 상태라 **새 서버 이전·`data/` 초기화 시 소실** → 시드 지시가 부활할 수 있음(마이그레이션 시 수동 복사 필요).
 - **CRUD**: `append_directive` / `load` / `clear_directives` / `remove_directive`
   (멱등 — 동일 내용 SHA256 12자 id 중복 시 추가 생략, 계정당 최대 50건).
+  사용자는 **프로필 모달**(13장)에서 직접 추가·삭제 가능(`/api/profile/directives`).
 - 사장님(hh09080) 계정에는 **매크로 붕괴 시나리오 대응 지시**가 1회 시드됨
   (달러 단기국채·MMF 핵심축, 퀄리티 팩터 우량주·인버스 헤지, 금·비트코인 배제,
   리밸런싱 트리거·현금화 계획 보고 — 사용자 명시 승인 항목).
@@ -706,14 +699,17 @@ Cloudflare Access(Zero Trust)를 제거하고 **앱 자체 로그인**으로 전
   인덱스 백필. 이미 마이그레이션된 행은 건너뜀. 로그: `auth 마이그레이션 완료: 해시승격 N, bidx백필 M`.
 - legacy 행 로그인 시에도 복호-비교 후 **즉시 argon2로 승격**(`verify_password` 경로).
 
-### 계정 복구 — 블라인드 인덱스(HMAC) (신규)
+### 계정 복구 — 블라인드 인덱스(HMAC), 2인자 (2026-05-20 단순화)
 사용자가 아이디/비밀번호를 잊었을 때, **암호화된 자격증명을 복호하지 않고** 복구한다.
-- 복구 인자(3종, 본인만 알 수 있는 값): **KIS App Key + KIS App Secret + OpenRouter Key**.
+- 복구 인자(**2종**, 본인만 알 수 있는 값): **한국투자증권 계좌번호 + KIS App Secret**.
+  (직전 3인자 KIS App Key+Secret+OpenRouter Key에서 단순화 — 계좌번호는 본인이 외우기 쉽고
+  App Secret은 비밀이라 본인확인에 충분.)
 - 저장 형태: 각 값의 `HMAC-SHA256` 블라인드 인덱스 컬럼
-  (`kis_app_key_bidx` / `kis_app_secret_bidx` / `openrouter_key_bidx`).
-  HMAC 키는 Fernet 원본키에서 `HKDF`(`info=b"arquant-bidx-v1"`)로 파생 — raw 키는 어디에도 평문 저장 안 됨.
-- **아이디 찾기**(`POST /api/recover_id`): 3인자 일치 → username 반환.
-- **비밀번호 재설정**(`POST /api/recover_password`): username + 3인자 일치 → 새 비밀번호 설정.
+  (`kis_account_no_bidx` / `kis_app_secret_bidx`). HMAC 키는 Fernet 원본키에서
+  `HKDF`(`info=b"arquant-bidx-v1"`)로 파생 — raw 키는 어디에도 평문 저장 안 됨.
+  - `kis_account_no_bidx`는 부팅 1회 멱등 백필(`migrate_passwords_and_bidx`)로 legacy 행에도 채워짐.
+- **아이디 찾기**(`POST /api/recover_id`): 계좌번호+App Secret 2인자 일치 → username 반환.
+- **비밀번호 재설정**(`POST /api/recover_password`): username + 2인자 일치 → 새 비밀번호 설정.
 - **열거 오라클 차단(I1)**: 새 비밀번호 정책 검증을 **인자 매칭보다 먼저** 수행 →
   "인자 틀림" vs "정책 위반" 응답이 계정 존재 여부를 누설하지 않음.
 
@@ -734,6 +730,20 @@ Cloudflare Access(Zero Trust)를 제거하고 **앱 자체 로그인**으로 전
 `GET /api/accounts` · `POST /api/switch` · `GET /api/auth_status`(공개) ·
 `GET /api/check_username`(공개) · **`POST /api/recover_id`(공개)** · **`POST /api/recover_password`(공개)**.
 그 외 모든 `/api/*`는 세션 필요(미인증 401).
+
+### 프로필 관리 (2026-05-20 — 신규)
+로그인 후 우상단 **프로필** 버튼 → 모달(아코디언)에서 본인 계정을 직접 관리한다. 모든 변경은 감사 로그(JSONL)에 기록.
+- **비밀번호 변경**(`POST /api/profile/password`): 현재 비번 확인 + 새 비번 정책 검증 후 argon2 재해시.
+- **API 자격증명 변경**(`POST /api/profile/credentials`): OpenRouter Key / KIS App Key·Secret / 계좌번호 / Base URL을
+  **부분 업데이트**(입력한 칸만). KIS·OpenRouter 값은 변경 시 **실호출 재검증**, 현재 활성 계정이면 런타임에 즉시 재주입.
+- **상시 지시사항**(`GET/POST/DELETE /api/profile/directives`): 본인 계정 상시 지시 추가·삭제(위 📌 섹션, tombstone 영구삭제).
+- **회원 탈퇴**(`POST /api/profile/delete_account`): **비밀번호 재확인** 후 계정·세션·자격증명·프로필 폴더(`data/profiles/<uid>`) 영구 삭제.
+  단독 ADMIN 보호 — ADMIN 계정은 탈퇴 불가(영구 잠금 방지).
+
+### 회원 관리 (ADMIN 전용 — 2026-05-20 신규)
+ADMIN 계정에서만 프로필 모달에 **회원 관리** 섹션이 노출된다(비관리자는 엔드포인트 403).
+- **회원 현황**(`GET /api/admin/members`): **읽기 전용** — 아이디·ADMIN 여부·모의/실거래 모드 표시. (실전↔모의 '전환' 기능은 없음.)
+- **회원 삭제**(`POST /api/admin/members/delete`): username으로 완전 삭제. **본인·ADMIN 계정은 삭제 차단**(단독 ADMIN 영구 소실 방지). 처리 결과는 감사 로그에 username·uid로 기록.
 
 > 모바일 앱(arquant_mobile): 네이티브 `LoginScreen.kt`(Compose)로 로그인/등록 +
 > 아이디·비밀번호 찾기 폼 제공. 대시보드는 index.html WebView. APK 빌드는 Android SDK 환경에서 수행
@@ -795,7 +805,7 @@ Compose UI 기반 Android 앱. 웹 대시보드와 동일한 백엔드를 사용
 
 ### 로그인 화면 오버홀 (2026-05-19 — 웹 `index.html` + 네이티브 `LoginScreen.kt` 동시 적용)
 - **5-1 로고 통일**: 로그인/등록 화면 로고를 대시보드 좌상단 로고와 동일하게(웹 SVG / Compose `ArQuantLogoBox` Canvas).
-- **5-2 계정 복구 UI**: "아이디 찾기"(KIS Key+Secret+OpenRouter Key) / "비밀번호 찾기"(아이디+3인자) 패널.
+- **5-2 계정 복구 UI**: "아이디 찾기"(계좌번호+App Secret) / "비밀번호 찾기"(아이디+계좌번호+App Secret) 패널.
 - **5-3 모바일 배지 미러**: "에이전트 통신 로그" 텍스트 우측에 상태 배지 부착(`#badgeMirror`).
 - **5-4 안전영역 패딩**: 등록 버튼이 홈 인디케이터/내비바와 겹치지 않게(`navigationBarsPadding`/`imePadding`, 웹 safe-area).
 - **5-5 입력 필드 정리**: 계정 이름(선택)·DART API Key 칸 제거(서버 소유 키 사용).
@@ -806,7 +816,7 @@ Compose UI 기반 Android 앱. 웹 대시보드와 동일한 백엔드를 사용
   XSS-안전 `<table>`로 렌더(`_renderAgentContent()`) → 표가 정상 표시.
 
 ### 핵심 화면
-- **사이드바** (사장 피드백 모바일 #1): `statusBarsPadding()` 적용해 X 닫기 버튼이 상태바와 안 겹침. LazyColumn으로 전체 에이전트(9 + 3) 스크롤. 뉴스 피드는 별도 탭으로 이동했다는 안내 표시
+- **사이드바** (사장 피드백 모바일 #1): `statusBarsPadding()` 적용해 X 닫기 버튼이 상태바와 안 겹침. LazyColumn으로 전체 에이전트(8명, 산하 팀장 폐지) 스크롤. 뉴스 피드는 별도 탭으로 이동했다는 안내 표시
 - **대시보드** (사장 피드백 모바일 #2): 평소엔 핵심 3개 박스(장 상태 / 완료 사이클 / 실매매 체결)만 한 줄로, **▾ V 토글** 클릭 시 나머지 5개 박스(세션/시간/감지 뉴스/다음 사이클/전략) 펼침 → 통신 로그 가시성 확보
 - **에이전트 통신 로그** (사장 피드백 모바일 #3): `cleanLog()` 정규식으로 `**`, `##`, `---`, `|...|`, ` ``` ` 마크다운 잔여물 자동 제거
 - **수익률 탭 — 거래 내역 클릭 펼침** (사장 피드백 5~6차):
@@ -849,8 +859,15 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | POST | `/api/start` / `/api/stop` | 감시 시작 / 중지 |
 | POST | `/api/ceo` | 사장 직접 지시 (`@에이전트명`) |
 | POST | `/api/register` / `/api/login` / `/api/logout` | 계정 등록 / 로그인 / 로그아웃 |
-| POST | `/api/recover_id` | **아이디 찾기**(공개) — KIS Key+Secret+OpenRouter Key 3인자 일치 시 username 반환 |
-| POST | `/api/recover_password` | **비밀번호 재설정**(공개) — username + 3인자 일치 시 새 비번 설정 (정책 선검증) |
+| POST | `/api/recover_id` | **아이디 찾기**(공개) — 계좌번호 + App Secret 2인자 일치 시 username 반환 |
+| POST | `/api/recover_password` | **비밀번호 재설정**(공개) — username + 2인자 일치 시 새 비번 설정 (정책 선검증) |
+| GET | `/api/me` | 현재 계정 정보 — 아이디·마스킹 키·`is_admin`·활성 계정 |
+| POST | `/api/profile/password` | **프로필** — 비밀번호 변경 (현재 비번 확인) |
+| POST | `/api/profile/credentials` | **프로필** — API 자격증명 부분 변경 (변경분만 재검증, 활성 계정이면 즉시 재주입) |
+| GET/POST | `/api/profile/directives` · DELETE `/api/profile/directives/{id}` | **프로필** — 상시 지시사항 조회/추가/삭제 (본인 계정) |
+| POST | `/api/profile/delete_account` | **프로필** — 회원 탈퇴 (비번 확인 + 단독 ADMIN 보호 + 프로필 폴더 삭제) |
+| GET | `/api/admin/members` | **ADMIN 전용** — 회원 현황(읽기전용: 아이디·ADMIN 여부·모의/실거래) |
+| POST | `/api/admin/members/delete` | **ADMIN 전용** — 회원 완전 삭제 (본인·ADMIN 보호) |
 | GET | `/api/coresight/pending` | **관리자 전용** — Coresight 승인 대기 항목 (비관리자 403) |
 | POST | `/api/coresight/approve` / `/api/coresight/reject` | **관리자 전용** — 항목 승인(→상시 지시 승격)/거절 |
 | GET | `/api/balance` | 통합 포트폴리오 — 국내·해외·채권·펀드 + 예수금/총평가 |
@@ -860,14 +877,14 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | POST | `/api/trades/clear` | **거래 내역만** 초기화 (시스템 로그는 유지) |
 | GET | `/api/history` | 분석 사이클 이력 |
 | GET | `/api/events?limit=N` / POST `/api/events/clear` | 통합 이벤트 로그 / 전체 초기화 |
-| GET | `/api/agents` | 에이전트 9명 + 모델 |
+| GET | `/api/agents` | 에이전트 8명 + 모델 (산하 팀장 폐지 후) |
 | GET | `/api/dart?corp_name=X&days=N` | DART 공시 |
 | GET | `/api/price/kr/{code}` / `/api/price/us/{ticker}` | 국내 / 해외 현재가 (US는 거래소 자동 탐지) |
 | GET | `/api/rank/volume` | 거래량 순위 |
 | GET | `/api/strategy` / POST `/api/strategy` | 활성 전략·프리셋 조회 / 변경 (커스텀 params 지원) |
 | POST | `/api/strategy/preset` / DELETE `/api/strategy/preset/{name}` | 사용자 정의 프리셋 저장/삭제 |
 | GET | `/api/cycles?limit=N&offset=N` / `/api/cycles/{id}` | SQLite에 영속화된 분석 사이클 |
-| GET | `/api/ops_history?limit=N` | 운용지원실장(+ 산하 팀장) 자동 수정 이력 |
+| GET | `/api/ops_history?limit=N` | 운용지원실장 진단·조정 제안 이력 (코드 자가수정 폐지 후) |
 | GET | `/api/alerts?limit=N&level=CRITICAL` | **운영자 실패 알림** — 조용히 삼켜졌던 주문/체결/equity/루프 실패 표면화 [신규] |
 | GET | `/api/metrics?window_sec=N` | **메트릭 집계** — 사이클 소요시간·주문 성공/실패·오류 카운트 [신규] |
 | WS | `/ws` | 실시간 로그·에이전트 메시지·상태 배지 (+ `type:alert` 푸시) |
@@ -912,7 +929,7 @@ MODEL_ASSIGNMENTS = {
     "risk_guard":         "openrouter/free",
     "policy_filter":      "openrouter/free",
     "post_manager":       "moonshotai/kimi-k2.6",
-    "ops_support":        "deepseek/deepseek-v4-pro",         # 산하 팀장 3명도 동일 모델 공유
+    "ops_support":        "deepseek/deepseek-v4-pro",         # 진단·파라미터 조정 제안 (산하 팀장·코드 자가수정 폐지)
 }
 
 # 프롬프트 캐싱
@@ -936,10 +953,10 @@ AGENT_HISTORY_TURNS      = 3
 7. **실제 체결가 추적** — 추정값(`est_price`) 대신 holdings avg_price 변화로 매수 체결가 정확 역산, 매도는 직전 last_price 스냅샷. `fill_price`/`price_source: "actual"` 필드로 추적.
 8. **에이전트 응답 양식 통일** — 계량분석팀장은 5섹션·가중치 강제, 트레이더는 산문체·JSON 금지, 뉴스 큐레이터는 결정론 키워드 스코어, 뉴스 분류기는 decision tree + anti-examples. 일관성이 다음 단계 의사결정의 비교 가능성을 보장.
 9. **비용 최적화 레버** — 사이클 빈도(1h + 개장) · 매크로/DART/Tavily 캐시 · 무료 모델로 폴백 역할 위임 · 뉴스 큐레이터 결정론화 · API 비용 추적으로 사이클당 비용 가시화. 사이클당 $0.08–0.15, 월 $60–150 수준.
-10. **재시작 친화** — KIS 토큰 디스크 캐시, equity_curve/strategy_state 영속화, claude_response.json 무삭제 로그, `RESUME_ON_BOOT` 마커로 운용지원실장 코드 수정 후 자동 감시 재개.
-11. **운용지원실장 = 조정자, 산하 팀장 = 수정자** — 직접 코드를 만지지 않고 도메인 분류(investment/operations/finance) 후 산하 팀장 워커에 위임. spawn↔완료를 `OPS#N` 마커로 시각적 연결. 보호 패턴(FORBIDDEN_PATTERNS)이 핵심 매매 로직 침범을 막음.
+10. **재시작 친화** — KIS 토큰 디스크 캐시, equity_curve/strategy_state 영속화, claude_response.json 무삭제 로그. 계정·세션(`arquant_auth.db`)도 영속이라 재시작·코드 갱신 후 로그인 유지.
+11. **운용지원실장 = 진단·조언만** (2026-05-20 변경) — 코드 자가수정·서버 재시작·산하 팀장 위임을 전면 폐지하고, 읽기 전용 진단 + 프로필 한정 전략 파라미터 조정 제안만 수행. 코드가 핵심 매매 로직을 건드릴 경로 자체가 제거됨(가장 강한 안전장치는 "기능을 없애는 것").
 12. **조용한 실패 금지 + 검증된 결정론 핵심** (사장 피드백 2026-05-18) — 돈이 걸린 결정론 코드(주문 검증·사이징·파서)는 `pytest` 회귀 테스트로 고정, 의존성은 핀 고정, 머니패스의 삼켜진 예외는 `notifier`로 운영자에게 표면화(동작 보존·중복억제), 자가수정은 컴파일 실패 시 **디스크 전면 롤백**으로 부분 적용 불일치 차단.
-13. **지시는 프롬프트에만, 게이트는 불변** (2026-05-19) — 사장님 상시 지시·Coresight 승격 지시는 운용전략실장 LLM 프롬프트에만 주입되고 `agents/guardrails.py` 결정론 리스크 게이트는 절대 참조하지 않는다. 어떤 지시도 안전 게이트를 우회해 실매매를 강제할 수 없으며, 계정별로 완전 격리된다(uid 분리 파일 + sentinel 영구 삭제 보장).
+13. **지시는 프롬프트에만, 게이트는 불변** (2026-05-19) — 사장님 상시 지시·Coresight 승격 지시는 운용전략실장 LLM 프롬프트에만 주입되고 `agents/guardrails.py` 결정론 리스크 게이트는 절대 참조하지 않는다. 어떤 지시도 안전 게이트를 우회해 실매매를 강제할 수 없으며, 계정별로 완전 격리된다(uid 분리 파일 + tombstone 영구 삭제 보장).
 14. **신호 없음 ≠ 악재 없음** (2026-05-19) — DART 조회 실패(`QUERY_FAILED`)를 공시 부재(`NO_DISCLOSURE`)와 엄격히 구분하고, 재무상태표가 회계항등식을 깨면(`IMPOSSIBLE`) 그 수치로 부실 판정을 내리지 않고 `QUERY_FAILED`로 격상. 데이터 결손을 안전 신호로 오독하지 않는다.
 
 ---
@@ -976,7 +993,9 @@ python3.11 -m backtest.report
 - ⚠️ **정직성 경계**: LLM 종목 선정은 오프라인 재현 불가 → 진입 신호는 고정 SMA 프록시로 통일하고 **프리셋의 결정론 규칙(사이징·익절·손절·MDD 차단)만** 비교. 절대 수익률이 아니라 *프리셋 간 상대 리스크/회전율* 로만 해석.
 - 검증 결과 프리셋 스펙트럼이 설계대로 단조(방어형 MDD 최소·샤프 최고 → 초공격형 수익률 최대·MDD 최대).
 
-### 6) 자가수정 안전 강화 (`infra/ops_support_worker.py`)
+### 6) 자가수정 안전 강화 (`infra/ops_support_worker.py`) — 2026-05-20 기능 자체 폐지
+> ⚠️ **운용지원실장 코드 자가수정은 2026-05-20 사장 지시로 RETIRED**. 아래 가드(전면 롤백·변경 크기 상한 등)는
+> 코드에 남아 있으나 `run()`에서 호출되지 않는다. 가장 강한 안전장치 = "수정 기능을 제거"한 것. 이력 참고용으로 남김.
 - **전면 롤백**: 최종 컴파일 실패 시 그 플랜이 만든 *모든* 변경을 원장 역순으로 백업 원복(기존엔 깨진 파일이 디스크에 남아 다음 재기동 시 전체 다운).
 - `append`도 백업, **변경 크기 상한**(`MAX_CHANGE_BYTES`/`MAX_NET_NEW_LINES`)으로 작은 앵커로 파일 전체 갈아엎기 차단.
 - 롤백 발생 시 `notifier` CRITICAL 알림.

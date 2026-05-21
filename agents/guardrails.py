@@ -141,8 +141,7 @@ def _check_single_order(o: Dict[str, Any], bp: Dict[str, Any], price_map: Dict[s
             # cycle-level aggregate budget (원화 환산 누적)
             if cash > 0 and (cycle_state.get("spent", 0.0) + notional_krw) > cash * MAX_CYCLE_BUDGET_RATIO:
                 issues.append(f"사이클 누적 매수예산({cash*MAX_CYCLE_BUDGET_RATIO:,.0f}원) 초과")
-    else:
-        warnings.append("매도 주문 — 보유수량 확인은 브로커 단에서 수행")
+    # 사장 지시 2026-05-21: 매도 경고("보유수량 확인은 브로커 단에서 수행") 출력 제거 — sell 은 별도 경고 없이 통과.
 
     status = "REJECTED" if issues else "APPROVED"
     if status == "APPROVED" and side == "buy":

@@ -150,6 +150,8 @@ class Req(BaseModel):
     directive: Optional[str] = None
 class CeoReq(BaseModel):
     message: str
+class CostModeReq(BaseModel):
+    mode: str                       # h | d | m | total — 우상단 API 비용 표시 합산 모드(프로필별)
 class RegisterReq(BaseModel):
     username: str                   # 사용자가 정하는 아이디 (중복 불가)
     password: str                   # 10자 이상 + 특수문자 1개 이상
@@ -476,17 +478,23 @@ async def switch_account(req: SwitchReq):
 async def health(): return {"status":"ok","service":"ArQuant v1.0","timestamp":datetime.now().isoformat()}
 
 @app.get("/api/status")
-async def status():
+async def status(request: Request):
     from main_swarm import get_swarm
     s = get_swarm().get_status()
     # Expose whether the background task is actively running so frontend can sync buttons on reconnect
     s["is_running"] = bool(_task and not _task.done())
-    # 사장 피드백 2026-05-15: 최근 사이클 API 비용 (USD 추정)
+    # 사장 지시 2026-05-21: API 비용 — 시간(/h)·일(/d)·월(/m)·총누적 요약 + 보는 사람(세션)의 표시 모드.
+    _empty = {"usd": 0.0, "calls": 0}
     try:
-        from agents.base_agent import get_api_cost_last_cycle
-        s["api_cost"] = get_api_cost_last_cycle(seconds_back=3600.0)
+        from agents.base_agent import cost_summary
+        import runtime
+        _uid = getattr(request.state, "user_id", None)
+        cs = cost_summary()
+        cs["mode"] = runtime.cost_display_mode(_uid)
+        s["api_cost"] = cs
     except Exception:
-        s["api_cost"] = {"cost_usd": 0.0, "calls": 0, "window_sec": 3600.0}
+        s["api_cost"] = {"h": dict(_empty), "d": dict(_empty), "m": dict(_empty),
+                         "total": dict(_empty), "mode": "h"}
     # 운용지원실장 피드백 on/off 토글 상태 (프로필별) — 봇이 구동 중인 활성 계정 기준.
     try:
         import runtime
@@ -511,9 +519,22 @@ async def stop():
 
 @app.post("/api/ceo")
 async def ceo_command(req: CeoReq):
+    # 사장 지시 2026-05-21: 저장 여부는 체크박스 대신 ceo_directive 안에서 에이전트가
+    # 지시 내용·결과로 자동 판단해 standing_directive 로 저장한다(자동 판단 경로).
     from main_swarm import get_swarm
     resp = await get_swarm().ceo_directive(req.message)
     return {"response": resp}
+
+@app.post("/api/cost_mode")
+async def cost_mode_set(req: CostModeReq, request: Request):
+    """우상단 API 비용 표시 합산 모드 — 프로필(세션 사용자)별 저장."""
+    uid = _uid_or_403(request)
+    import runtime
+    try:
+        mode = runtime.set_cost_display_mode((req.mode or "").strip(), uid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "mode": mode}
 
 @app.get("/api/history")
 async def history():
@@ -732,6 +753,78 @@ async def equity(limit: int = 500, view: str = "realtime"):
     v = view if view in ("realtime", "daily", "monthly") else "realtime"
     return {"series": get_equity_series(limit, v), "view": v}
 
+@app.get("/api/performance")
+async def performance():
+    """수익률 탭 KPI 카드 — 누적·오늘·주·월 수익(원/%), MDD, 승률, 평균 보유일."""
+    from main_swarm import performance_kpis
+    return performance_kpis()
+
+@app.get("/api/benchmark")
+async def benchmark(view: str = "daily"):
+    """벤치마크 곡선 — KOSPI·NASDAQ 지수를 자산곡선 시작 평가액에 리베이스해 겹쳐 보여준다.
+    사장 지시 2026-05-21:
+      • 날짜(ts_kst) 기준 정렬이라 realtime/daily/monthly 모든 뷰에서 동작(realtime 은 일별 종가의 계단선).
+      • 첫 equity 날짜에 지수 데이터가 없어도, 지수가 존재하는 첫 공통 날짜에 리베이스해 표시(과거 버그 수정).
+      • NASDAQ 은 QQQ(나스닥100 ETF) 일봉을 프록시로 사용."""
+    from main_swarm import get_equity_series, get_broker
+    v = view if view in ("realtime", "daily", "monthly") else "daily"
+    series = get_equity_series(limit=600, view=v)
+    if len(series) < 2:
+        return {"benchmarks": []}
+
+    def valof(p):
+        x = p.get("adj_total_eval")
+        return x if x is not None else p.get("total_eval")
+
+    def date_of(p):
+        return str(p.get("ts_kst") or p.get("label") or "")[:10]
+
+    base_val = valof(series[0])
+    if not base_val:
+        return {"benchmarks": []}
+
+    broker = get_broker()
+    out = []
+    # (표시명, fetch 코루틴) — KOSPI: 국내지수 일봉, NASDAQ: QQQ 미국 ETF 일봉
+    async def _fetch(kind):
+        try:
+            return await (broker.kr_index_daily(index_code="0001", days=200) if kind == "kr"
+                          else broker.us_daily_chart("QQQ", days=200))
+        except Exception:
+            return []
+    for name, kind in (("KOSPI", "kr"), ("NASDAQ", "us")):
+        rows = await _fetch(kind)
+        if not rows:
+            continue
+        rows = sorted(rows, key=lambda r: r["date"])
+
+        def close_on_or_before(ds, _rows=rows):
+            c = None
+            for r in _rows:
+                if r["date"] <= ds:
+                    c = r["close"]
+                else:
+                    break
+            return c
+
+        base_idx = None
+        for p in series:                       # 지수 데이터가 있는 첫 공통 날짜에 리베이스
+            c = close_on_or_before(date_of(p))
+            if c:
+                base_idx = c
+                break
+        if not base_idx:
+            continue
+        line = []
+        for p in series:
+            c = close_on_or_before(date_of(p))
+            if c is None:
+                continue
+            line.append({"label": p.get("label"), "value": base_val * (c / base_idx)})
+        if len(line) >= 2:
+            out.append({"label": name, "series": line})
+    return {"benchmarks": out}
+
 @app.get("/api/trades")
 async def trades(limit: int = 500):
     """All real trade events (executed/failed), newest first — 전체 거래 내역."""
@@ -840,8 +933,12 @@ SD = Path(__file__).parent / "static"; SD.mkdir(exist_ok=True)
 
 @app.get("/", response_class=HTMLResponse)
 async def dash():
+    # 사장 지시 2026-05-21: 모바일 WebView가 옛 index.html을 캐시해 UI 수정이 안 보이던 문제 —
+    # 대시보드 HTML은 항상 최신을 받도록 캐시 금지(파일은 작아 매 요청 디스크 읽기 부담 없음).
     p = SD / "index.html"
-    return HTMLResponse(content=p.read_text(encoding="utf-8") if p.exists() else "<h1>ArQuant v1.0</h1>")
+    content = p.read_text(encoding="utf-8") if p.exists() else "<h1>ArQuant v1.0</h1>"
+    return HTMLResponse(content=content, headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"})
 
 if SD.exists(): app.mount("/static", StaticFiles(directory=str(SD)), name="static")
 

@@ -351,6 +351,13 @@ class KISBroker:
         if cached and not holdings and total > cash + 5000 and cached.get("holdings"):
             snap["holdings"] = cached["holdings"]
             snap["holdings_stale"] = True
+            # 사장 지시 2026-05-21: KIS가 보유목록을 빈 채 주면서 nass_amt(총평가)를 부풀려
+            # 반환하는 글리치 폴(보유=0인데 총평가−예수금이 큼) → 자산곡선·주문 사이징이 튄다.
+            # 보유목록뿐 아니라 총평가도 직전 정상 스냅샷 값으로 유지해 안정화한다.
+            prev_total = float((cached.get("buying_power") or {}).get("total_eval") or 0.0)
+            if prev_total > 0:
+                snap["buying_power"]["total_eval"] = prev_total
+                snap["buying_power"]["total_stale"] = True
         # Transient cash=0 protection (관측된 버그 2026-05-14 09:58): KIS가 잔고는 정상이지만
         # 예수금 필드 3개(D0/D1/D2) 모두 0으로 반환하는 케이스가 있다. 이 경우 신규 매수가
         # 통째로 막힘. 캐시된 직전 cash가 있으면 그것을 유지하고 stale 플래그를 단다.
@@ -500,6 +507,38 @@ class KISBroker:
             logger.warning(f"[해외원화평가] CTRP6504R 실패: {e}")
             return {"ok": False, "krw_value": 0.0, "exrt": 0.0}
 
+    # 사장 지시 2026-05-21: 해외 원화평가 캐시 — KIS 해외잔고 조회가 간헐 실패하면 US 평가가
+    # 통째로 빠져 통합 총평가가 ~16% 급락(자산곡선 -16% 글리치)한다. 마지막 정상값을 디스크에
+    # 영속해 일시적 조회 실패를 메우고(재시작 콜드스타트 포함), 실제 매도(조회 성공+평가 0)면
+    # 즉시 캐시를 비운다.
+    _OVERSEAS_CACHE_TTL = 7200  # 2시간 — 일시 실패 보강용(실제 매도는 즉시 반영되므로 무관)
+
+    def _overseas_cache_path(self) -> Path:
+        return Path(__file__).resolve().parent.parent / "data" / "overseas_krw_cache.json"
+
+    def _get_overseas_cache(self):
+        c = getattr(self, "_overseas_krw_cache", None)
+        if c is not None:
+            return c
+        try:
+            p = self._overseas_cache_path()
+            if p.exists():
+                d = json.loads(p.read_text(encoding="utf-8"))
+                self._overseas_krw_cache = (float(d.get("krw") or 0.0), float(d.get("ts") or 0.0))
+                return self._overseas_krw_cache
+        except Exception:
+            pass
+        self._overseas_krw_cache = (0.0, 0.0)
+        return self._overseas_krw_cache
+
+    def _set_overseas_cache(self, krw: float, ts: float) -> None:
+        self._overseas_krw_cache = (float(krw), float(ts))
+        try:
+            self._overseas_cache_path().write_text(
+                json.dumps({"krw": float(krw), "ts": float(ts)}, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
     async def portfolio_holdings(self) -> Dict:
         """대시보드 '종목 포트폴리오' — 국내주식 + 해외주식 + 국내채권 + 펀드 통합 잔고.
         kr_account_snapshot()의 국내주식 잔고를 기준으로 나머지를 best-effort 병합한다.
@@ -539,16 +578,31 @@ class KISBroker:
         #    않는다. USD 보유가 있으면 present-balance(원화환산 평가합계)를 더해 총자산을 맞춘다.
         #    + 각 USD 종목에 원화환산 평가액(krw_value)을 부여(프론트 표시용). ──
         bp = dict(snap["buying_power"])
-        if any(h.get("ccy") == "USD" for h in holdings):
-            pk = await self._overseas_present_krw()
-            if pk["ok"] and pk["krw_value"] > 0:
-                bp["total_eval"] = self._num(bp.get("total_eval")) + pk["krw_value"]
-                bp["overseas_krw"] = pk["krw_value"]
+        _now = time.time()
+        _us_in_holdings = any(h.get("ccy") == "USD" for h in holdings)
+        # 항상 권위 조회(ok 플래그 보유)로 US 원화평가를 확인 — 실패/진짜없음/정상을 구분해
+        # 곡선·총평가가 조회 실패로 ~16% 급락하지 않게 한다.
+        pk = await self._overseas_present_krw()
+        krw = None
+        if pk["ok"] and pk["krw_value"] > 0:
+            krw = pk["krw_value"]                         # 조회 성공 + 평가 있음 = 권위값
+            self._set_overseas_cache(krw, _now)
+            if pk["exrt"] > 0:
                 bp["fx_rate"] = pk["exrt"]
-                if pk["exrt"] > 0:
-                    for h in holdings:
-                        if h.get("ccy") == "USD":
-                            h["krw_value"] = round(self._num(h.get("qty")) * self._num(h.get("cur_price")) * pk["exrt"])
+                for h in holdings:
+                    if h.get("ccy") == "USD":
+                        h["krw_value"] = round(self._num(h.get("qty")) * self._num(h.get("cur_price")) * pk["exrt"])
+        elif pk["ok"] and pk["krw_value"] == 0 and not _us_in_holdings:
+            self._set_overseas_cache(0.0, _now)           # 조회 성공 + 평가 0 + 보유목록도 US 없음 = 실제 매도 → 캐시 무효화
+        else:
+            # 조회 실패(ok=False) 또는 모순(보유목록엔 US인데 평가 0) → 최근 캐시로 보강(곡선 안정)
+            _ck, _ct = self._get_overseas_cache()
+            if _ck > 0 and (_now - _ct) < self._OVERSEAS_CACHE_TTL:
+                krw = _ck
+                bp["overseas_krw_stale"] = True
+        if krw and krw > 0:
+            bp["total_eval"] = self._num(bp.get("total_eval")) + krw
+            bp["overseas_krw"] = krw
         return {"buying_power": bp, "holdings": holdings,
                 "holdings_stale": snap.get("holdings_stale", False), "ok": snap.get("ok", False)}
 
@@ -598,6 +652,33 @@ class KISBroker:
                     "FID_PERIOD_DIV_CODE":"D"}) as r:
             data = (await r.json()).get("output2",[])
         return f"[업종지수 {sector_code}] {len(data)}일 데이터 조회 완료"
+
+    async def kr_index_daily(self, index_code: str = "0001", days: int = 40) -> List[Dict]:
+        """지수 일별 종가 (KOSPI=0001, KOSDAQ=1001). 벤치마크 오버레이용.
+        반환: [{"date":"YYYY-MM-DD","close":float}, ...] 오름차순. 실패 시 []."""
+        tok = await self.token(); s = await self._s()
+        end = datetime.now(KST).strftime("%Y%m%d")
+        start = (datetime.now(KST) - timedelta(days=days * 2)).strftime("%Y%m%d")
+        out: List[Dict] = []
+        try:
+            async with s.get(f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice",
+                headers=self._h(tok, "FHKUP03500100"),
+                params={"FID_COND_MRKT_DIV_CODE":"U","FID_INPUT_ISCD":index_code,
+                        "FID_INPUT_DATE_1":start,"FID_INPUT_DATE_2":end,
+                        "FID_PERIOD_DIV_CODE":"D"}) as r:
+                data = (await r.json()).get("output2", []) or []
+            for x in data:
+                d = (x.get("stck_bsop_date") or "").strip()
+                c = x.get("bstp_nmix_prpr") or x.get("stck_clpr") or ""
+                if len(d) == 8 and c not in ("", None):
+                    try:
+                        out.append({"date": f"{d[:4]}-{d[4:6]}-{d[6:8]}", "close": float(c)})
+                    except (TypeError, ValueError):
+                        pass
+            out.sort(key=lambda r: r["date"])
+        except Exception as ex:
+            logger.warning(f"[지수일봉] {index_code} 조회 예외: {ex}")
+        return out
 
     # ═══════════════════ 해외주식 ═══════════════════
     # KIS overseas-price (HHDFS00000300) EXCD codes: NAS(나스닥) / NYS(뉴욕) / AMS(아멕스).
@@ -792,7 +873,12 @@ class KISBroker:
         async with s.post(f"{self.base_url}/uapi/overseas-stock/v1/trading/order",
             headers=self._h(tok,"TTTT1002U"), json=body) as r:
             d = await r.json()
-        return f"[US매수] {ticker} {qty}주 @ ${body['OVRS_ORD_UNPR']} → {_clean_kis_msg(d.get('msg1',''))}"
+        msg = _clean_kis_msg(d.get('msg1', ''))
+        # KR(kr_buy)과 대칭: rt_cd≠0(거부)면 [실패] 프리픽스 — 호출부 accepted 휴리스틱이
+        # "주문가능금액을 초과" 같은 거부를 잡아 잠정 체결로 오판하지 않게 한다.
+        return (f"[US매수] {ticker} {qty}주 @ ${body['OVRS_ORD_UNPR']} → {msg}"
+                if d.get("rt_cd") == "0" else
+                f"[US매수 실패] {ticker} {qty}주 → {msg}")
 
     async def us_sell(self, ticker: str, qty: int, price: float = 0, excd: str = "NASD") -> str:
         body = await self._overseas_order_body(ticker, qty, price, side="sell", excd=excd)
@@ -802,7 +888,10 @@ class KISBroker:
         async with s.post(f"{self.base_url}/uapi/overseas-stock/v1/trading/order",
             headers=self._h(tok,"TTTT1006U"), json=body) as r:
             d = await r.json()
-        return f"[US매도] {ticker} {qty}주 @ ${body['OVRS_ORD_UNPR']} → {_clean_kis_msg(d.get('msg1',''))}"
+        msg = _clean_kis_msg(d.get('msg1', ''))
+        return (f"[US매도] {ticker} {qty}주 @ ${body['OVRS_ORD_UNPR']} → {msg}"
+                if d.get("rt_cd") == "0" else
+                f"[US매도 실패] {ticker} {qty}주 → {msg}")
 
     async def us_balance(self) -> str:
         tok = await self.token(); s = await self._s(); c, p = self._acnt()
