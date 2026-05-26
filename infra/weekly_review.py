@@ -132,19 +132,44 @@ def build_review_summary() -> Dict[str, Any]:
     }
 
 
-def trigger_if_due() -> bool:
+def build_review_message(summary: Dict[str, Any], diag: str) -> str:
+    """주간 피드백 결과를 사장에게 '직접' 보고할 한국어 메시지 (사장 지시 2026-05-24).
+    이전엔 'data/...log 참고'로만 안내했으나, 무엇을 점검·진단했는지 메시지에 직접 담는다.
+    (운용지원실장이 산출하는 구체 파라미터 조정안은 분석 완료 후 별도 🛠 OPS 메시지로 이어진다.)"""
+    lines = [f"📅 [주간 피드백 루프] {summary.get('period', '최근 7일')} — 지난 7일 운영을 점검했습니다."]
+    lines.append(
+        f"• 사이클 {summary.get('cycles', 0)}회 (장중 {summary.get('market_open_cycles', 0)}회) · "
+        f"주문실행 {summary.get('with_orders', 0)}회 · 리스크승인 {summary.get('risk_approved', 0)}회")
+    lines.append(
+        f"• 후보→매수 전환 {summary.get('candidate_to_target_pct', 0):.0f}% "
+        f"(후보 {summary.get('candidates_picked', 0)} → 매수 {summary.get('targets_final', 0)})")
+    lines.append(
+        f"• 체결 {summary.get('trades_executed', 0)}건 · 실패 {summary.get('trades_failed', 0)}건")
+    er = summary.get("equity_return_pct_adj")
+    lines.append(f"• 7일 자산 수익률(입출금 보정) {er:+.2f}%" if isinstance(er, (int, float))
+                 else "• 7일 자산 수익률: 데이터 부족")
+    if diag:
+        lines.append(f"• 뉴스분류 진단: {diag}")
+    nt = summary.get("news_tuning") or {}
+    if nt.get("verdict"):
+        lines.append(f"• 가중치 점검: {nt.get('verdict')}")
+    for f in (nt.get("findings") or [])[:3]:
+        lines.append(f"   - {f}")
+    lines.append("→ 운용지원실장이 위 통계로 전략 파라미터 조정안을 분석 중입니다. "
+                 "실제 적용 내역은 이어지는 🛠 OPS 메시지로 직접 보고됩니다.")
+    return "\n".join(lines)
+
+
+def trigger_if_due(uid=None, is_admin: bool = False):
     """If it's Saturday 06:00+ KST and we haven't run this week, spawn the ops_support worker
-    with a 주간 리뷰 directive. Returns True if triggered."""
+    with a 주간 리뷰 directive. Returns a human-readable 한국어 summary message (truthy) if triggered,
+    else False (사장 지시 2026-05-24: '로그 참고' 대신 점검 내용 자체를 메시지로 보고).
+
+    Phase 2 멀티테넌트: 전역 활성 계정 폐지 → 호출자(오케스트레이터)가 자신의 uid/is_admin 을
+    명시적으로 넘긴다. 주간 조정은 그 프로필에 적용된다."""
     if not should_run_now():
         return False
-    # 활성 계정(프로필) 조회 — 주간 조정은 이 프로필에 적용된다.
-    try:
-        from infra import credentials as _creds
-        _act = _creds.current()
-        _auid, _admin = _act.get("user_id"), bool(_act.get("is_admin"))
-    except Exception as _e:
-        logger.warning(f"활성 계정 조회 실패 — uid 없이 진행: {_e}")
-        _auid, _admin = None, False
+    _auid, _admin = uid, bool(is_admin)
     # 운용지원 on/off 토글(프로필별) 존중 — 이 프로필이 OFF면 주간 피드백도 스킵.
     try:
         import runtime as _rt
@@ -186,7 +211,7 @@ def trigger_if_due() -> bool:
             start_new_session=True, cwd=str(PROJECT_ROOT))
         _write_last_run(datetime.now(KST))
         logger.info("주간 피드백 워커 spawn 완료")
-        return True
+        return build_review_message(summary, diag)
     except Exception as e:
         logger.warning(f"주간 피드백 트리거 실패: {e}")
         return False

@@ -41,10 +41,12 @@ CREATE TABLE IF NOT EXISTS cycles (
     bp_cash         REAL,
     bp_total_eval   REAL,
     bp_pnl_ratio    REAL,
-    error           TEXT
+    error           TEXT,
+    uid             INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_started ON cycles(started_at);
 CREATE INDEX IF NOT EXISTS idx_cycles_session ON cycles(session);
+CREATE INDEX IF NOT EXISTS idx_cycles_uid ON cycles(uid);
 
 CREATE TABLE IF NOT EXISTS holdings_history (
     code        TEXT NOT NULL,
@@ -67,6 +69,11 @@ def _get_conn() -> sqlite3.Connection:
         _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, isolation_level=None)
         _conn.row_factory = sqlite3.Row
         _conn.executescript(_SCHEMA)
+        # Idempotent migration: pre-Phase2 DBs lack the uid column.
+        cols = {r[1] for r in _conn.execute("PRAGMA table_info(cycles)").fetchall()}
+        if "uid" not in cols:
+            _conn.execute("ALTER TABLE cycles ADD COLUMN uid INTEGER")
+            _conn.execute("CREATE INDEX IF NOT EXISTS idx_cycles_uid ON cycles(uid)")
     return _conn
 
 def _now_kst() -> str:
@@ -87,7 +94,7 @@ def record_cycle(meta: Dict[str, Any]) -> Optional[int]:
             "candidate_codes","target_codes","sell_directives","orders_planned",
             "orders_executed","risk_approved","risk_report","macro_report",
             "quant_report","news_report","final_report","bp_cash","bp_total_eval",
-            "bp_pnl_ratio","error")
+            "bp_pnl_ratio","error","uid")
     vals = []
     for c in cols:
         v = meta.get(c)
@@ -107,13 +114,16 @@ def record_cycle(meta: Dict[str, Any]) -> Optional[int]:
         logger.warning(f"record_cycle 실패: {e}")
         return None
 
-def list_cycles(limit: int = 50, offset: int = 0) -> List[Dict]:
-    """Newest cycles first, paged. Returns raw rows (JSON fields un-parsed to keep wire cost low)."""
+def list_cycles(limit: int = 50, offset: int = 0, uid: Optional[int] = None) -> List[Dict]:
+    """Newest cycles first, paged. Returns raw rows (JSON fields un-parsed to keep wire cost low).
+    `uid` filters to one user's cycles (Phase 2); None returns all."""
     try:
+        where = "WHERE uid=?" if uid is not None else ""
+        args = ([int(uid)] if uid is not None else []) + [int(limit), int(offset)]
         with _lock:
             rows = _get_conn().execute(
-                "SELECT * FROM cycles ORDER BY id DESC LIMIT ? OFFSET ?",
-                (int(limit), int(offset))).fetchall()
+                f"SELECT * FROM cycles {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                tuple(args)).fetchall()
         return [dict(r) for r in rows]
     except Exception as e:
         logger.warning(f"list_cycles 실패: {e}")

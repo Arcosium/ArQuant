@@ -269,8 +269,9 @@ DART 결과를 `DartResult` 데이터클래스의 **3-state**로 구분한다(`t
          · **주문 전후 holdings 스냅샷** → 매수 체결가는 `(after_avg×after_qty − before_avg×before_qty) ÷ buy_qty`로 정확히 역산, 매도 체결가는 직전 `kr_last_price` 스냅샷 사용 (시장가 매도 = 직전 호가 근사)
          · 매도(사후관리 우선) + 매수 최대 N건
          · 초당 거래건수 제한 → 최대 3회 재시도 + 1.5~2.5s 페이스
-         · **접수 ≠ 체결** (사장 피드백 #8, #15): KR은 잔고 변동 확인 후에만 누적 카운트 + 사이클 카운트
-         · 미체결 주문은 5분 후 `_reverify_fills` 백그라운드 태스크로 재확인
+         · **확정 후 증가** (사장 지시 2026-05-21): 주문 직후 '즉시 체결'이 확인된 경우에만 누적 카운트 +1 (KR 2초 후 잔고 / US는 즉시 확인 불가)
+         · 미확정(접수만) 주문은 `_poll_fills_until_confirmed`가 **5분마다 반복** 확인 → 체결 확인 순간 +1 + 통신로그 '체결 확인됨'(type=`trade_executed`). 미체결 동안은 무메시지·무카운트, 해당 시장 마감 시 조용히 종료 (이전의 낙관적 +1/롤백 폐지)
+         · 접수 시 `order_submitted`(체결 신청)·확정 시 `trade_executed`(체결 완료) 이벤트 방송 → 모바일 알림 트리거
          · 각 trade event에 `fill_price`(실제) + `fill_currency` 필드 저장
        ↓
 [9.5] 트레이딩팀장 (deepseek-v4-flash) → **체결 결과 + 매매 사유를 한국어 산문으로 보고** (사장 피드백 3차)
@@ -371,16 +372,21 @@ DART 결과를 `DartResult` 데이터클래스의 **3-state**로 구분한다(`t
 
 ## 📈 평가금액 추이 (수익률 탭)
 
-`data/equity_curve.json`에 60s 최소 간격으로 `{ts, total_eval, cash, pnl_ratio, src}` 누적(2000 pt cap). 사이클 시점과 `/api/balance` 폴링 시점에 기록.
+`data/equity_curve.json`에 60s 최소 간격으로 `{ts(KST), total_eval, cash, pnl_ratio, src, kospi?, nasdaq?}` 누적(2000 pt cap). 사이클 시점과 5분 equity 폴러 시점에 기록.
 
 ### 3가지 뷰 토글
 | 뷰 | 정의 | 라벨 |
 |----|------|------|
-| **실시간** | KR 09:00~15:30 + US 22:30~05:00 KST 포인트만 + 10분 버킷의 마지막값으로 다운샘플 | `MM-DD HH:M0` |
+| **실시간** | KR 09:00~15:30 + US 22:30~05:00 KST 포인트만 + **5분 버킷**의 마지막값으로 다운샘플 (체결 폴링 주기와 동일) | `MM-DD HH:MM` |
 | **일별** | KST 일자별 마지막 포인트 | `YYYY-MM-DD` |
 | **월별** | KST 월별 마지막 포인트 | `YYYY-MM` |
 
-> naive 타임스탬프(과거 UTC 기록)는 자동으로 UTC로 간주 → KST 변환. 신규 기록은 `datetime.now(KST).isoformat()`(+09:00 박힘).
+> **시각(KST) 버그 수정 — 사장 보고 2026-05-21**: `record_equity`가 과거 `datetime.now()`(서버=UTC)로 ts를 저장해 차트 가로축이 9h 어긋났다 → 이제 `datetime.now(KST)`로 KST 저장. 기존 UTC 기록은 일회성 마이그레이션(`tools/migrate_equity_kst.py`, 공백포맷 +9h)으로 보정. `_ts_to_kst`는 공백포맷을 KST로 간주.
+
+### 벤치마크 오버레이 (KOSPI·NASDAQ — 사장 지시 2026-05-21)
+- 5분 equity 폴러가 잔고와 함께 **KOSPI 현재값**(`broker.kr_index_now` = 검증된 `kr_index_daily` 당일 종가 재사용)과 **NASDAQ 프록시**(`broker.us_last_price("QQQ")`)를 수집해 equity 포인트에 `kospi`/`nasdaq`로 저장.
+- `/api/benchmark`는 포인트에 저장된 지수값을 시작 평가액에 리베이스해 점선으로 겹쳐 표시 → equity와 지수가 **동일 타임스탬프에 정렬**되어 장중 일중 움직임이 그대로 나타난다(이전엔 일봉만 매핑해 장중 +0.00 평탄선 버그).
+- 미검증 분봉 API 추측은 폐기하고 검증된 현재가 API만 사용. 지수값이 없는 포인트는 벤치마크에서 건너뛴다(2개 이상 쌓이면 표시).
 
 ---
 
@@ -414,6 +420,11 @@ DART 결과를 `DartResult` 데이터클래스의 **3-state**로 구분한다(`t
   - 예: `1주문 예수금 사용 비율: 10 %`, `데이트레이딩 허용: ON/OFF`
 - **즉시 적용** 버튼 → `runtime.set_strategy("custom", custom={...})` 으로 라이브 오버라이드
 - **프리셋으로 저장** → `data/user_presets.json`에 영구 저장, 사이드바에 사용자 프리셋으로 노출(삭제 가능)
+
+#### 운용지원 토글 · 현재 적용 카드 · deprecated 정리 (2026-05-21)
+- **🛠 운용지원 ON/OFF 토글**: 헤더에서 전략 탭 **'적용 가능 전략' 헤더 우측**으로 이동(웹·모바일 공통, `index.html` `#opsToggle`; 기존 모바일 숨김 CSS 제거). 프로필별 `runtime.set_ops_feedback` — 켜면 운용지원실장이 해당 프로필 파라미터를 진단·조정.
+- **현재 적용 카드**: `/api/strategy`가 `active.ops_since`(= `profile_overrides.last_updated()`, `overrides.json` mtime)를 내려줘 "적용 시각 = 운용지원실장 마지막 파라미터 갱신"으로 표시. 요약(`_ppFullHtml`)은 핵심 6개가 아니라 **전체 tunable 파라미터**를 보여주며 갱신마다 전체 반영.
+- **deprecated 제거**: `ANALYSIS_NEWS_THRESHOLD`·`ANALYSIS_RAW_FALLBACK`을 `STRATEGY_TUNABLE_KEYS`·`STRATEGY_KEY_META`·전 프리셋·모듈 상수에서 완전 제거(tunable 19→**17개**). 저장된 옛 JSON의 잔존 키는 `key_order`에 없어 무시됨(마이그레이션 불필요).
 
 ### 데이트레이딩 룰 (사장 피드백 #24 — 0.5일 규칙 폐기)
 - 직전 버전에는 사후관리실장 프롬프트에 "0.5일 미만은 데이트레이딩 회피"가 하드코딩되어 있었으나, 사장 지시로 **전략 프리셋의 토글 파라미터**로 분리:
@@ -739,6 +750,8 @@ Cloudflare Access(Zero Trust)를 제거하고 **앱 자체 로그인**으로 전
 - **상시 지시사항**(`GET/POST/DELETE /api/profile/directives`): 본인 계정 상시 지시 추가·삭제(위 📌 섹션, tombstone 영구삭제).
 - **회원 탈퇴**(`POST /api/profile/delete_account`): **비밀번호 재확인** 후 계정·세션·자격증명·프로필 폴더(`data/profiles/<uid>`) 영구 삭제.
   단독 ADMIN 보호 — ADMIN 계정은 탈퇴 불가(영구 잠금 방지).
+- **모바일 알림 설정**(`GET/POST /api/notif_settings`, 2026-05-21): 모바일 푸시 4종(체결 신청/체결 완료/사이클 완료/장 마감)을 프로필별 on/off (`data/notif_settings.json`, `runtime.notif_settings`). 끈 종류는 모바일에만 미발송, 웹 통신 로그는 전체 표시.
+- **버튼 배치**(2026-05-21): **로그아웃** 버튼을 모달 하단 우측 정렬(회원 탈퇴 버튼 왼쪽)로 이동(기존 최상단 단독 → 하단).
 
 ### 회원 관리 (ADMIN 전용 — 2026-05-20 신규)
 ADMIN 계정에서만 프로필 모달에 **회원 관리** 섹션이 노출된다(비관리자는 엔드포인트 403).
@@ -824,7 +837,8 @@ Compose UI 기반 Android 앱. 웹 대시보드와 동일한 백엔드를 사용
   - `remember(t.ts, t.ticker) { mutableStateOf(false) }`로 행별 expand state 유지
   - 매수/매도/미체결 분기 + FIFO 매칭표 + 실현 손익 합계 (🟢/🔴 색상)
   - 실제 체결가는 "체결가 (KIS holdings 평균단가 차이로 역산 — 정확)" 라벨, 추정은 "추정 체결가 (시장가 → reason ≈X 근사치)" 라벨
-- **전략 탭** (사장 피드백 모바일 #4): 코드(`PER_ORDER_BUDGET_RATIO=0.1`) 대신 한국어 라벨(`1주문 예수금 사용 비율: 10%`)로 표시. 빌트인/사용자 프리셋 모두 노출
+- **전략 탭** (사장 피드백 모바일 #4): 코드(`PER_ORDER_BUDGET_RATIO=0.1`) 대신 한국어 라벨(`1주문 예수금 사용 비율: 10%`)로 표시. 빌트인/사용자 프리셋 모두 노출. **운용지원 ON/OFF 토글**이 '적용 가능 전략' 헤더 우측에 노출(웹·모바일 공통).
+- **푸시 알림 4종 + 백그라운드 지속** (2026-05-21): 네이티브 `WsManager`가 `/ws?client=mobile`로 구독하고, 인증 시 `WsRelayService`(foreground service)를 기동해 앱이 백그라운드여도 WS 연결을 유지. `TradeNotifier`가 `order_submitted`(체결 신청)·`trade_executed`(체결 완료)·`cycle_complete`(사이클 완료)·`market_close`(장 마감, 당일+누적 수익률) 4종을 로컬 알림으로 발사. on/off는 **서버가 `client=mobile` 연결에 한해** 프로필 `notif_settings`로 필터링(웹 연결은 전체 수신).
 
 ### 빌드 & 배포 (Compose UI는 컴파일되므로 변경 후 재빌드 + 재설치 필수)
 - Android Studio Hedgehog 이상, 또는:
@@ -883,6 +897,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 | GET | `/api/rank/volume` | 거래량 순위 |
 | GET | `/api/strategy` / POST `/api/strategy` | 활성 전략·프리셋 조회 / 변경 (커스텀 params 지원) |
 | POST | `/api/strategy/preset` / DELETE `/api/strategy/preset/{name}` | 사용자 정의 프리셋 저장/삭제 |
+| GET/POST | `/api/ops_feedback` | 운용지원 피드백 on/off (프로필별) — 전략 탭 '적용 가능 전략' 우측 토글 |
+| GET/POST | `/api/notif_settings` | **모바일 알림 4종 on/off (프로필별)** — 체결 신청/체결 완료/사이클 완료/장 마감 [신규 2026-05-21] |
 | GET | `/api/cycles?limit=N&offset=N` / `/api/cycles/{id}` | SQLite에 영속화된 분석 사이클 |
 | GET | `/api/ops_history?limit=N` | 운용지원실장 진단·조정 제안 이력 (코드 자가수정 폐지 후) |
 | GET | `/api/alerts?limit=N&level=CRITICAL` | **운영자 실패 알림** — 조용히 삼켜졌던 주문/체결/equity/루프 실패 표면화 [신규] |
@@ -948,7 +964,7 @@ AGENT_HISTORY_TURNS      = 3
    - 미국장에 KR 코드 추천 자동 제거
    - KR 마감 후 KR 주문 자동 차단
    - **사후관리실장은 현재 세션 시장 보유분만 분석**, 반대편 시장은 자동 보유
-5. **체결 ≠ 접수** — 접수만 된 주문은 카운트하지 않음. KR은 잔고 변동 확인 후, US는 잠정 카운트 후 5분 뒤 재확인 백그라운드 태스크로 보정.
+5. **체결 ≠ 접수 (확정 후 증가, 2026-05-21)** — 접수만으론 카운트 안 함. 즉시 체결 확인 시에만 +1, 미확정은 `_poll_fills_until_confirmed`가 5분마다 **반복** 확인해 체결 확인 순간 +1 + '체결 확인됨' 방송. 미체결 중엔 무메시지·무카운트(낙관적 +1/롤백 폐지).
 6. **가격 데이터 단일 권위 출처** — 모든 가격·등락률·지수값은 **검증된 네이버 크롤(글로벌 지수 10종)에서만** 인용. Tavily는 시황 해설·정책·심리·수급 분석만 활용 (가격 인용 금지). 매크로 분석가 프롬프트에 강제.
 7. **실제 체결가 추적** — 추정값(`est_price`) 대신 holdings avg_price 변화로 매수 체결가 정확 역산, 매도는 직전 last_price 스냅샷. `fill_price`/`price_source: "actual"` 필드로 추적.
 8. **에이전트 응답 양식 통일** — 계량분석팀장은 5섹션·가중치 강제, 트레이더는 산문체·JSON 금지, 뉴스 큐레이터는 결정론 키워드 스코어, 뉴스 분류기는 decision tree + anti-examples. 일관성이 다음 단계 의사결정의 비교 가능성을 보장.

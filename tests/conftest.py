@@ -33,10 +33,10 @@ def fixed_runtime_limits(monkeypatch):
 
     real_get = _rt.get
 
-    def _patched(key, default=None):
+    def _patched(key, default=None, uid=None):
         if key in FIXED_LIMITS:
             return FIXED_LIMITS[key]
-        return real_get(key, default)
+        return real_get(key, default, uid=uid)
 
     monkeypatch.setattr(_rt, "get", _patched)
     return FIXED_LIMITS

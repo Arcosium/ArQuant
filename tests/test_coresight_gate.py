@@ -61,8 +61,8 @@ async def test_query_coresight_nonadmin_returns_benign(monkeypatch):
     """비관리자 활성 계정 → 빈/거부 문자열 반환, 데이터 누출 없음."""
     import tools.coresight_rag as cr
 
-    # 활성 계정을 비관리자로 패치
-    monkeypatch.setattr(cr, "_is_admin_active", lambda: False)
+    # 활성 계정을 비관리자로 패치 (Phase 2: _is_admin_active(uid) 시그니처)
+    monkeypatch.setattr(cr, "_is_admin_active", lambda *a, **k: False)
 
     result = await cr.query_coresight("테스트 쿼리")
     assert "[Coresight] 비활성" in result
@@ -75,7 +75,7 @@ async def test_query_coresight_nonadmin_no_exception(monkeypatch):
     """비관리자 호출 시 예외 발생 없음 (fail-soft)."""
     import tools.coresight_rag as cr
 
-    monkeypatch.setattr(cr, "_is_admin_active", lambda: False)
+    monkeypatch.setattr(cr, "_is_admin_active", lambda *a, **k: False)
 
     # 예외 없이 문자열 반환되어야 한다
     try:
@@ -90,7 +90,7 @@ async def test_query_coresight_admin_path_no_crash(monkeypatch, tmp_path):
     """관리자 활성 계정 → admin 경로 진입. Coresight 파일 없어도 크래시 없음."""
     import tools.coresight_rag as cr
 
-    monkeypatch.setattr(cr, "_is_admin_active", lambda: True)
+    monkeypatch.setattr(cr, "_is_admin_active", lambda *a, **k: True)
     # CORESIGHT_PATH 를 빈 tmp 디렉토리로 패치
     import config as _cfg
     monkeypatch.setattr(_cfg, "CORESIGHT_PATH", str(tmp_path))
@@ -106,7 +106,7 @@ async def test_query_coresight_admin_finds_matching_file(monkeypatch, tmp_path):
     import tools.coresight_rag as cr
     import config as _cfg
 
-    monkeypatch.setattr(cr, "_is_admin_active", lambda: True)
+    monkeypatch.setattr(cr, "_is_admin_active", lambda *a, **k: True)
     monkeypatch.setattr(_cfg, "CORESIGHT_PATH", str(tmp_path))
 
     # 매칭 파일 생성
@@ -128,7 +128,7 @@ async def test_query_coresight_credentials_error_is_denied(monkeypatch):
     import tools.coresight_rag as cr
 
     # _is_admin_active 가 예외를 던져도 query_coresight 는 크래시하지 않아야 한다
-    def _raise():
+    def _raise(*a, **k):
         raise RuntimeError("credentials unavailable")
 
     monkeypatch.setattr(cr, "_is_admin_active", _raise)

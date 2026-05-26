@@ -180,53 +180,29 @@ _DIAGNOSE_SYSTEM_PROMPT = """당신은 ArQuant **운용지원실장** (별도 �
 directive는 팀장이 '무엇을·왜' 고치는지 명확히 이해할 만큼 구체적이되, 구현 방법(코드/문자열)은 지정하지 마십시오 — 그것은 팀장의 몫입니다."""
 
 
-_OPS_SYSTEM_PROMPT_BODY = """## 임무 (사장 피드백 2026-05-15 #16)
-1. 직전 사이클의 결과를 분석해 **전략 발전 방향**과 **버그 수정 사항**을 도출하십시오.
-2. 필요한 코드 변경을 JSON으로 출력하면 워커가 직접 적용하고 서버를 재시작합니다.
-3. 변경할 게 없으면 솔직하게 "변경 없음"이라고 답하십시오 — 무리한 수정은 시스템을 불안정하게 만듭니다.
-   ⚠️ 절대 "(요약 없음)" 같은 빈 응답은 보내지 마십시오 (사장 피드백 #9). 고칠 게 없으면 명시적으로 그 이유를 적으십시오.
-4. **(사장 지시 2026-05-19) 당신은 운용지원실장이 정의한 '문제·수용 기준'을 받아 *구현(HOW)을 스스로 설계*하는 팀장입니다.**
-   - 프롬프트 맨 위 [🔴 운용지원실장 지시] / [🔴 사장 직접 지시]는 *무엇이 왜 문제이고 무엇이 정상 동작인지*만 말합니다 — 그 문제를 해결할 search/replace는 **첨부된 실제 파일 본문을 직접 읽고 당신이 작성**하십시오 (실장은 코드를 지정하지 않습니다).
-   - search는 첨부 본문에 정확히 1회 일치해야 합니다 — 본문을 보고 실제로 일치하는 문자열을 직접 고르십시오 (지시문 안의 코드를 추측해 베끼지 말 것; 일치 실패의 원인입니다).
-   - 진단된 그 문제의 해결로 **범위를 한정**하십시오 — 무관한 리팩토링·추가 문제를 끌어들이지 말고, 재진단·전략 의견도 내지 마십시오.
-   - 지시가 보안 가드에 막히거나 기술적으로 불가하면 changes:[]로 두고 rationale에 그 사유만 적으십시오.
+_OPS_SYSTEM_PROMPT_BODY = """## 임무 (사장 지시 2026-05-22 — 파라미터 점검 전용)
+당신이 시스템을 개선할 수 있는 **유일한 수단은 이 프로필의 전략 튜닝 파라미터(param_overrides) 조정**입니다.
+소스 코드는 수정하지 않습니다(권한 없음). 직전 사이클(또는 주간) 실제 데이터를 근거로, 아래 '튜닝 파라미터'를
+조정해 운용을 개선하는 게 당신의 일입니다.
 
-## 코드 컨텍스트 (사장 지시 2026-05-14)
-프롬프트 끝에 ArQuant의 **모든 편집 가능 파일 원본**(ALLOWED_EDITS 화이트리스트, 약 11개 파일)이
-'===== <상대경로> ===== ... ===== /<상대경로> =====' 마커로 감싸져 첨부됩니다.
-search 문자열은 그 첨부 본문에서 **정확히 1회만 일치하는** 텍스트(공백·들여쓰기 포함 그대로 복사)
-여야 합니다 — 0회나 2회 이상이면 워커가 변경을 거부합니다.
+## 점검 방법 (반드시 이 순서로)
+1. 직전 사이클 데이터를 읽으십시오 — 매수/매도 결정, 체결/접수, 예수금·평가액, 퀀트점수, 발생한 에러, 보유 종목 손익.
+2. **아래 튜닝 파라미터를 하나씩** 그 데이터에 비춰 점검하십시오. 예시 질문:
+   - 손절이 너무 늦거나 빨랐나? → STOP_LOSS_PCT
+   - 익절을 너무 일찍/늦게 했나? → TAKE_PROFIT_PCT
+   - 한 종목 비중이 과했나? → CONSERVATIVE_STOCK_RATIO / TRIM_OVER_RATIO
+   - 매매가 과하거나 부족했나? → MAX_TRADES_PER_CYCLE / ENABLE_SELL_REBALANCE
+   - 주문 예산이 과/소했나, 체결 거부가 잦았나? → PER_ORDER_BUDGET_RATIO / MAX_CYCLE_BUDGET_RATIO / MIN_CASH_BUFFER
+   - 계좌 손실이 한도에 근접했나? → CONSERVATIVE_MDD
+   - 데이트레이딩·해외·파생 허용 정책이 실제 동작과 맞나? → ALLOW_DAY_TRADING / ALLOW_US_STOCKS / ALLOW_DERIVATIVES 등
+3. **데이터로 정당화되는 조정만** param_overrides 에 담으십시오 (근거 없는 추측·취향성 변경 금지, 한 번에 과도한 폭 금지).
+4. 점검 결과 정말 손볼 게 없으면 param_overrides 를 빈 객체로 두되, rationale 에 *어떤 파라미터들을 왜 그대로 두는지* 적으십시오 — "이상 없음" 한 줄로 끝내지 마십시오.
 
-## 절대 규칙 (워커가 코드로 강제 — LLM 우회 불가)
-- **자기 자신(infra/ops_support_worker.py) 수정 절대 금지** — 새 프로세스에서만 가능
-- .env, data/*.db, data/*.json, claude_response.json 수정 금지
-- config.py의 KIS_APP_KEY/KIS_APP_SECRET/KIS_ACCOUNT_NO 수정 금지
-- infra/kis_broker.py의 place_order/kr_buy/kr_sell/us_buy/us_sell 수정 금지
-- main_swarm.py의 _run_analysis_cycle/_build_orders/start_continuous 함수 시그니처 변경 금지
-- start_server.sh/stop_server.sh/supervise.sh 수정 금지
+## 소스/구조 문제를 발견하면
+파라미터로 못 고치는 로직·데이터·UI 버그가 보이면 **rationale 에 '제안'으로만** 적으십시오(무엇이·왜 문제인지).
+소스 수정·서버 재시작은 당신 권한 밖이며 사장이 직접 처리합니다 — changes 는 비워 두십시오.
 
-## 응답 형식
-변경이 필요하면 JSON 한 블록으로만 답하십시오:
-```json
-{
-  "summary": "변경 한줄 요약",
-  "rationale": "사이클 데이터의 어떤 신호 때문에 이 변경이 필요한가",
-  "changes": [
-    {
-      "file": "tools/market_data.py",
-      "action": "modify",
-      "search": "정확히 일치할 기존 문자열",
-      "replace": "교체할 새 문자열"
-    }
-  ],
-  "restart": true
-}
-```
-- action: modify(검색-치환) / append(파일 끝 추가) / create(새 파일)
-- search는 파일 안에 정확히 1회만 나타나야 함 — 0회나 2회 이상이면 변경 거부
-- restart: true이면 변경 적용 후 서버 재시작 트리거
-
-변경이 필요 없으면 단순히: `{"summary": "변경 없음", "rationale": "...", "changes": [], "restart": false}`
+(구체적인 허용 파라미터 키·단위·응답 JSON 형식은 아래에 이어집니다.)
 """
 
 
@@ -448,30 +424,68 @@ def gather_editable_files() -> str:
 
 
 # ─── Cycle data fetch (read-only) ─────────────────────────────────────────
-def fetch_cycle_context(cycle_id: Optional[int]) -> Dict[str, Any]:
-    """Pull recent cycles from cycles.db + the last few error/skip events from claude_response.json."""
+def fetch_cycle_context(cycle_id: Optional[int], uid: Optional[int] = None) -> Dict[str, Any]:
+    """Pull recent cycles from cycles.db + the last few error/skip events from this uid's log.
+
+    Phase 2 멀티테넌트 (사장 지시 2026-05-26): 사이클·이벤트 컨텍스트는 **이 워커를 트리거한
+    actor uid 의 데이터만** 읽는다. cycles 는 cycle_store.list_cycles(uid=uid) 로 필터하고,
+    에러·스킵 보조 이벤트는 전역 claude_response.json 대신 uid 별 trade_log.json 을
+    main_swarm.get_recent_events(uid=uid) 로 읽는다. uid 가 None 이면 (예: 활성 계정 없음)
+    다른 계정 데이터를 읽지 않도록 **빈 컨텍스트**로 처리한다 (deny-by-default)."""
     from infra import cycle_store
-    cycles = cycle_store.list_cycles(limit=5)
+    if uid is None:
+        # default-deny: actor uid 없으면 어느 계정 데이터도 읽지 않는다 (계정 혼선 방지).
+        logger.info("actor uid 없음 — 사이클 컨텍스트를 빈 값으로 처리 (계정 혼선 방지)")
+        return {"target_cycle": None, "recent_cycles": [], "recent_errors_skips": []}
+
+    cycles = cycle_store.list_cycles(limit=5, uid=uid)
     target = None
     if cycle_id is not None:
-        target = cycle_store.get_cycle(cycle_id)
+        _c = cycle_store.get_cycle(cycle_id)
+        # 지정 cycle_id 가 이 uid 소유일 때만 사용 — 타 계정 사이클 누출 방지.
+        if _c is not None and _c.get("uid") == uid:
+            target = _c
+        else:
+            logger.info(f"cycle_id={cycle_id} 가 uid={uid} 소유 아님 — 최신 사이클로 대체")
+            target = cycles[0] if cycles else None
     elif cycles:
         target = cycles[0]
-    # Recent events (errors / skips) for additional signal
+    # Recent events (errors / skips) for additional signal — uid 별 로그에서만 읽는다.
     recent_events: List[Dict] = []
     try:
-        evs_path = PROJECT_ROOT / "claude_response.json"
-        if evs_path.exists():
-            evs = json.loads(evs_path.read_text(encoding="utf-8"))
-            if isinstance(evs, list):
-                for e in evs[-200:]:
-                    t = e.get("type", "")
-                    if t in ("error", "execution_skipped", "trade_failed"):
-                        recent_events.append(e)
-                recent_events = recent_events[-20:]
+        import main_swarm
+        evs = main_swarm.get_recent_events(limit=200, uid=uid)
+        if isinstance(evs, list):
+            for e in evs:
+                t = e.get("type", "")
+                if t in ("error", "execution_skipped", "trade_failed"):
+                    recent_events.append(e)
+            recent_events = recent_events[-20:]
     except Exception as e:
-        logger.warning(f"events 로드 실패: {e}")
+        logger.warning(f"events 로드 실패(uid={uid}): {e}")
     return {"target_cycle": target, "recent_cycles": cycles, "recent_errors_skips": recent_events}
+
+
+def _summarize_exec_results(orders_executed) -> str:
+    """직전 사이클 주문 실행결과를 '체결확인 / 접수—체결폴링중(실패아님) / 미접수·반려' 로 명확히 구분.
+
+    버그 2026-05-22: 주문은 비동기 체결(접수 후 5분 폴링)인데 운용지원실장이 사이클 종료
+    스냅샷의 filled=false 를 '실패'로 단정해 MAX_TRADES_PER_CYCLE·ENABLE_CHEAP_FALLBACK 를
+    잘못 변경했다(실제로는 직후 정상 체결). accepted=true·filled=false 는 폴링 진행중이며
+    실패가 아님을 라벨로 못박는다."""
+    if not orders_executed:
+        return "없음"
+    out = []
+    for e in orders_executed:
+        tk = e.get("ticker", "?"); side = e.get("side", "?"); qty = e.get("qty", "?")
+        if e.get("filled"):
+            st = "체결확인"
+        elif e.get("accepted"):
+            st = "접수—체결폴링중(실패아님)"
+        else:
+            st = "미접수·반려"
+        out.append(f"{tk} {side} x{qty}: {st}")
+    return " | ".join(out)
 
 
 def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
@@ -494,7 +508,9 @@ def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
         parts.append(f"- 최종 매수: {tgt.get('target_codes')}")
         parts.append(f"- 사후관리실장 매도결정: {tgt.get('sell_directives')}")
         parts.append(f"- 계획 주문: {tgt.get('orders_planned')}")
-        parts.append(f"- 실행 결과: {tgt.get('orders_executed')}")
+        parts.append(f"- 실행 결과: {_summarize_exec_results(tgt.get('orders_executed'))}")
+        parts.append("  ⚠️ 주문은 비동기 체결이다 — '접수—체결폴링중(실패아님)'은 5분 폴링 진행중이지 실패가 아니다. "
+                     "미체결을 '실패'로 단정해 MAX_TRADES_PER_CYCLE·ENABLE_CHEAP_FALLBACK 등 파라미터를 바꾸지 말 것.")
         parts.append(f"- 리스크 승인: {bool(tgt.get('risk_approved'))}")
         parts.append(f"- 잔고: cash {tgt.get('bp_cash')} / total {tgt.get('bp_total_eval')} / pnl {tgt.get('bp_pnl_ratio')}")
         for fld in ("macro_report", "quant_report", "news_report", "final_report", "risk_report", "error"):
@@ -523,21 +539,14 @@ def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
                 parts.append(f"- {e.get('ts')} {e.get('type')}: {str(e.get('message',''))[:200]}")
 
     parts.append(
-        "\n[과제] 위 사이클 결과를 검토하여 ① 전략 발전 방향, ② 발견된 버그·이상 동작에 대한 코드 수정안을 제시하십시오. "
-        "변경이 필요 없으면 솔직하게 변경 없음으로 답하십시오. 보수적으로 — 검증 어려운 큰 리팩토링은 피하세요. "
-        "한 번에 1~3개의 작은 변경이 이상적입니다.\n\n"
-        "⚠️ search 문자열은 아래 첨부된 파일 내용에서 **정확히 1회만 나타나는** 텍스트여야 합니다 "
-        "(공백·들여쓰기·줄바꿈 포함 그대로 복사). 모호하면 search 범위를 더 넓혀 유니크하게 만드십시오. "
-        "TRUNCATED 표시 아래 영역은 search 대상으로 쓰면 안 됩니다.")
+        "\n[과제] 위 사이클 결과를 검토하여, **이 프로필의 전략 튜닝 파라미터(param_overrides)** 를 점검·조정하십시오. "
+        "시스템 프롬프트의 허용 키 목록을 보고 **각 파라미터를 하나씩** 사이클 데이터에 비춰 따져, "
+        "데이터로 정당화되는 조정만 param_overrides 에 담으십시오. 보수적으로 — 한 번에 과도한 폭/개수는 피하고, "
+        "정말 손볼 게 없으면 빈 객체로 두되 *어떤 파라미터를 왜 그대로 두는지* rationale 에 적으십시오. "
+        "파라미터로 못 고치는 소스/구조 버그는 rationale 에 '제안'으로만 적으십시오(소스 수정은 권한 밖).")
 
-    # 사장 지시 2026-05-14: 코드베이스 전체(화이트리스트)를 워커에 첨부해 LLM이 정확한 search/replace를 작성하게 함
-    parts.append("\n\n[ArQuant 편집 가능 코드베이스 스냅샷]")
-    try:
-        parts.append(gather_editable_files())
-    except Exception as e:
-        logger.warning(f"gather_editable_files 실패: {e}")
-        parts.append(f"(코드베이스 로드 실패: {e})")
-
+    # 사장 지시 2026-05-22: 운용지원실장은 param_overrides 만 조정하므로 소스 본문 첨부 불필요.
+    # (편집 가능 코드베이스 스냅샷 첨부를 제거 — 프롬프트 비대화 방지 + LLM을 소스 사고로 유도하지 않음)
     return "\n".join(parts)
 
 
@@ -746,7 +755,7 @@ def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
             logger.warning(f"profile_overrides.set_overrides 실패: {e}")
 
     if applied_ov:
-        head = f"✅ 이 프로필 전용 튜닝 {len(applied_ov)}건 반영 (소스/서버 불변, 다음 로그인 시 활성화)"
+        head = f"✅ 전략 파라미터 튜닝 {len(applied_ov)}건 반영 (다음 로그인 시 활성화)"
     elif proposed:
         head = f"📝 개선 제안 {len(proposed)}건 — 참고용 (자동 적용 안 함)"
     elif "변경 없음" in summary or "변경 사항 없음" in summary:
@@ -758,7 +767,7 @@ def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
     if rationale and not ("변경 없음" in summary and not applied_ov and not proposed):
         msg_lines.append(f"근거: {rationale[:500]}")
     for k, v in applied_ov.items():
-        msg_lines.append(f"  • {k} = {v}  (이 프로필 한정)")
+        msg_lines.append(f"  • {k} = {v}")
     if proposed:
         msg_lines.append("개선 제안(참고용):")
         for s in proposed[:5]:
@@ -781,20 +790,20 @@ def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
     else:
         logger.info("활성 계정 uid 없음 — 프로필 기록 생략 (서버 유휴 상태로 추정)")
 
-    # 대시보드 로그(claude_response.json)에도 남겨 사용자가 바로 확인
-    try:
-        evs_path = PROJECT_ROOT / "claude_response.json"
-        data = json.loads(evs_path.read_text(encoding="utf-8")) if evs_path.exists() else []
-        if not isinstance(data, list):
-            data = []
-        data.append({"ts": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                     "source": "system_event", "type": "agent_msg",
-                     "agent": display, "message": message})
-        if len(data) > 4000:
-            data = data[-4000:]
-        evs_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        logger.warning(f"claude_response.json append 실패: {e}")
+    # 대시보드 로그(uid 별 trade_log.json)에도 남겨 사용자가 바로 확인.
+    # Phase 2 멀티테넌트 (사장 지시 2026-05-26): 전역 claude_response.json 대신
+    # main_swarm.log_response_event(uid=actor_uid) 로 라우팅 → 해당 유저 대시보드에만 표시.
+    if actor_uid is not None:
+        try:
+            import main_swarm
+            main_swarm.log_response_event(
+                {"source": "system_event", "type": "agent_msg",
+                 "agent": display, "message": message},
+                uid=int(actor_uid))
+        except Exception as e:
+            logger.warning(f"log_response_event append 실패(uid={actor_uid}): {e}")
+    else:
+        logger.info("actor uid 없음 — 대시보드 로그 기록 생략 (계정 혼선 방지)")
 
 
 async def run(cycle_id: Optional[int], manual: Optional[str], role: str = "ops_support",
@@ -815,7 +824,7 @@ async def run(cycle_id: Optional[int], manual: Optional[str], role: str = "ops_s
     # trigger 분류 — 주간 리뷰 키워드 감지
     trigger = "weekly" if (manual and "주간 피드백 루프" in manual) else ("manual" if manual else "cycle")
 
-    ctx = fetch_cycle_context(cycle_id)
+    ctx = fetch_cycle_context(cycle_id, uid=actor_uid)
     if not ctx.get("target_cycle") and not manual:
         logger.info("분석할 사이클 데이터 없음 — 종료")
         return

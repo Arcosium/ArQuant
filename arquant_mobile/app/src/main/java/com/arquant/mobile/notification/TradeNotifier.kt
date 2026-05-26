@@ -11,11 +11,16 @@ import com.arquant.mobile.MainActivity
 import com.arquant.mobile.network.EventItem
 
 /**
- * 거래 체결/실패 시 시스템 푸시 알림을 전송한다.
+ * 거래 이벤트 시 시스템 푸시 알림을 전송한다 (사장 지시 2026-05-21 — 알림 4종 + 실패).
  *
- * - trade_executed → 🔼 매수 또는 🔻 매도 체결 알림 (HIGH 중요도)
+ * - order_submitted → 📨 체결 신청(주문 접수) 알림
+ * - trade_executed → 🔼 매수 또는 🔻 매도 체결 완료 알림 (HIGH 중요도)
  * - trade_failed → ⚠️ 주문 실패 알림
- * - cycle_complete → 사이클 완료 요약
+ * - cycle_complete → 🏁 사이클 완료 요약
+ * - market_close → 🔔 장 마감(당일·누적 수익률) 알림
+ *
+ * 어떤 종류를 받을지는 서버가 프로필 알림설정으로 1차 필터(client=mobile 연결)하고,
+ * 여기서는 받은 이벤트 타입에 맞는 알림을 발사한다.
  */
 object TradeNotifier {
 
@@ -27,6 +32,17 @@ object TradeNotifier {
 
     fun maybeNotify(context: Context, ev: EventItem) {
         when (ev.type) {
+            "order_submitted" -> {
+                val side = if (ev.side.lowercase() == "sell") "매도" else "매수"
+                val title = "📨 체결 신청 — ${ev.ticker}"
+                val body = cleanMsg(ev.message).ifBlank { "$side ${ev.qty}주 주문 접수 — 체결 확인 중" }
+                fire(context, title, body, ev.hashCode())
+            }
+            "market_close" -> {
+                val title = "🔔 장 마감"
+                val body = cleanMsg(ev.message).ifBlank { "장이 마감되었습니다" }
+                fire(context, title, body, ev.hashCode())
+            }
             "trade_executed" -> {
                 val side = if (ev.side.lowercase() == "sell") "매도" else "매수"
                 val icon = if (ev.side.lowercase() == "sell") "🔻" else "🔼"

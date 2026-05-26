@@ -1,19 +1,19 @@
-"""trade 이벤트 타입이 ok(잠정 체결 포함) 기준이어야 함 — 회귀 테스트.
+"""trade 이벤트 타입이 '확정 체결' 기준이어야 함 — 회귀 테스트.
 
-버그(2026-05-21 밤 로그): 실행부가 type 을 `filled` 기준으로 방송해, US 의
-'접수만(accepted, ok=True, filled=False)' 주문이 trade_executed 카운트에는
-포함되면서도 이벤트는 trade_failed 로 나갔다. get_trade_history 가 두 타입을
-모두 거래내역에 넣으므로 "성공으로 카운트됐는데 실패로 표시"되는 불일치가 생겼다.
+사장 지시 2026-05-21로 누적 카운트가 '확정 후 증가'로 바뀌면서, 실행부는 즉시 체결이
+확인된 주문(filled=True)만 trade_executed 로, 접수 실패(not accepted)만 trade_failed 로
+방송한다. 접수만 되고 미확인인 주문은 fill 이벤트를 내지 않고(order_submitted 만),
+_poll_fills_until_confirmed 가 체결을 확인한 그 시점에 trade_executed 를 낸다.
 
-요구 동작: 누적 체결 카운트(ok) 와 이벤트 타입이 일치해야 한다.
-  - ok=True  → trade_executed (체결 또는 US 잠정 접수)
-  - ok=False → trade_failed   (진짜 실패/거부)
+요구 동작: _trade_event_type 은 '확정 체결 여부'를 이벤트 타입으로 매핑한다.
+  - filled=True  → trade_executed (체결 확인)
+  - filled=False → trade_failed   (실패/거부)
 """
 from main_swarm import _trade_event_type
 
 
-def test_event_type_follows_ok_not_filled():
-    # US 접수만 된 주문: filled=False 라도 ok=True 면 executed
+def test_event_type_follows_confirmed_fill():
+    # 체결 확인된 주문 → executed
     assert _trade_event_type(True) == "trade_executed"
-    # 진짜 실패/거부: ok=False → failed
+    # 실패/거부 → failed
     assert _trade_event_type(False) == "trade_failed"

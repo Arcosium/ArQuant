@@ -109,12 +109,12 @@ def _bump_rollup(cost_usd: float, ts: float) -> None:
 
 
 def _record_api_call(model: str, agent: str, prompt_tokens: int, completion_tokens: int,
-                     ts: Optional[float] = None) -> float:
+                     ts: Optional[float] = None, uid: Optional[int] = None) -> float:
     """OpenRouter usage → 모델 단가로 비용 추정 → 회전식 로그 + 영속 롤업에 적재. 비용(USD) 반환."""
     ts = ts if ts is not None else time.time()
     in_rate, out_rate = _MODEL_PRICING.get(model, _DEFAULT_PRICING)
     cost = (prompt_tokens / 1_000_000.0) * in_rate + (completion_tokens / 1_000_000.0) * out_rate
-    _API_CALL_LOG.append({"ts": ts, "model": model, "agent": agent,
+    _API_CALL_LOG.append({"ts": ts, "model": model, "agent": agent, "uid": uid,
                           "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                           "cost_usd": cost})
     if len(_API_CALL_LOG) > _API_LOG_CAP:
@@ -154,15 +154,27 @@ class BaseAgent:
         system_prompt: str,
         model_key: str = "quant_analyst",
         tools: Optional[List[Dict[str, Any]]] = None,
+        injection: Optional[Dict[str, Any]] = None,
     ):
-        from config import (OPENROUTER_API_KEY, OPENROUTER_BASE_URL, MODEL_ASSIGNMENTS,
-                            AGENT_MAX_TOKENS, ENABLE_PROMPT_CACHE, AGENT_HISTORY_TURNS)
+        from config import (MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS, ENABLE_PROMPT_CACHE,
+                            AGENT_HISTORY_TURNS, OPENROUTER_API_KEY, OPENROUTER_BASE_URL)
         self.name = name
         self.role = role
         self.system_prompt = system_prompt
-        self.model = MODEL_ASSIGNMENTS.get(model_key, "deepseek/deepseek-v4-flash")
-        self.api_key = OPENROUTER_API_KEY
-        self.base_url = OPENROUTER_BASE_URL
+        inj = injection or {}
+        self.uid = inj.get("uid")
+        # Per-uid model override wins; else admin global override; else config default.
+        _ov = (inj.get("model_overrides") or {}).get(model_key) or ""
+        if not _ov:
+            try:
+                from infra import admin_config
+                _ov = admin_config.get_model_override(model_key)
+            except Exception:
+                _ov = ""
+        self.model = _ov or MODEL_ASSIGNMENTS.get(model_key, "deepseek/deepseek-v4-flash")
+        # Credentials: injected per-uid OpenRouter key, else config global (legacy/no-uid).
+        self.api_key = inj.get("openrouter_key") or OPENROUTER_API_KEY
+        self.base_url = inj.get("openrouter_base_url") or OPENROUTER_BASE_URL
         self.tools = tools or []
         self.conversation_history: List[Dict[str, str]] = []
         self._tool_functions: Dict[str, Callable] = {}
@@ -235,7 +247,7 @@ class BaseAgent:
                         error_text = await resp.text()
                         record_error(self.name, context=(
                             f"OpenRouter HTTP {resp.status} | model={self.model} | "
-                            f"resp={error_text[:600]}"))
+                            f"resp={error_text[:600]}"), uid=self.uid)
                         return f"[{self.name} 에러] API 호출 실패: {resp.status}"
 
                     data = await resp.json()
@@ -286,17 +298,17 @@ class BaseAgent:
                             else:
                                 record_error(self.name, context=(
                                     f"빈응답 재시도 실패 HTTP {_r2.status} | model={self.model} | "
-                                    f"max_tokens={_retry_max}"))
+                                    f"max_tokens={_retry_max}"), uid=self.uid)
                 except Exception as _re:
                     record_error(self.name, _re, context=(
-                        f"빈응답 재시도 예외 | model={self.model} | max_tokens={_retry_max}"))
+                        f"빈응답 재시도 예외 | model={self.model} | max_tokens={_retry_max}"), uid=self.uid)
 
             # 사장 피드백 2026-05-15: API 사용량 → 비용 추정 → 회전식 로그 + 영속 롤업 적재
             try:
                 _usage = (data.get("usage") or {})
                 _pt = int(_usage.get("prompt_tokens", 0) or 0)
                 _ct = int(_usage.get("completion_tokens", 0) or 0)
-                _record_api_call(self.model, self.name, _pt, _ct)
+                _record_api_call(self.model, self.name, _pt, _ct, uid=self.uid)
             except Exception as _ue:
                 # 클린코드 2026-05-19: 비용 추적 실패가 debug라 운영에서 안 보였음 → warning 승격.
                 logger.warning(f"[{self.name}] 사용량 추적 실패: {type(_ue).__name__}: {_ue!r}")
@@ -313,7 +325,7 @@ class BaseAgent:
         except Exception as e:
             # 사장 지시 2026-05-19: TimeoutError 등 str(e)='' 인 예외도 타입+repr+트레이스백을
             # 남겨 운용지원실장이 '어디서 왜' 났는지 진단할 수 있게 한다.
-            record_error(self.name, e, context=f"think() | model={self.model}")
+            record_error(self.name, e, context=f"think() | model={self.model}", uid=self.uid)
             return f"[{self.name} 에러] {type(e).__name__}: {str(e) or repr(e)}"
 
     def reset_history(self):

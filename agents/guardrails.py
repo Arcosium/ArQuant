@@ -8,7 +8,7 @@ from agents.base_agent import BaseAgent
 from infra.kis_broker import OrderDraft
 
 
-def create_risk_guard() -> BaseAgent:
+def create_risk_guard(injection=None) -> BaseAgent:
     """리스크관리실장 (Risk Guard) — DART 공시 기반 2차 재심.
 
     1차 검증(편중도·MDD·예수금 버퍼·사이클 예산·수량/사유)은 LLM 없이 ``validate_order_draft()``
@@ -22,6 +22,7 @@ def create_risk_guard() -> BaseAgent:
         name="리스크관리실장",
         role="risk_guard",
         model_key="risk_guard",
+        injection=injection,
         system_prompt="""당신은 ArQuant v1.0의 '리스크관리실장(Risk Guard)'입니다.
 
 ## 역할 — DART 공시 기반 2차 재심
@@ -88,13 +89,14 @@ def _extract_balance_numbers(balance_info: str) -> Dict[str, Optional[float]]:
 
 
 def _check_single_order(o: Dict[str, Any], bp: Dict[str, Any], price_map: Dict[str, float],
-                        cycle_state: Dict[str, float]) -> Dict[str, Any]:
+                        cycle_state: Dict[str, float], uid=None) -> Dict[str, Any]:
     """One order against the *conservative* gate set. `bp` = buying power snapshot
     {"cash","total_eval","pnl_ratio","ok"}; `price_map` = {ticker: last_price};
-    `cycle_state` accumulates {"spent": running notional this cycle}."""
+    `cycle_state` accumulates {"spent": running notional this cycle}.
+    `uid` 는 프로필(계정)별 전략 파라미터 선택용 — 리스크/사이징 수식은 불변, 값만 그 계정 기준."""
     import runtime
-    CONSERVATIVE_MDD = runtime.get("CONSERVATIVE_MDD"); CONSERVATIVE_STOCK_RATIO = runtime.get("CONSERVATIVE_STOCK_RATIO")
-    MIN_CASH_BUFFER = runtime.get("MIN_CASH_BUFFER"); MAX_CYCLE_BUDGET_RATIO = runtime.get("MAX_CYCLE_BUDGET_RATIO")
+    CONSERVATIVE_MDD = runtime.get("CONSERVATIVE_MDD", uid=uid); CONSERVATIVE_STOCK_RATIO = runtime.get("CONSERVATIVE_STOCK_RATIO", uid=uid)
+    MIN_CASH_BUFFER = runtime.get("MIN_CASH_BUFFER", uid=uid); MAX_CYCLE_BUDGET_RATIO = runtime.get("MAX_CYCLE_BUDGET_RATIO", uid=uid)
     ticker = str(o.get("ticker", "") or "").strip()
     side = str(o.get("side", "buy") or "buy").lower()
     reason = str(o.get("reason", "") or "")
@@ -119,7 +121,8 @@ def _check_single_order(o: Dict[str, Any], bp: Dict[str, Any], price_map: Dict[s
     # '사이클 매수예산 사용 194원'처럼 USD 금액이 원으로 잘못 표기되고, 단일종목 비중·예수금
     # 체크도 통화가 섞여 무력화되던 버그. 원화 환산 notional로 한도 검증 + 누적을 일원화.
     _is_kr_tk = ticker.isdigit() and len(ticker) == 6
-    _KRW_PER_USD = 1500.0  # rough; KIS 통합증거금 환산 (env에 환율 없을 때 폴백)
+    from tools.market_data import get_usdkrw
+    _KRW_PER_USD = get_usdkrw(1510.0)  # 사장 지시 2026-05-22: 5분 크롤 라이브 환율(폴백 1510)
     notional_krw = notional if _is_kr_tk else notional * _KRW_PER_USD
     cash = float(bp.get("cash", 0.0) or 0.0)
     total = float(bp.get("total_eval", 0.0) or 0.0) or cash
@@ -159,7 +162,8 @@ def _check_single_order(o: Dict[str, Any], bp: Dict[str, Any], price_map: Dict[s
 
 def validate_order_draft(order_json: Any, balance_info: Any = "",
                          buying_power: Optional[Dict[str, Any]] = None,
-                         price_map: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+                         price_map: Optional[Dict[str, float]] = None,
+                         uid=None) -> Dict[str, Any]:
     """Deterministic, LLM-free, *conservative* risk validation of a trader OrderDraft (batch).
 
     Accepts either a single order dict / JSON string, or a wrapper {"orders": [...]}.
@@ -200,7 +204,7 @@ def validate_order_draft(order_json: Any, balance_info: Any = "",
                         "pnl_ratio": (b.get("pnl_ratio") or 0.0), "ok": bool(b.get("ok"))}
     price_map = price_map or {}
     cycle_state: Dict[str, float] = {"spent": 0.0}
-    results = [_check_single_order(o if isinstance(o, dict) else {}, buying_power, price_map, cycle_state)
+    results = [_check_single_order(o if isinstance(o, dict) else {}, buying_power, price_map, cycle_state, uid=uid)
                for o in orders]
     approved = [r for r in results if r["status"] == "APPROVED"]
 
@@ -225,7 +229,8 @@ def validate_order_draft(order_json: Any, balance_info: Any = "",
                 px = f" @ {r['price']:,.0f}원 (≈{r['notional']:,.0f}원)"
             else:
                 # USD 표시 + 환산 원화도 함께 (총평가/예수금이 원화 기준이므로 비교용)
-                _krw_est = r["notional"] * 1500  # rough KRW estimate (env에 환율 없을 때 폴백)
+                from tools.market_data import get_usdkrw
+                _krw_est = r["notional"] * get_usdkrw(1510.0)  # 사장 지시 2026-05-22: 5분 크롤 라이브 환율
                 px = f" @ ${r['price']:,.2f} (≈${r['notional']:,.2f} / ≈{_krw_est:,.0f}원)"
         else:
             px = ""

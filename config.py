@@ -43,7 +43,7 @@ MODEL_ASSIGNMENTS = {
     "trader": "deepseek/deepseek-v4-flash",  # 사장 피드백 2026-05-15 (3차) — free 모델 말투 어색 → flash로 격상. 자연어 보고 품질 향상
     "risk_guard": "openrouter/free",                     # DART 공시 기반 재심 (룰 게이트는 파이썬, 파싱 실패 시 fail-open)
     # policy_filter 폐지(사장 피드백 2026-05-18) — 역할 risk_guard 통합
-    "post_manager": "moonshotai/kimi-k2.6",         # 사장 지시 2026-05-14 — 매도 타이밍 결정자, 고지능 모델로 격상
+    "post_manager": "deepseek/deepseek-v4-pro",     # 사장 지시 2026-05-24 — 매도 타이밍 결정자, kimi-k2.6에서 deepseek-v4-pro로 교체(안정성). ADMIN 오버라이드가 비더라도 이 기본값으로 적용
     "ops_support": "deepseek/deepseek-v4-pro",  # 사장 피드백 2026-05-15 — DeepSeek V4 Pro로 변경 (운용지원실장은 분류·조정만; 실제 코딩은 산하 팀장 워커가 수행)
 }
 
@@ -69,7 +69,7 @@ AGENT_MAX_TOKENS = {
     "trader":             1500,   # 사장 피드백 (3차) — 자연어 보고용. 체결 결과 요약 + 매매 이유 정리
     "risk_guard":         2200,   # DART 공시 읽고 종목별 재심 + 사유
     # policy_filter 폐지(2026-05-18)
-    "post_manager":      12000,   # moonshotai/kimi-k2.6 reasoning 모델 — chief_orchestrator와 동일 사유(2026-05-19)
+    "post_manager":      12000,   # deepseek-v4-pro(2026-05-24 교체) — chief_orchestrator와 동일 모델·동일 토큰 한도
     "ops_support":        8000,   # 코드 변경 JSON + 근거 설명 (사장 지시 2026-05-14 — 토큰 한도 상향)
 }
 ENABLE_PROMPT_CACHE = True            # Anthropic prompt caching via OpenRouter cache_control
@@ -81,9 +81,7 @@ DART_CACHE_TTL_SEC  = 24 * 60 * 60    # 1 day
 
 # Analysis-cycle trigger tuning.
 # 감시/재료성 뉴스 트리거는 폐지 — 단순히 1시간마다 사이클 1회 + 한국/미국 장 개장 시 누적 뉴스로 1회.
-# (ANALYSIS_NEWS_THRESHOLD / ANALYSIS_RAW_FALLBACK 는 전략 프리셋 호환을 위해 남겨두지만 트리거에는 미사용)
-ANALYSIS_NEWS_THRESHOLD = 10          # (deprecated — no longer triggers a cycle)
-ANALYSIS_RAW_FALLBACK   = 20          # (deprecated — no longer triggers a cycle)
+# (구버전 ANALYSIS_NEWS_THRESHOLD / ANALYSIS_RAW_FALLBACK 트리거 파라미터는 사장 지시 2026-05-21로 완전 제거)
 PERIODIC_CYCLE_SEC      = 1 * 60 * 60 # run a cycle this often while a market is open (1시간마다 1회)
 HEADLINE_DEDUP_RATIO    = 0.85        # difflib ratio above which two headlines are "the same"
 NEWS_PREFILTER_TRIGGER  = 40          # 누적 헤드라인이 이 수를 넘으면 큐레이터로 사전 선별
@@ -155,7 +153,6 @@ STRATEGY_TUNABLE_KEYS = [
     "ENABLE_SELL_REBALANCE", "TAKE_PROFIT_PCT", "STOP_LOSS_PCT", "TRIM_OVER_RATIO",
     "ALLOW_DAY_TRADING", "MIN_HOLDING_DAYS_FOR_SELL",
     "ENABLE_CHEAP_FALLBACK", "ALLOW_US_STOCKS", "ALLOW_DERIVATIVES",
-    "ANALYSIS_NEWS_THRESHOLD", "ANALYSIS_RAW_FALLBACK",
 ]
 
 # ─── Strategy parameter metadata (사장 지시 2026-05-14: UI에 한국어 라벨로 표시) ────
@@ -217,12 +214,6 @@ STRATEGY_KEY_META = {
     "ALLOW_DERIVATIVES":          {"label": "파생상품(선물/옵션) 매매 허용", "type": "bool",
                                    "help": "마진·증거금 처리 필요 — 기본 OFF",
                                    "group": "기타"},
-    "ANALYSIS_NEWS_THRESHOLD":    {"label": "뉴스 분석 트리거 (deprecated)", "type": "int", "unit": "건",
-                                   "help": "구버전 — 더 이상 사용되지 않음 (사이클은 1시간 주기로 고정)",
-                                   "min": 0, "max": 100, "step": 1, "group": "기타", "deprecated": True},
-    "ANALYSIS_RAW_FALLBACK":      {"label": "뉴스 폴백 임계 (deprecated)", "type": "int", "unit": "건",
-                                   "help": "구버전 — 더 이상 사용되지 않음",
-                                   "min": 0, "max": 100, "step": 1, "group": "기타", "deprecated": True},
 }
 # 사장 지시 2026-05-14: 보수→공격 스펙트럼 순서로 노출 (방어형 → 보수형 → 균형형 → 공격형 → 초공격형)
 STRATEGY_PRESETS = {
@@ -231,36 +222,31 @@ STRATEGY_PRESETS = {
         "CONSERVATIVE_MDD": 0.025, "CONSERVATIVE_STOCK_RATIO": 0.07, "MAX_TRADES_PER_CYCLE": 1, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 6.0, "STOP_LOSS_PCT": 3.5, "TRIM_OVER_RATIO": True,
         "ALLOW_DAY_TRADING": False, "MIN_HOLDING_DAYS_FOR_SELL": 1.0,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": False, "ALLOW_DERIVATIVES": False,
-        "ANALYSIS_NEWS_THRESHOLD": 15, "ANALYSIS_RAW_FALLBACK": 28},
+        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": False, "ALLOW_DERIVATIVES": False},
     "conservative": {"label": "보수형 — 작게, 손절 빠르게, 사이클 드물게",
         "PER_ORDER_BUDGET_RATIO": 0.05, "PER_ORDER_BUDGET_OVERSHOOT": 1.10, "MAX_CYCLE_BUDGET_RATIO": 0.15, "MIN_CASH_BUFFER": 1.15,
         "CONSERVATIVE_MDD": 0.04, "CONSERVATIVE_STOCK_RATIO": 0.10, "MAX_TRADES_PER_CYCLE": 1, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 8.0, "STOP_LOSS_PCT": 5.0, "TRIM_OVER_RATIO": True,
         "ALLOW_DAY_TRADING": False, "MIN_HOLDING_DAYS_FOR_SELL": 0.5,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": False, "ALLOW_DERIVATIVES": False,
-        "ANALYSIS_NEWS_THRESHOLD": 12, "ANALYSIS_RAW_FALLBACK": 24},
+        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": False, "ALLOW_DERIVATIVES": False},
     "balanced": {"label": "균형형 — 기본값 (권장)",
         "PER_ORDER_BUDGET_RATIO": 0.10, "PER_ORDER_BUDGET_OVERSHOOT": 1.20, "MAX_CYCLE_BUDGET_RATIO": 0.25, "MIN_CASH_BUFFER": 1.10,
         "CONSERVATIVE_MDD": 0.05, "CONSERVATIVE_STOCK_RATIO": 0.15, "MAX_TRADES_PER_CYCLE": 2, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 12.0, "STOP_LOSS_PCT": 5.0, "TRIM_OVER_RATIO": True,
         "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.5,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False,
-        "ANALYSIS_NEWS_THRESHOLD": 10, "ANALYSIS_RAW_FALLBACK": 20},
+        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False},
     "aggressive": {"label": "공격형 — 크게, 길게 보유, 사이클 잦게",
         "PER_ORDER_BUDGET_RATIO": 0.20, "PER_ORDER_BUDGET_OVERSHOOT": 1.30, "MAX_CYCLE_BUDGET_RATIO": 0.40, "MIN_CASH_BUFFER": 1.05,
         "CONSERVATIVE_MDD": 0.08, "CONSERVATIVE_STOCK_RATIO": 0.25, "MAX_TRADES_PER_CYCLE": 3, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 18.0, "STOP_LOSS_PCT": 10.0, "TRIM_OVER_RATIO": False,
         "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.0,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False,
-        "ANALYSIS_NEWS_THRESHOLD": 6, "ANALYSIS_RAW_FALLBACK": 14},
+        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False},
     "ultra_aggressive": {"label": "초공격형 — 최대 베팅·고위험 고리워드",
         "PER_ORDER_BUDGET_RATIO": 0.35, "PER_ORDER_BUDGET_OVERSHOOT": 1.50, "MAX_CYCLE_BUDGET_RATIO": 0.70, "MIN_CASH_BUFFER": 1.02,
         "CONSERVATIVE_MDD": 0.15, "CONSERVATIVE_STOCK_RATIO": 0.40, "MAX_TRADES_PER_CYCLE": 5, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 30.0, "STOP_LOSS_PCT": 15.0, "TRIM_OVER_RATIO": False,
         "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.0,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False,
-        "ANALYSIS_NEWS_THRESHOLD": 4, "ANALYSIS_RAW_FALLBACK": 10},
+        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False},
 }
 DEFAULT_STRATEGY = "balanced"
 

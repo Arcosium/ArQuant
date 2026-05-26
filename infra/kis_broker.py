@@ -61,10 +61,12 @@ class OrderDraft(BaseModel):
     rejection_reason: Optional[str] = None
 
 class KISBroker:
-    def __init__(self):
-        from config import KIS_APP_KEY, KIS_APP_SECRET, KIS_BASE_URL, KIS_ACCOUNT_NO
-        self.app_key = KIS_APP_KEY; self.app_secret = KIS_APP_SECRET
-        self.base_url = KIS_BASE_URL; self.account_no = KIS_ACCOUNT_NO
+    def __init__(self, creds: dict, token_path=None):
+        # Phase 2: credentials are injected per-uid. No more config globals.
+        self.app_key = creds["kis_app_key"]; self.app_secret = creds["kis_app_secret"]
+        self.base_url = creds.get("kis_base_url") or "https://openapi.koreainvestment.com:9443"
+        self.account_no = creds["kis_account_no"]
+        self._token_path = Path(token_path) if token_path else TOKEN_CACHE_FILE
         # 사장 피드백 2026-05-16: 실전/모의 정식 지원. base_url 이 KIS 모의투자 서버면
         # 주문/잔고 tr_id 를 모의용으로 변환 (실전 경로는 전혀 안 건드림 — 무위험).
         _bu = (self.base_url or "")
@@ -85,8 +87,8 @@ class KISBroker:
 
     def _load_token_file(self) -> Optional[Dict[str, Any]]:
         try:
-            if TOKEN_CACHE_FILE.exists():
-                d = json.loads(TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
+            if self._token_path.exists():
+                d = json.loads(self._token_path.read_text(encoding="utf-8"))
                 if isinstance(d, dict) and d.get("access_token") and d.get("appkey") == self.app_key:
                     return d
         except Exception as e:
@@ -95,7 +97,7 @@ class KISBroker:
 
     def _save_token_file(self, token: str, exp: float):
         try:
-            TOKEN_CACHE_FILE.write_text(json.dumps(
+            self._token_path.write_text(json.dumps(
                 {"access_token": token, "expires_at": exp, "appkey": self.app_key,
                  "issued_at": time.time()}, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
@@ -367,6 +369,23 @@ class KISBroker:
                 snap["buying_power"]["cash"] = prev_cash
                 snap["buying_power"]["cash_stale"] = True
                 logger.warning(f"[잔고스냅샷] KIS가 cash=0 반환 — 캐시된 예수금 {prev_cash:,.0f}원 유지 (stale)")
+        # 결제예수금(D+1/D+2) 0 글리치 (사장 보고 2026-05-22): KIS는 거래 직후 결제 과도기에
+        # prvs_rcdl_excc_amt(D+2)·nxdy_excc_amt(D+1)를 0으로 깜빡인다. 그러면 cash 가 dnca_tot_amt
+        # (D0, 미결제 매수분이 아직 안 빠진 예수금)로 튀고 nass_amt 도 D0 기준이라, 통합 총평가에서
+        # 그 매수금액이 해외평가와 이중계상돼 자산곡선이 스파이크 친다(US 매수 직후 폴 등).
+        # settled(D1/D2)=0 & D0>0 은 글리치로 보고 직전 정상값(settled 기반 cash/total)을 유지한다.
+        elif cached and snap["ok"] and cash_d2 <= 0 and cash_d1 <= 0 and cash_d0 > 0:
+            _prev_bp = cached.get("buying_power") or {}
+            prev_cash = float(_prev_bp.get("cash") or 0.0)
+            prev_total = float(_prev_bp.get("total_eval") or 0.0)
+            if prev_cash > 0:
+                snap["buying_power"]["cash"] = prev_cash
+                snap["buying_power"]["cash_stale"] = True
+            if prev_total > 0:
+                snap["buying_power"]["total_eval"] = prev_total
+                snap["buying_power"]["total_stale"] = True
+            logger.warning(f"[잔고스냅샷] 결제예수금(D1/D2)=0 글리치 — 직전 정상값 유지 "
+                           f"(cash={prev_cash:,.0f}, total={prev_total:,.0f})")
         self._acct_snap = snap
         return snap
 
@@ -514,7 +533,9 @@ class KISBroker:
     _OVERSEAS_CACHE_TTL = 7200  # 2시간 — 일시 실패 보강용(실제 매도는 즉시 반영되므로 무관)
 
     def _overseas_cache_path(self) -> Path:
-        return Path(__file__).resolve().parent.parent / "data" / "overseas_krw_cache.json"
+        # Phase 2: 토큰 캐시와 같은 per-uid 디렉터리(data/<uid>/)에 둔다. 전역 단일 파일이면
+        # 한 계정의 해외 원화평가가 다른 계정(특히 실전→모의)으로 누출된다.
+        return self._token_path.parent / "overseas_krw_cache.json"
 
     def _get_overseas_cache(self):
         c = getattr(self, "_overseas_krw_cache", None)
@@ -589,6 +610,13 @@ class KISBroker:
             self._set_overseas_cache(krw, _now)
             if pk["exrt"] > 0:
                 bp["fx_rate"] = pk["exrt"]
+                # 사장 지시 2026-05-22: 5분 폴러가 매번 호출하는 이 경로의 KIS 기준환율을
+                # 라이브 FX 캐시에 먹여, 예산·리스크 환산이 최신 환율을 쓰게 한다.
+                try:
+                    from tools.market_data import set_usdkrw
+                    set_usdkrw(pk["exrt"])
+                except Exception:
+                    pass
                 for h in holdings:
                     if h.get("ccy") == "USD":
                         h["krw_value"] = round(self._num(h.get("qty")) * self._num(h.get("cur_price")) * pk["exrt"])
@@ -679,6 +707,17 @@ class KISBroker:
         except Exception as ex:
             logger.warning(f"[지수일봉] {index_code} 조회 예외: {ex}")
         return out
+
+    async def kr_index_now(self, index_code: str = "0001") -> float:
+        """KOSPI(0001)/KOSDAQ(1001) 현재 지수값 (float). 실패 시 0.0.
+        사장 지시 2026-05-21: 벤치마크 일중 오버레이는 5분 폴링이 equity 포인트에 지수값을
+        같이 찍어 만든다. 여기선 검증된 일봉(kr_index_daily)의 '당일' 마지막 종가를 현재값으로
+        재사용한다 — 장중엔 당일 바가 실시간 갱신되므로 별도(미검증) 분봉 API가 불필요하다."""
+        try:
+            rows = await self.kr_index_daily(index_code=index_code, days=3)
+            return float(rows[-1]["close"]) if rows else 0.0
+        except Exception:
+            return 0.0
 
     # ═══════════════════ 해외주식 ═══════════════════
     # KIS overseas-price (HHDFS00000300) EXCD codes: NAS(나스닥) / NYS(뉴욕) / AMS(아멕스).
@@ -996,8 +1035,10 @@ class KISBroker:
             w.writerows(new_rows)
         logger.info(f"CSV 누적: {filename} +{len(new_rows)}행")
 
-_broker: Optional[KISBroker] = None
-def get_broker() -> KISBroker:
-    global _broker
-    if _broker is None: _broker = KISBroker()
-    return _broker
+# Phase 2: the global broker singleton is retired. Brokers are owned by UserContext
+# (one per uid, built with that uid's injected credentials). This shim raises so any
+# stray caller is caught loudly instead of silently trading on the wrong account.
+def get_broker():
+    raise RuntimeError(
+        "get_broker() is retired in Phase 2 — use UserContext.broker (per-uid). "
+        "A caller still references the global broker singleton.")

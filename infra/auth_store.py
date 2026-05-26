@@ -418,6 +418,38 @@ def is_admin(user_id: Optional[int]) -> bool:
         return False
 
 
+def list_users() -> list:
+    """회원 목록(민감정보 제외) — ADMIN 회원관리용 (사장 지시 2026-05-22)."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, username, label, is_admin, created_at, last_login_at "
+            "FROM users ORDER BY id").fetchall()
+    out = []
+    for r in rows:
+        k = r.keys()
+        out.append({"id": int(r["id"]), "username": r["username"],
+                    "label": (r["label"] if "label" in k else "") or "",
+                    "is_admin": bool(r["is_admin"]) if "is_admin" in k else False,
+                    "created_at": (r["created_at"] if "created_at" in k else "") or "",
+                    "last_login_at": (r["last_login_at"] if "last_login_at" in k else "") or ""})
+    return out
+
+
+def set_admin(user_id: int, is_admin_flag: bool) -> bool:
+    """ADMIN 권한 부여/회수. .env 시드 ADMIN(ADMIN_USERNAMES)은 회수 불가(부팅 시 재승격)."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute("SELECT username FROM users WHERE id=?", (int(user_id),)).fetchone()
+        if not row:
+            return False
+        if not is_admin_flag and row["username"] in ADMIN_USERNAMES:
+            return False  # 시드 ADMIN 강등 금지
+        conn.execute("UPDATE users SET is_admin=? WHERE id=?",
+                     (1 if is_admin_flag else 0, int(user_id)))
+    return True
+
+
 def verify_password(username: str, password: str) -> Optional[Dict[str, Any]]:
     """argon2id 검증. 미마이그레이션(legacy) 행이면 복호-비교 후 즉시 해시로 승격.
     성공 시 자격증명 dict, 실패 시 None."""

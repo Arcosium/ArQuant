@@ -316,6 +316,8 @@ class DashViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
-        wsManager.disconnect()
+        // 사장 지시 2026-05-21: WS 연결 해제는 WsRelayService(onDestroy)가 담당한다.
+        // 여기서 disconnect 하면 Activity 재생성/뷰모델 정리 시 백그라운드 연결이 끊겨
+        // 알림이 멈추므로, 연결 수명은 foreground service 가 단독 소유한다.
     }
 }

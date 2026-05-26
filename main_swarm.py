@@ -12,8 +12,8 @@ from agents.base_agent import BaseAgent
 from agents.specialists import (create_macro_analyst, create_quant_analyst, create_news_analyst,
                                 create_trader, create_post_manager, create_ops_support)
 from agents.guardrails import create_risk_guard, validate_order_draft
-from infra.kis_broker import get_broker, OrderDraft
-from infra import cycle_store, news_classifier_log, notifier, metrics
+from infra.kis_broker import OrderDraft
+from infra import cycle_store, news_classifier_log, notifier, metrics, admin_config
 from infra.error_log import record_error
 from tools.news_monitor import get_monitor
 from tools.dart_disclosure import (search_disclosures, get_financial_summary_by_stock_code,
@@ -22,7 +22,8 @@ from tools.dart_disclosure import (search_disclosures, get_financial_summary_by_
 from tools.global_search import deep_research
 from tools.market_data import (
     crawl_index_snapshot, crawl_company_full, format_quant_data_for_agent, INDEX_WATCHLIST,
-    get_index_data, format_indices_for_macro, get_stock_name, fetch_investor_data, _csv_row_count
+    get_index_data, format_indices_for_macro, get_stock_name, fetch_investor_data, _csv_row_count,
+    resolve_kr_stock_code, get_usdkrw
 )
 from config import (HEADLINE_DEDUP_RATIO,
                     MACRO_CACHE_TTL_SEC, DART_CACHE_TTL_SEC, LIVE_TRADING, PERIODIC_CYCLE_SEC,
@@ -93,26 +94,43 @@ KR_MARKET_HOLIDAYS = {
     "2027-08-15", "2027-10-03", "2027-10-09", "2027-12-25", "2027-12-31",
 }
 
+def is_kr_weekend(d: Optional[datetime] = None) -> bool:
+    """KST 기준 주말(토/일)이면 True. 주말은 KIS 호출 없이 자명하게 휴장 처리."""
+    d = d or _now_kst()
+    return d.weekday() >= 5  # 토(5)·일(6)
+
 def is_kr_holiday(d: Optional[datetime] = None) -> bool:
     """오늘이 한국 휴장일이면 True. 주말은 별도 체크가 아니라 SCHEDULE에서 09:00-15:30이 평일이라
-    가정함 — 그러나 휴장일+평일 케이스(공휴일)는 여기서 차단해야 사이클이 안 돈다."""
+    가정함 — 그러나 휴장일+평일 케이스(공휴일)는 여기서 차단해야 사이클이 안 돈다.
+    주: 이 하드코딩 목록은 이제 '폴백'이다 — 개장 5분 후 KIS 실시세 확인(_verify_market_open)이
+    1순위 권위이고, 실확인이 불가할 때만 이 목록을 쓴다 (사장 지시 2026-05-24)."""
     d = d or _now_kst()
-    if d.weekday() >= 5:  # 토(5)·일(6)
+    if is_kr_weekend(d):
         return True
     return d.strftime("%Y-%m-%d") in KR_MARKET_HOLIDAYS
 
+def is_us_weekend(d: Optional[datetime] = None) -> bool:
+    """미 동부 기준 주말(토/일)을 KST 시각으로 환산해 판정. 주말은 KIS 호출 없이 자명 휴장.
+    US 정규장은 KST 22:30~05:00 (미 동부 09:30~16:00)."""
+    d = d or _now_kst()
+    if d.hour < 5 and d.weekday() in (6, 0):  # KST 일/월 새벽 = 미 동부 토/일
+        return True
+    if d.hour >= 22 and d.weekday() == 4:  # KST 금 밤 = 미 동부 금 → 거래일(주말 아님)
+        return False
+    if d.hour >= 22 and d.weekday() in (5, 6):  # KST 토/일 밤 = 미 동부 토/일 → 주말
+        return True
+    return False
+
 def is_us_holiday(d: Optional[datetime] = None) -> bool:
     """미국 시장 휴장일. NYSE 기준 고정 휴일만 — 음력·이동식은 ops_support가 추후 보완 가능.
-    KST 기준 22:30~05:00이 US 정규장이므로 KST의 토/일 야간엔 휴장 (= 미 동부 금/토 낮)."""
+    KST 기준 22:30~05:00이 US 정규장이므로 KST의 토/일 야간엔 휴장 (= 미 동부 금/토 낮).
+    주: 고정 휴일 목록은 '폴백' — 개장 5분 후 KIS 실시세 확인이 1순위 (사장 지시 2026-05-24)."""
     d = d or _now_kst()
     # US 정규장은 KST 22:30~05:00. 미 동부 시간으로는 09:30~16:00.
     # KST 토 새벽 02:00 = 미 동부 금 12:00 (US 장중). KST 일 새벽 = 미 동부 토 = 휴장.
-    # 단순화: KST 일·월요일 새벽 시간대(00~05)는 미국이 토/일 오후 → 휴장
-    if d.hour < 5 and d.weekday() in (6, 0):  # KST 일/월 새벽
-        return True
     if d.hour >= 22 and d.weekday() == 4:  # KST 금 밤 = 미 동부 금 → 정상 (마지막 거래일)
         return False
-    if d.hour >= 22 and d.weekday() in (5, 6):  # KST 토/일 밤 = 미 동부 토/일 → 휴장
+    if is_us_weekend(d):
         return True
     # 미 동부 고정 휴장일 (KST로 환산하면 +14h)
     us_fixed = {"2026-01-01","2026-01-19","2026-02-16","2026-04-03","2026-05-25","2026-06-19",
@@ -137,6 +155,22 @@ def get_current_session():
     if _in_schedule("us_trading"): return "US_TRADING"
     return "OFF_HOURS"
 
+def _post_manager_session_hint(session: str) -> str:
+    """사후관리실장(매도 판단) 프롬프트에 넣을 '현재 어느 장이 열려 있는가' 안내문.
+    버그 2026-05-23 04:47: 세션 정보가 없어 LLM이 'KR 장중이라 미국 시장 닫힘'으로 환각 →
+    US_TRADING 인데도 매도 신호를 '매매 불가'로 무시하고 보유. 입력 보유 종목은 이미 현재
+    세션에서 거래 가능한 것만 필터링돼 들어오므로, 여기서 '지금 매도 가능'을 사실로 못박는다."""
+    if session == "US_TRADING":
+        return ("⚠️ 현재 세션은 **미국 정규장(US_TRADING)** — 지금 열려 있는 시장은 미국이고 한국 장은 마감입니다. "
+                "아래 보유 종목은 전부 미국 종목이며 **지금 즉시 매도 가능**합니다. "
+                "'미국 시장이 닫혀 매매 불가' 같은 판단은 사실과 다르니 절대 쓰지 말고, 세션을 임의로 추측하지 마십시오.")
+    if session in ("KR_TRADING", "KR_PRE_MARKET", "KR_CLOSE_REVIEW"):
+        return ("⚠️ 현재 세션은 **한국 장(KR)** — 지금 열려 있는 시장은 한국이고 미국 장은 마감입니다. "
+                "아래 보유 종목은 전부 국내 종목이며 **지금 즉시 매도 가능**합니다. "
+                "'한국 시장이 닫혀 매매 불가' 같은 판단은 사실과 다르니 절대 쓰지 말고, 세션을 임의로 추측하지 마십시오.")
+    return ("현재 장외 — 아래 보유 종목은 다음 개장 사이클에서 매매됩니다. "
+            "매도/보유는 오직 매크로·퀀트·뉴스·손익 신호로만 판단하십시오.")
+
 class SwarmState(str, Enum):
     IDLE="IDLE";MONITORING="MONITORING";MACRO_ANALYSIS="MACRO_ANALYSIS"
     QUANT_ANALYSIS="QUANT_ANALYSIS";NEWS_ANALYSIS="NEWS_ANALYSIS"
@@ -151,19 +185,36 @@ class SwarmCycleLog:
         self.state_logs.append({"timestamp":datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),"state":state,"agent":agent,"message":(message or "")[:20000]})
     def to_dict(self): return {"started_at":self.started_at,"logs":self.state_logs,"final_report":self.final_report}
 
-# ─── Real-time event/response log (claude_response.json) ────────────────────
+# ─── Real-time event/response log (data/<uid>/trade_log.json) ───────────────
 # Accumulates *forever* (per user request) until the dashboard "초기화" button calls
-# clear_event_log(). Soft-capped so the file can't grow without bound.
+# clear_event_log(uid). Soft-capped so the file can't grow without bound.
+#
+# Phase 2 멀티테넌트: 과거엔 전역 claude_response.json 하나에 모든 유저의 에이전트/이벤트가
+# 뒤섞여, 동시 운용되는 두 계정의 대시보드가 서로의 에이전트를 봤다(운용전략실장 등 페르소나
+# 중복 표시). equity 와 동일하게 유저별 파일(data/<uid>/trade_log.json — user_paths.trade_log_path)
+# 로 분리한다. log_response_event/get_recent_events/get_trade_history/clear_* 가 uid 인자를 받는다.
+# uid 가 None 이면 파일 기록을 건너뛴다(WS 로만 전달 — 부팅 IDLE 등 전역 시스템 이벤트).
 from pathlib import Path as _Path
-_RESPONSE_LOG = _Path(__file__).parent / "claude_response.json"
 _RESPONSE_LOG_CAP = 4000  # keep at most this many entries on disk
 _DISPLAY_EVENT_TYPES = {"status","news","trigger","agent_msg","cycle_complete",
-                        "execution_ready","execution_skipped","trade_executed","trade_failed","error"}
+                        "execution_ready","execution_skipped","trade_executed","trade_failed","error",
+                        # 사장 지시 2026-05-21: 체결 신청·장 마감 이벤트 (모바일 알림 4종 중 2종)
+                        "order_submitted","market_close"}
 
-def _read_response_log() -> list:
+def _response_log_path(uid):
+    """그 유저의 이벤트/응답 로그 파일 경로. uid 가 None 이면 None(파일 미사용)."""
+    if uid is None:
+        return None
+    from infra import user_paths
+    return user_paths.trade_log_path(int(uid))
+
+def _read_response_log(uid=None) -> list:
+    p = _response_log_path(uid)
+    if p is None:
+        return []
     try:
-        if _RESPONSE_LOG.exists():
-            d = json.loads(_RESPONSE_LOG.read_text(encoding="utf-8"))
+        if p.exists():
+            d = json.loads(p.read_text(encoding="utf-8"))
             return d if isinstance(d, list) else []
     except Exception:
         pass
@@ -177,26 +228,53 @@ def _now_kst_iso() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def log_response_event(entry: dict):
-    """Append an event/response record to claude_response.json (full text, no truncation)."""
+def log_response_event(entry: dict, uid=None):
+    """Append an event/response record to that uid's log (full text, no truncation).
+    Phase 2 멀티테넌트: uid 가 주어지면 data/<uid>/trade_log.json 에 적는다. uid 가 None 이면
+    파일 기록을 건너뛴다(이벤트는 _broadcast 의 WS 콜백으로 여전히 전달된다)."""
+    p = _response_log_path(uid)
+    if p is None:
+        return  # 전역 시스템 이벤트(uid 없음) — 파일에 남기지 않는다(WS 로만).
     try:
-        data = _read_response_log()
+        data = _read_response_log(uid)
         data.append({"ts": _now_kst_iso(), **entry})
         if len(data) > _RESPONSE_LOG_CAP:
             data = data[-_RESPONSE_LOG_CAP:]
-        _RESPONSE_LOG.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as _e:
-        logger.warning(f"claude_response.json 기록 실패: {_e}")
+        logger.warning(f"이벤트 로그 기록 실패(uid={uid}): {_e}")
 
-def get_recent_events(limit: int = 500) -> list:
+def get_recent_events(limit: int = 500, uid=None) -> list:
     """UI replay: the display-relevant events (newest-last), so a page reload restores
-    the trade/agent log without re-running anything."""
-    evs = [e for e in _read_response_log()
+    the trade/agent log without re-running anything. uid 별 로그만 반환한다."""
+    evs = [e for e in _read_response_log(uid)
            if e.get("source") == "system_event" and e.get("type") in _DISPLAY_EVENT_TYPES]
     return evs[-max(1, int(limit)):]
 
 # ─── Equity curve (for the 수익률 tab) ──────────────────────────────────────
-_EQUITY_LOG = _Path(__file__).parent / "data" / "equity_curve.json"
+# Phase 2 멀티테넌트: 전역 equity_curve.json 폐지. equity 는 유저별 data/<uid>/equity_curve.json
+# 에 기록·조회되며, record_equity/get_equity_series/performance_kpis 가 equity_path 인자를 받는다.
+
+# 사장 지시 2026-05-24: 거래 내역을 '비우기' 해도 승률·매도수·보유일 통계가 사라지지 않도록,
+# 비우기 직전에 누적 실현손익 통계를 이 파일에 적립한다. performance_kpis 가 라이브 거래 통계에
+# 이 베이스라인을 더해 표시하므로, 화면의 거래 리스트를 비워도 승률이 유지된다.
+_PERF_BASELINE = _Path(__file__).parent / "data" / "perf_baseline.json"
+
+def _read_perf_baseline() -> dict:
+    try:
+        if _PERF_BASELINE.exists():
+            d = json.loads(_PERF_BASELINE.read_text(encoding="utf-8"))
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _write_perf_baseline(d: dict):
+    try:
+        _PERF_BASELINE.parent.mkdir(parents=True, exist_ok=True)
+        _PERF_BASELINE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as _e:
+        logger.warning(f"perf_baseline 기록 실패: {_e}")
 
 def _parse_ts_any(ts_str) -> Optional[datetime]:
     """Parse a stored ts that may be ISO ('2026-05-13T17:13:57.123+09:00') or
@@ -224,10 +302,17 @@ def _detect_external_flow(prev: Optional[Dict], curr: Dict) -> float:
     이제 adj_total_eval == total_eval (실계좌 총평가) 라 그래프가 실제 자산을 그대로 표시한다."""
     return 0.0
 
-def record_equity(bp: dict, source: str = "poll", holdings: Optional[List[Dict]] = None):
-    """Append a {ts,total_eval,cash,pnl_ratio,holdings,external_flow_cum} point — at most one per 60s.
+def record_equity(equity_path, bp: dict, source: str = "poll", holdings: Optional[List[Dict]] = None,
+                  kospi: Optional[float] = None, nasdaq: Optional[float] = None):
+    """Append a {ts,total_eval,cash,pnl_ratio,holdings,external_flow_cum,kospi,nasdaq} point — at most one per 60s.
     Caps at 2000 points. `holdings` (optional list of {code,qty}) is used to detect external cashflow
-    (deposits/withdrawals) vs trade-driven changes — see _detect_external_flow()."""
+    (deposits/withdrawals) vs trade-driven changes — see _detect_external_flow().
+    `kospi`/`nasdaq` (사장 지시 2026-05-21): 5분 폴링이 잔고와 함께 수집한 지수 현재값. equity 포인트와
+    동일 타임스탬프에 저장돼, 벤치마크 오버레이가 일중 움직임을 보여준다(미검증 분봉 API 불필요).
+
+    Phase 2 멀티테넌트: `equity_path`(유저별 data/<uid>/equity_curve.json)를 명시적으로 받아
+    해당 유저 곡선에만 기록한다. 전역 _EQUITY_LOG 는 더 이상 쓰지 않는다."""
+    equity_path = _Path(equity_path)
     if holdings is not None:
         try:
             bp = {**bp, "_holdings": holdings}
@@ -236,16 +321,21 @@ def record_equity(bp: dict, source: str = "poll", holdings: Optional[List[Dict]]
         if not bp or not bp.get("ok"):
             return
         data = []
-        if _EQUITY_LOG.exists():
-            try: data = json.loads(_EQUITY_LOG.read_text(encoding="utf-8"))
+        if equity_path.exists():
+            try: data = json.loads(equity_path.read_text(encoding="utf-8"))
             except Exception: data = []
         if not isinstance(data, list): data = []
-        now = datetime.now()
+        # 사장 보고 2026-05-21: ts 를 KST 로 저장해야 차트 가로축이 KST 로 표시된다.
+        # (OCI 서버는 UTC 로 동작 → datetime.now() 는 UTC naive. _ts_to_kst 는 공백포맷을
+        #  '이미 KST'로 간주하므로, 여기서 UTC 로 저장하면 9시간 어긋난 라벨이 나왔다.)
+        now = datetime.now(KST)
         if data:
             try:
                 last = _parse_ts_any(data[-1]["ts"])
-                if last and (now - last.replace(tzinfo=None) if last.tzinfo else now - last).total_seconds() < 60:
-                    return
+                if last:
+                    last_aware = last if last.tzinfo else last.replace(tzinfo=KST)
+                    if (now - last_aware).total_seconds() < 60:
+                        return
             except Exception: pass
         # holdings snapshot {code: qty} — used to distinguish external cashflow from trade-driven changes
         try:
@@ -260,6 +350,12 @@ def record_equity(bp: dict, source: str = "poll", holdings: Optional[List[Dict]]
                  "src": source}
         if holdings_snap:
             entry["holdings"] = holdings_snap
+        # 사장 지시 2026-05-21: 잔고와 함께 수집한 지수 현재값을 같이 저장 (벤치마크 일중 오버레이)
+        try:
+            if kospi and float(kospi) > 0:  entry["kospi"]  = float(kospi)
+            if nasdaq and float(nasdaq) > 0: entry["nasdaq"] = float(nasdaq)
+        except (TypeError, ValueError):
+            pass
         # Detect external cashflow (deposits/withdrawals) — total_eval delta unexplained by holdings change.
         # Carry forward cumulative external flow so charts can show a "trade-only" equity curve.
         prev_flow = 0.0
@@ -273,7 +369,8 @@ def record_equity(bp: dict, source: str = "poll", holdings: Optional[List[Dict]]
             entry["external_flow"] = flow_delta
             logger.info(f"[equity] 외부 현금흐름 감지: {flow_delta:+,.0f}원 (입출금) — 수익률 베이스라인 보정")
         data.append(entry)
-        _EQUITY_LOG.write_text(json.dumps(data[-2000:], ensure_ascii=False, indent=2), encoding="utf-8")
+        equity_path.parent.mkdir(parents=True, exist_ok=True)
+        equity_path.write_text(json.dumps(data[-2000:], ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as _eq_e:
         # 동작 보존(여전히 raise 안 함) + 조용한 실패 표면화: equity 영속 실패는
         # 대시보드 P&L 을 말없이 고착시킨다.
@@ -299,46 +396,98 @@ def _ts_to_kst(ts_str: str) -> Optional[datetime]:
     except Exception:
         return None
 
-def _is_trading_kst(dt_kst: datetime) -> bool:
-    """Is `dt_kst` inside KR regular hours (09:00-15:30 KST) or US regular hours (22:30-05:00 KST)?"""
-    h, m = dt_kst.hour, dt_kst.minute; t = h * 60 + m
-    for name in ("kr_trading", "us_trading"):
-        s = SCHEDULE[name]; st = s["start"][0] * 60 + s["start"][1]; en = s["end"][0] * 60 + s["end"][1]
-        if (st <= t < en) if st <= en else (t >= st or t < en):
-            return True
+def is_market_session_now(dt: Optional[datetime] = None) -> bool:
+    """지금(또는 dt)이 '실제 정규장 세션'인지 — 시간대 + 요일 + 휴장일까지 본다.
+    is_trading_hours()/get_current_session()은 시간대만 보므로 주말 밤 US 시간대
+    (토 22:30~일 05:00 KST = 실제 미국 토요일·휴장)를 장중으로 오인한다. 평가금액 기록·차트 표시는
+    이 함수로 게이팅해 장외/주말/휴장 포인트가 쌓이거나 표시되지 않게 한다 (사장 지시 2026-05-24).
+    KR 정규장 09:00-15:30(평일·비휴장) 또는 US 정규장 22:30-05:00(미 거래일)이면 True."""
+    dt = dt or _now_kst()
+    t = dt.hour * 60 + dt.minute
+    if 9 * 60 <= t < 15 * 60 + 30:        # KR 정규장
+        return not is_kr_holiday(dt)
+    if t >= 22 * 60 + 30 or t < 5 * 60:   # US 정규장 (야간 wrap)
+        return not is_us_holiday(dt)
     return False
 
-def get_equity_series(limit: int = 500, view: str = "realtime") -> list:
-    """Return equity-curve points for the dashboard chart.
-    - view='realtime' : KR/US 거래시간 포인트만, 10분 버킷의 마지막 값으로 다운샘플 (라벨은 'MM-DD HH:M0' KST)
-    - view='daily'    : KST 일자별 마지막 포인트 (라벨 'YYYY-MM-DD')
-    - view='monthly'  : KST 월별 마지막 포인트 (라벨 'YYYY-MM')
-    `limit`은 최종 반환 포인트 수의 상한.
-    Each point's `total_eval` is the RAW account value; `adj_total_eval` is the
-    deposit/withdrawal-adjusted value (subtracts cumulative external cashflow so the
-    chart shows trade-driven P&L only — per 사장 지시 2026-05-14)."""
-    try:
-        if not _EQUITY_LOG.exists():
-            return []
-        raw = json.loads(_EQUITY_LOG.read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            return []
-    except Exception:
-        return []
+def _equity_points(raw_equity, *, glitch_pct: float = 0.10):
+    """정렬된 [(dt, adj_total, point)] — 입출금 보정(adj) 적용 + 결제 글리치 carry-forward.
+
+    사장 지시 2026-05-22: 보유 종목 변동이 없는데 총평가가 비정상 급변(>glitch_pct)하면 KIS
+    결제 과도기 글리치로 보고 직전 값을 유지(carry-forward)해, 누적수익·MDD·그래프에 가짜
+    스파이크가 끼지 않게 한다. (보유가 실제로 바뀐 시점은 정상 변동이라 그대로 둔다.)"""
     enriched = []
-    for p in raw:
+    for p in (raw_equity or []):
         if not isinstance(p, dict) or not p.get("total_eval"):
             continue
         dt = _ts_to_kst(p.get("ts", ""))
         if not dt:
             continue
-        # adjusted total = total_eval − cumulative external cashflow (deposits/withdrawals removed)
         try:
             ext = float(p.get("external_flow_cum", 0.0) or 0.0)
         except Exception:
             ext = 0.0
         try:
-            p = {**p, "adj_total_eval": float(p["total_eval"]) - ext}
+            adj = float(p["total_eval"]) - ext
+        except Exception:
+            continue
+        enriched.append((dt, adj, p))
+    enriched.sort(key=lambda x: x[0])
+    out = []
+    prev_total = None
+    prev_hold = None
+    n = len(enriched)
+    for i, (dt, adj, p) in enumerate(enriched):
+        hold = p.get("holdings")
+        use = adj
+        # 사장 지시 2026-05-24 (강화): 결제 글리치(전산오류) 배제 강화.
+        # 실제 거래로 보유 수량이 '명시적으로' 바뀐 경우는 정상 변동이라 그대로 둔다.
+        holdings_changed = (prev_hold is not None and hold is not None and hold != prev_hold)
+        if (prev_total is not None and prev_total > 0
+                and not holdings_changed
+                and abs(adj - prev_total) / prev_total > glitch_pct):
+            # (a) 보유 수량이 직전과 '동일함이 확인'되면 결제 글리치로 보고 즉시 직전값 유지(기존 동작).
+            holds_same_known = (prev_hold is not None and hold is not None and hold == prev_hold)
+            # (b) 보유 스냅샷이 미상(holdings 필드 없음)이면, 다음 포인트가 직전값으로 되돌아오는
+            #     '일시 스파이크'일 때만 글리치로 본다 — 며칠에 걸친 실제 손익(되돌림 없음)은 보존.
+            reverts = (i + 1 < n and abs(enriched[i + 1][1] - prev_total) / prev_total <= glitch_pct)
+            if holds_same_known or reverts:
+                use = prev_total  # 글리치 의심 — 직전 값 유지
+        out.append((dt, use, {**p, "adj_total_eval": use}))
+        prev_total = use
+        if hold is not None:
+            prev_hold = hold
+    return out
+
+
+def get_equity_series(equity_path, limit: int = 500, view: str = "realtime") -> list:
+    """Return equity-curve points for the dashboard chart.
+    - view='realtime' : KR/US 거래시간 포인트만, 5분 버킷의 마지막 값으로 다운샘플 (라벨은 'MM-DD HH:MM' KST)
+    - view='daily'    : KST 일자별 마지막 포인트 (라벨 'YYYY-MM-DD')
+    - view='monthly'  : KST 월별 마지막 포인트 (라벨 'YYYY-MM')
+    `limit`은 최종 반환 포인트 수의 상한.
+    Each point's `total_eval` is the RAW account value; `adj_total_eval` is the
+    deposit/withdrawal-adjusted value (subtracts cumulative external cashflow so the
+    chart shows trade-driven P&L only — per 사장 지시 2026-05-14).
+    Phase 2 멀티테넌트: `equity_path` 로 요청 유저의 곡선을 읽는다."""
+    equity_path = _Path(equity_path)
+    try:
+        if not equity_path.exists():
+            return []
+        raw = json.loads(equity_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            return []
+    except Exception:
+        return []
+    # 사장 지시 2026-05-22: 결제 글리치 carry-forward + 누적수익(cum_pnl, 0원 시작) 부여.
+    cleaned = _equity_points(raw)
+    if not cleaned:
+        return []
+    _baseline = cleaned[0][1]
+    enriched = []
+    for dt, adj, p in cleaned:
+        try:
+            p = {**p, "cum_pnl": adj - _baseline}
         except Exception:
             pass
         enriched.append((dt, p))
@@ -362,49 +511,66 @@ def get_equity_series(limit: int = 500, view: str = "realtime") -> list:
     else:  # realtime
         bucket: Dict[str, tuple] = {}
         for dt, p in enriched:
-            if not _is_trading_kst(dt):
+            if not is_market_session_now(dt):
                 continue
-            key = dt.strftime("%Y-%m-%d %H:") + f"{(dt.minute // 10) * 10:02d}"
+            # 사장 지시 2026-05-21: 5분 체결 확인 폴링 주기에 맞춰 5분 버킷으로 다운샘플
+            key = dt.strftime("%Y-%m-%d %H:") + f"{(dt.minute // 5) * 5:02d}"
             bucket[key] = (dt, p)
         for k in sorted(bucket):
             dt, p = bucket[k]
-            label = dt.strftime("%m-%d %H:") + f"{(dt.minute // 10) * 10:02d}"
+            label = dt.strftime("%m-%d %H:") + f"{(dt.minute // 5) * 5:02d}"
             out.append({**p, "label": label, "ts_kst": dt.strftime("%Y-%m-%d %H:%M")})
     return out[-max(1, int(limit)):]
 
 
-def performance_kpis(raw_equity: Optional[list] = None, trades: Optional[list] = None,
-                     now: Optional[datetime] = None) -> dict:
+def _trade_realized_stats(trades: Optional[list]) -> dict:
+    """매도 거래의 FIFO/KIS 실현손익으로 승률·매도수·보유일 합계를 집계한다.
+    performance_kpis(표시) 와 clear_trade_log(비우기 시 베이스라인 적립) 가 공유한다."""
+    wins = total = 0
+    hold_sum = 0.0; hold_n = 0
+    for e in (trades or []):
+        if str(e.get("side") or "").lower() != "sell":
+            continue
+        det = e.get("detail") or {}
+        pnl = det.get("realized_pnl")
+        if pnl is None:
+            pnl = det.get("total_pnl")
+        if pnl is None:
+            continue
+        total += 1
+        if pnl > 0:
+            wins += 1
+        sell_dt = _ts_to_kst(e.get("ts", ""))
+        for m in (det.get("matched") or []):
+            bdt = _ts_to_kst(m.get("buy_ts", ""))
+            if sell_dt and bdt:
+                hold_sum += max(0.0, (sell_dt - bdt).total_seconds() / 86400.0); hold_n += 1
+    return {"sell_count": total, "win_count": wins, "hold_days_sum": hold_sum, "hold_days_n": hold_n}
+
+
+def performance_kpis(equity_path=None, raw_equity: Optional[list] = None,
+                     trades: Optional[list] = None, now: Optional[datetime] = None,
+                     uid=None) -> dict:
     """수익률 탭 KPI 카드용 요약 (사장 지시 2026-05-21).
 
     equity_curve 의 입출금 보정값(adj total) 기준으로 누적·오늘·이번주·이번달 수익(원/%)
     과 최대낙폭(MDD)을, 거래 FIFO 실현손익 기준으로 승률·평균 보유일을 계산한다.
-    `raw_equity`/`trades`/`now` 를 주입하면 디스크 없이 순수 계산 — 단위 테스트용."""
+    `raw_equity`/`trades`/`now` 를 주입하면 디스크 없이 순수 계산 — 단위 테스트용.
+    Phase 2 멀티테넌트: `equity_path`(유저별)를 주면 그 곡선을 읽는다."""
     now = now or datetime.now(KST)
     if raw_equity is None:
         try:
-            raw_equity = json.loads(_EQUITY_LOG.read_text(encoding="utf-8")) if _EQUITY_LOG.exists() else []
+            ep = _Path(equity_path) if equity_path is not None else None
+            raw_equity = (json.loads(ep.read_text(encoding="utf-8"))
+                          if (ep is not None and ep.exists()) else [])
             if not isinstance(raw_equity, list):
                 raw_equity = []
         except Exception:
             raw_equity = []
 
-    pts = []
-    for p in raw_equity:
-        if not isinstance(p, dict) or not p.get("total_eval"):
-            continue
-        dt = _ts_to_kst(p.get("ts", ""))
-        if not dt:
-            continue
-        try:
-            ext = float(p.get("external_flow_cum", 0.0) or 0.0)
-        except Exception:
-            ext = 0.0
-        try:
-            pts.append((dt, float(p["total_eval"]) - ext))
-        except Exception:
-            continue
-    pts.sort(key=lambda x: x[0])
+    # 사장 지시 2026-05-22: 결제 글리치(보유 불변·총액 급변)를 carry-forward 한 포인트로
+    # 누적수익·MDD 를 계산해 가짜 낙폭/급등을 배제한다.
+    pts = [(dt, v) for dt, v, _p in _equity_points(raw_equity)]
 
     kpi: Dict[str, Any] = {"has_equity": False, "has_trades": False}
     if pts:
@@ -442,33 +608,22 @@ def performance_kpis(raw_equity: Optional[list] = None, trades: Optional[list] =
 
     if trades is None:
         try:
-            trades = get_trade_history(limit=2000)
+            trades = get_trade_history(limit=2000, uid=uid)
         except Exception:
             trades = []
-    wins = total = 0
-    hold_days: List[float] = []
-    for e in (trades or []):
-        if str(e.get("side") or "").lower() != "sell":
-            continue
-        det = e.get("detail") or {}
-        pnl = det.get("realized_pnl")
-        if pnl is None:
-            pnl = det.get("total_pnl")
-        if pnl is None:
-            continue
-        total += 1
-        if pnl > 0:
-            wins += 1
-        sell_dt = _ts_to_kst(e.get("ts", ""))
-        for m in (det.get("matched") or []):
-            bdt = _ts_to_kst(m.get("buy_ts", ""))
-            if sell_dt and bdt:
-                hold_days.append(max(0.0, (sell_dt - bdt).total_seconds() / 86400.0))
+    live = _trade_realized_stats(trades)
+    # 사장 지시 2026-05-24: '거래 내역 비우기' 후에도 승률·통계가 유지되도록, 비우기 때 적립한
+    # 누적 베이스라인을 라이브 거래 통계에 더한다(평가금액 추이는 equity_curve 가 별도 보존).
+    base = _read_perf_baseline()
+    total = live["sell_count"] + int(base.get("sell_count", 0) or 0)
+    wins = live["win_count"] + int(base.get("win_count", 0) or 0)
+    hold_sum = live["hold_days_sum"] + float(base.get("hold_days_sum", 0.0) or 0.0)
+    hold_n = live["hold_days_n"] + int(base.get("hold_days_n", 0) or 0)
     if total > 0:
         kpi.update({
             "has_trades": True, "sell_count": total, "win_count": wins,
             "win_rate_pct": wins / total * 100.0,
-            "avg_hold_days": (sum(hold_days) / len(hold_days)) if hold_days else None,
+            "avg_hold_days": (hold_sum / hold_n) if hold_n else None,
         })
     return kpi
 
@@ -607,53 +762,98 @@ def _enrich_trade_history(events: list) -> list:
                 realized_pnl = (eff_sell_auth - rec_avg) * qty
                 realized_pct = (eff_sell_auth / rec_avg - 1) * 100.0
                 total_pnl = realized_pnl  # 표시 P&L을 권위값(KIS 평단 기준)으로 교체
+            # 사장 지시 2026-05-22(R5): KIS 실평단(avg_cost)도 없고 매수 이력도 없으면(거래내역 초기화)
+            # 손익을 0/추정으로 '부정확하게' 찍지 말고 '미상'으로 표기한다.
+            _no_basis = (not (rec_avg and rec_avg > 0)) and (not matches)
+            if _no_basis:
+                total_pnl = None
             e["detail"] = {"matched": matches, "sell_price": shown_sell, "qty": qty,
                           "total_pnl": total_pnl, "unmatched_qty": remaining,
                           "currency": e["est_currency"], "price_source": price_source,
                           "cost_basis": rec_avg, "realized_pnl": realized_pnl,
                           "realized_pnl_pct": realized_pct,
                           "cost_source": ("kis_avg" if (rec_avg and rec_avg > 0)
-                                          else "fifo_reconstructed"),
+                                          else ("none" if _no_basis else "fifo_reconstructed")),
+                          "no_cost_basis": _no_basis,
                           "sell_price_inferred": (actual_fill is None and est_price is None)}
     return sorted_evs
 
 
-def get_trade_history(limit: int = 500) -> list:
+def get_trade_history(limit: int = 500, uid=None) -> list:
     """All trade events (executed/failed), newest first, for the 거래 내역 list.
-    사장 피드백 2026-05-15 (5차): 추정 가격 + FIFO 매칭 P&L detail 첨부."""
-    evs = [e for e in _read_response_log() if e.get("type") in ("trade_executed", "trade_failed")]
+    사장 피드백 2026-05-15 (5차): 추정 가격 + FIFO 매칭 P&L detail 첨부.
+    Phase 2 멀티테넌트: uid 별 로그만 반환한다."""
+    evs = [e for e in _read_response_log(uid) if e.get("type") in ("trade_executed", "trade_failed")]
     enriched = _enrich_trade_history(evs[-max(1, int(limit)):])
     return list(reversed(enriched))
 
-def clear_event_log():
-    """Wipe the accumulated event/response log (the dashboard '초기화' button)."""
+def clear_event_log(uid=None):
+    """Wipe that uid's accumulated event/response log (the dashboard '초기화' button)."""
+    p = _response_log_path(uid)
+    if p is None:
+        return
     try:
-        _RESPONSE_LOG.write_text("[]", encoding="utf-8")
+        p.write_text("[]", encoding="utf-8")
         log_response_event({"source": "system_event", "type": "status", "state": "IDLE",
-                            "message": "로그 초기화됨 (사용자 요청)"})
+                            "message": "로그 초기화됨 (사용자 요청)"}, uid=uid)
     except Exception as _e:
-        logger.warning(f"claude_response.json 초기화 실패: {_e}")
+        logger.warning(f"이벤트 로그 초기화 실패(uid={uid}): {_e}")
 
-def clear_trade_log() -> int:
+def clear_trade_log(uid=None) -> int:
     """Wipe just the trade events from claude_response.json (keeps everything else) + clear in-memory trade log.
-    Used by the 수익률 탭 '거래 내역 비우기' button. Returns the number of trade entries removed."""
+    Used by the 수익률 탭 '거래 내역 비우기' button. Returns the number of trade entries removed.
+
+    사장 지시 2026-05-24: 비우기 해도 ① 승률·매도수·보유일 통계는 영속 베이스라인에 적립해 유지하고,
+    ② 제거되는 거래 이벤트는 타임스탬프 백업으로 남긴다('기억 못해서 평가금액이 틀어지는' 문제 방지).
+    누적 평가금액(누적수익)은 equity_curve.json 가 별도 보존하므로 비우기와 무관하게 정확하다."""
     removed = 0
+    p = _response_log_path(uid)
+    if p is None:
+        return 0
+    # ① 비우기 직전 실현손익 통계를 베이스라인에 적립 (승률이 0으로 초기화되지 않게)
     try:
-        data = _read_response_log()
+        st = _trade_realized_stats(get_trade_history(limit=4000, uid=uid))
+        if st["sell_count"] > 0:
+            base = _read_perf_baseline()
+            base["sell_count"] = int(base.get("sell_count", 0) or 0) + st["sell_count"]
+            base["win_count"] = int(base.get("win_count", 0) or 0) + st["win_count"]
+            base["hold_days_sum"] = float(base.get("hold_days_sum", 0.0) or 0.0) + st["hold_days_sum"]
+            base["hold_days_n"] = int(base.get("hold_days_n", 0) or 0) + st["hold_days_n"]
+            _write_perf_baseline(base)
+    except Exception as _e:
+        logger.warning(f"승률 베이스라인 적립 실패(무시): {_e}")
+    try:
+        data = _read_response_log(uid)
+        trade_evs = [e for e in data if e.get("type") in ("trade_executed", "trade_failed")]
         kept = [e for e in data if e.get("type") not in ("trade_executed", "trade_failed")]
         removed = len(data) - len(kept)
-        _RESPONSE_LOG.write_text(json.dumps(kept[-_RESPONSE_LOG_CAP:], ensure_ascii=False, indent=2), encoding="utf-8")
+        # ② 제거 전 백업 (안전망) — uid 별로 구분 저장.
+        if trade_evs:
+            try:
+                _bdir = _Path(__file__).parent / "data" / "_reset_backup"
+                _bdir.mkdir(parents=True, exist_ok=True)
+                (_bdir / f"trades.uid{uid}.{datetime.now(KST):%Y%m%d-%H%M%S}.json").write_text(
+                    json.dumps(trade_evs, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as _be:
+                logger.warning(f"거래 내역 백업 실패(무시): {_be}")
+        p.write_text(json.dumps(kept[-_RESPONSE_LOG_CAP:], ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as _e:
-        logger.warning(f"거래 내역 초기화 실패: {_e}")
+        logger.warning(f"거래 내역 초기화 실패(uid={uid}): {_e}")
+    # Phase 2 멀티테넌트: 이 uid 의 스왐 인메모리 trade_log 만 비운다(이미 생성된 스왐만 —
+    # lazy 프로퍼티 강제생성 안 함). 다른 유저의 인메모리 거래 상태는 건드리지 않는다.
     try:
-        sw = _swarm
-        if sw is not None:
-            sw._trade_log.clear()
-            sw._trades_executed = 0
+        from infra.user_context import REGISTRY
+        for _ctx in REGISTRY.all_contexts().values():
+            if int(getattr(_ctx, "uid", -1)) != int(uid):
+                continue
+            sw = getattr(_ctx, "_swarm", None)
+            if sw is not None:
+                sw._trade_log.clear()
+                sw._trades_executed = 0
     except Exception:
         pass
     log_response_event({"source": "system_event", "type": "status", "state": "IDLE",
-                        "message": f"거래 내역 초기화됨 ({removed}건 제거)"})
+                        "message": f"거래 내역 초기화됨 ({removed}건 제거 · 승률·통계는 유지)"}, uid=uid)
     return removed
 
 _broadcast_callback = None
@@ -670,12 +870,16 @@ def set_broadcast_callback(cb):
         notifier.set_broadcast_callback(_alert_bridge)
     except Exception:
         pass
-async def _broadcast(msg):
+async def _broadcast(msg, uid=None):
+    """이벤트를 영속 로그에 적고 WS 콜백으로 흘린다.
+    Phase 2 멀티테넌트: uid 가 주어지면(오케스트레이터 사이클 이벤트) 해당 유저 연결에만,
+    uid 가 None 이면(시스템 알림 등) 전체 연결에 송신한다. 라우팅은 app.py 가 등록한
+    콜백(_route)이 결정한다."""
     try:
-        if isinstance(msg, dict): log_response_event({"source":"system_event", **msg})
+        if isinstance(msg, dict): log_response_event({"source":"system_event", **msg}, uid=uid)
     except Exception: pass
     if _broadcast_callback:
-        try: await _broadcast_callback(msg)
+        try: await _broadcast_callback(msg, uid)
         except: pass
 
 _TICKER_SKIP = {"APPROVED","JSON","KOSPI","KOSDAQ","KPI","NYSE","NASD","NASDAQ","AMEX","ETF","RSI","MACD",
@@ -726,6 +930,53 @@ def _has_label(text: str, *labels: str) -> bool:
     return bool(re.search(r"(?:" + "|".join(re.escape(l) for l in labels) + r")\s*[:：]", text or "", re.IGNORECASE))
 
 
+def _resolve_candidate_codes(allocation: str, *, session: Optional[str] = None,
+                             resolver=None, name_check=None, limit: int = 5) -> List[str]:
+    """'후보종목:' 라인을 파싱해 **실제 종목코드**로 해석한다 (사장 지시 2026-05-22).
+
+    운용전략실장(LLM)은 종목명은 알아도 6자리 코드를 몰라 환각(123456 등)한다. 그래서
+    `종목명(코드)`/`종목명`/`코드`/US티커가 섞여 들어온다. 규칙:
+      - 6자리 코드가 유효(name_check 로 이름 조회 성공)하면 그대로 사용.
+      - 코드가 무효/누락이면 **종목명을 resolver(이름→코드)로 검색**해 보정. 이름도 없으면 버린다.
+      - 영문 토큰은 US 세션(또는 세션 불명)에서만 미국 티커로 본다. KR 세션의 'HPSP' 같은
+        영문 종목명은 코드로 해석한다.
+    resolver/name_check 미주입(테스트·오프라인) 시 보정 없이 코드만 신뢰한다."""
+    m = re.search(r"(?:후보종목|대상종목|종목코드|target stocks)\s*[:：]\s*(.+)", allocation or "", re.IGNORECASE)
+    if not m:
+        return []
+    seg = m.group(1).splitlines()[0]
+    is_kr_session = session in ("KR_TRADING", "KR_PRE_MARKET", "KR_CLOSE_REVIEW")
+    out: List[str] = []
+    for tok in re.split(r"[,，;]", seg):
+        tok = tok.strip().strip(".·").strip()
+        if not tok:
+            continue
+        mm = re.match(r"(?P<name>.*?)\s*[\(（]\s*(?P<code>[A-Za-z0-9.]{1,6})\s*[\)）]\s*$", tok)
+        name = mm.group("name").strip() if mm else ""
+        inner = (mm.group("code").strip() if mm else tok)
+        code = inner if re.fullmatch(r"\d{6}", inner) else ""
+        # 영문 토큰 → US 티커 (단, KR 세션이면 영문 종목명일 수 있으니 코드 해석으로 넘김)
+        if not code and re.fullmatch(r"[A-Za-z]{1,5}", inner) and not is_kr_session:
+            t = inner.upper()
+            if t not in out:
+                out.append(t)
+            if len(out) >= limit:
+                break
+            continue
+        nm = name or ("" if code else tok)
+        resolved = ""
+        if code:
+            if name_check is None or name_check(code):
+                resolved = code  # 유효 코드(또는 검증 불가 환경)
+        if not resolved and nm and resolver:
+            resolved = resolver(nm) or ""
+        if resolved and resolved not in out:
+            out.append(resolved)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _affordable_one_share(price: float, cash: float, total: float) -> bool:
     """사장 결정 2026-05-16: '1주 예산'(총평가의 10%) 비율과 무관하게,
     1주 가격이 **가용 예수금** 이내면 최소 1주 매수를 허용한다.
@@ -751,6 +1002,95 @@ def _affordable_one_share(price: float, cash: float, total: float) -> bool:
     # **동일 기준**을 써서, 주문 초안이 곧바로 리스크 단에서 반려되는 모순을 막는다.
     # 사장님이 더 공격적으로 가려면 아래 한 줄을 `return price <= cash` 로 바꾸십시오.
     return price * _buffer <= cash
+
+_SELL_HOLD_WORDS = {"보유", "유지", "hold", "keep", "유보", "관망"}
+_SELL_ALL_WORDS  = {"전량", "전부", "모두", "all", "full", "100%", "청산"}
+_SELL_HALF_WORDS = {"절반", "반", "1/2", "half", "50%"}
+
+
+def _assemble_sell_orders(holdings, sell_directives, *, enable_rebalance, take_profit_pct,
+                          stop_loss_pct, trim_over_ratio, conservative_ratio, per_stock_cap, total,
+                          sell_prices=None):
+    """보유종목 → 매도 주문 리스트 + price_map. KR(6자리)·US(티커) 모두 처리.
+    사후관리실장 매도결정(sell_directives)이 우선, 미언급 종목은 자동 익절/손절(안전망).
+    편중축소(TRIM)는 KRW per_stock_cap 기준이라 KR에만 적용 — US(USD 평가액)와 통화를
+    섞으면 안 됨(버그 2026-05-22). 반환 order dict 의 market 으로 실행부가 us_sell/kr_sell 라우팅."""
+    sell_directives = sell_directives or {}
+    orders = []
+    price_map: dict = {}
+    for h in holdings:
+        code = str(h.get("code", "")).strip()
+        qty = int(h.get("qty") or 0)
+        if not code or qty < 1:
+            continue
+        is_kr = code.isdigit() and len(code) == 6
+        pkey = code if is_kr else code.upper()
+        pnl = float(h.get("pnl_pct") or 0.0)
+        cur = float(h.get("cur_price") or 0.0)
+        price_map[pkey] = cur
+        reason = None
+        sell_qty = 0
+        directive = sell_directives.get(code) or sell_directives.get(code.upper())
+        if directive is not None:
+            dl = str(directive).strip().lower()
+            if dl in _SELL_HOLD_WORDS:
+                continue
+            elif dl in _SELL_ALL_WORDS:
+                sell_qty = qty; reason = "사후관리실장 매도 판단 — 전량"
+            elif dl in _SELL_HALF_WORDS:
+                sell_qty = max(1, qty // 2); reason = "사후관리실장 매도 판단 — 절반"
+            else:
+                mnum = re.match(r"(\d+)", dl)
+                if mnum:
+                    sell_qty = max(1, min(int(mnum.group(1)), qty)); reason = f"사후관리실장 매도 판단 — {sell_qty}주"
+                else:
+                    continue  # 알 수 없는 지시 → 보유로 간주
+        elif enable_rebalance:
+            # 사후관리실장이 언급 안 한 종목 → 자동 익절/손절/편중축소 (안전망)
+            if pnl >= take_profit_pct:
+                reason = f"자동 익절 — 평가손익 {pnl:+.1f}% ≥ +{take_profit_pct:.0f}%"; sell_qty = qty
+            elif pnl <= -stop_loss_pct:
+                reason = f"자동 손절 — 평가손익 {pnl:+.1f}% ≤ -{stop_loss_pct:.0f}%"; sell_qty = qty
+            elif is_kr and trim_over_ratio and per_stock_cap > 0 and cur > 0 and (cur * qty) > per_stock_cap:
+                over = int(((cur * qty) - per_stock_cap) // cur) + 1
+                sell_qty = max(1, min(over, qty))
+                reason = f"편중 축소 — 비중 {cur*qty/total*100:.1f}% > {conservative_ratio*100:.0f}% 한도"
+        if reason and sell_qty > 0:
+            # 사장 지시 2026-05-22: 계량분석팀장이 '매도가'를 숫자로 제시하면 그 지정가로 매도.
+            # (시장가/미지정·안전망 자동 익절손절은 시장가 유지 — 즉시 청산.)
+            _sp = (sell_prices or {}).get(code) or (sell_prices or {}).get(pkey) or (sell_prices or {}).get(code.upper())
+            _lim = _sp.get("limit_price") if (_sp and _sp.get("mode") == "limit") else None
+            _od = {"ticker": pkey, "side": "sell", "qty": sell_qty,
+                   "price_type": "limit" if _lim else "market",
+                   "market": "KR" if is_kr else "US",
+                   "reason": (f"{h.get('name', pkey)} {reason} (보유 {qty}주, 평가손익 {pnl:+.1f}%"
+                              + (f", 매도지정가 {_lim:,.0f}" if _lim else "") + ")")}
+            if _lim:
+                _od["entry_mode"] = "limit"; _od["entry_limit"] = _lim
+            orders.append(_od)
+    return orders, price_map
+
+
+def _codes_for_session(holdings, session) -> List[str]:
+    """현재 세션 시장에 해당하는 보유 종목코드만 반환. US세션→US티커, KR세션→6자리, 장외→전체.
+    계량분석·매도평가 대상이 세션 시장과 일치하도록 한다 — 과거 6자리(KR)만 골라 US 보유분이
+    분석에서 통째 빠지던 버그(2026-05-22) 방지. [[arquant-kr-us-asymmetry-bugs]]"""
+    out: List[str] = []
+    for h in (holdings or []):
+        c = str(h.get("code", "")).strip()
+        if not c:
+            continue
+        is_kr = c.isdigit() and len(c) == 6
+        if session == "US_TRADING":
+            if not is_kr:
+                out.append(c)
+        elif session in ("KR_TRADING", "KR_PRE_MARKET", "KR_CLOSE_REVIEW"):
+            if is_kr:
+                out.append(c)
+        else:  # OFF_HOURS 등 — 양쪽 모두
+            out.append(c)
+    return out
+
 
 def _looks_like_tool_call(text: str) -> bool:
     """계량분석팀장 등이 분석 대신 도구호출 JSON/코드를 뱉었는지 감지 (사장 피드백 2026-05-18).
@@ -842,9 +1182,75 @@ def _parse_entry_directive(text: str, code: str) -> Dict[str, Any]:
     # 인식 실패 → 시장가 폴백
     return {"mode": "market", "limit_price": None, "watch_pct": None, "raw": raw}
 
+
+def _parse_sell_price(text: str, code: str) -> Dict[str, Any]:
+    """계량분석팀장의 `매도가: code=값` 한 줄 파싱 (사장 지시 2026-05-22).
+
+    값: '시장가' | 숫자(지정가) | 빈문자열(시장가). 매도는 관망 모드 없음 — 시장가 또는 지정가만.
+    Returns {"mode": "market"/"limit", "limit_price": float|None, "raw": str}."""
+    if not text or not code:
+        return {"mode": "market", "limit_price": None, "raw": ""}
+    m = re.search(rf"매도가\s*[:：][^\n]*\b{re.escape(code)}\s*=\s*([^\n,，;]+)", text, re.IGNORECASE)
+    if not m:
+        return {"mode": "market", "limit_price": None, "raw": ""}
+    raw = m.group(1).strip()
+    s = raw.lower().replace(",", "")
+    if not s or "시장가" in s or "market" in s or "즉시" in s:
+        return {"mode": "market", "limit_price": None, "raw": raw}
+    mm = re.match(r"([+\-]?[\d.]+)", s)
+    if mm:
+        try:
+            px = float(mm.group(1))
+            if px > 0:
+                return {"mode": "limit", "limit_price": px, "raw": raw}
+        except ValueError:
+            pass
+    return {"mode": "market", "limit_price": None, "raw": raw}
+
+
+def _quant_ctx_for(report: str, code: str, width: int = 200) -> str:
+    """주문 사유에 첨부할 '그 종목'의 퀀트 분석 앞부분을 돌려준다.
+
+    quant_report 는 종목별 섹션을 `\\n\\n---\\n\\n` 으로 이은 것이고, 각 섹션엔
+    `퀀트점수: {code}=` / `진입가: {code}=` 가 들어 있다. 그 앵커로 섹션을 찾아
+    인접 종목 텍스트 오염을 막는다.
+    버그 2026-05-22: 옛 구현은 report.find(code) 후 [idx-100:idx+200] 윈도우를 ctx[:90]
+    으로 잘라, idx-100 이 직전 종목 섹션의 꼬리를 끌어와 SK텔레콤(017670) 주문에
+    지아이이노베이션(358570) 퀀트가 붙었다."""
+    if not report or not code:
+        return ""
+    anchor = re.compile(rf"(?:퀀트점수|진입가)\s*[:：][^\n]*\b{re.escape(code)}\s*=", re.IGNORECASE)
+    for sec in report.split("\n\n---\n\n"):
+        if anchor.search(sec):
+            body = sec.split("\n", 1)[1] if "\n" in sec else sec
+            return body.replace("\n", " ").strip()[:width]
+    # 섹션 매칭 실패 — 코드 첫 등장 위치에서 '앞으로'만(뒤로 끌어오지 않음)
+    m = re.search(re.escape(code), report, re.IGNORECASE)
+    if m:
+        return report[m.start(): m.start() + width].replace("\n", " ").strip()
+    return ""
+
+
+def _affordable_buy_qty(price: float, *, per_order_budget: float, per_stock_cap: float,
+                        cycle_remaining: float) -> int:
+    """세 한도(주문당 예산·단일종목 한도·사이클 잔여예산)의 최소값 안에서 매수 수량을 산정.
+
+    리스크관리실장 결정론 검증(guardrails._check_single_order)과 **같은 한도**를 사이징
+    단계에서 선반영해, 종목을 골라놓고 비중·예산 초과로 반려되는 낭비를 막는다.
+    버그 2026-05-22: 개장 사이클이 per_stock_cap 을 60%로 완화했으나 검증은 25%로 반려 →
+    삼성전자 6주(58.6%)·대한항공 69주(59.9%)가 매번 반려, 매수 0건."""
+    if price <= 0:
+        return 0
+    budget = min(per_order_budget, per_stock_cap, cycle_remaining)
+    return int(budget // price) if budget > 0 else 0
+
+
 # 체결 미확인 주문을 다시 확인하기까지의 대기 시간(초). 모듈 상수로 둬서 테스트가
 # 5분 실대기 없이 재확인 로직을 검증할 수 있게 한다(seam).
 _REVERIFY_DELAY_SEC = 300
+# 사장 지시 2026-05-21: 미체결 주문을 5분마다 반복 폴링하는 최대 횟수 (5분 × 36 = 3시간).
+# 보통은 해당 시장 마감(KIS 자동취소) 시 조기 종료되고, 이 상한은 안전 장치(루프 누수 방지)다.
+_POLL_MAX_ATTEMPTS = 36
 
 
 def _trade_event_type(ok: bool) -> str:
@@ -888,8 +1294,17 @@ async def _llm_is_standing_directive(message: str, response: str) -> bool:
 
 
 class ArquantOrchestrator:
-    def __init__(self):
-        self.orchestrator = BaseAgent(name="운용전략실장", role="chief_orchestrator", model_key="chief_orchestrator",
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.uid = ctx.uid
+        self.is_admin = ctx.is_admin
+        from infra import user_paths
+        self.equity_path = user_paths.equity_path(ctx.uid)
+        self.trade_log_path = user_paths.trade_log_path(ctx.uid)
+        _inj = {"uid": ctx.uid,
+                "openrouter_key": ctx.creds.get("openrouter_key"),
+                "openrouter_base_url": None}
+        self.orchestrator = BaseAgent(name="운용전략실장", role="chief_orchestrator", model_key="chief_orchestrator", injection=_inj,
             system_prompt="""당신은 ArQuant v1.0의 운용전략실장입니다. 의사결정은 **2단계(2패스)**로 진행됩니다.
 
 ## 데이터 소스
@@ -905,7 +1320,8 @@ class ArquantOrchestrator:
   같은 업종 3개 이상, '삼성전자·SK하이닉스만' 같은 구성은 금지.
 - 이미 보유 중인 종목은 가급적 제외하고 새 후보를 우선합니다.
 - 응답 **마지막 줄**에 반드시 이 형식으로만(다른 텍스트 없이):
-  `후보종목: 005930, 000660, 012345, 067890, AAPL`  ← 국내 6자리 숫자 / 미국 티커, 정확히 5개
+  `후보종목: 삼성전자(005930), SK하이닉스(000660), 에코프로비엠(247540), 클래시스(214150), AAPL`
+  ← **종목명(코드)** 형식, 미국은 티커. 정확히 5개. 코드가 불확실하면 종목명만 정확히 적으면 시스템이 코드를 채웁니다 — 코드를 지어내지 마십시오.
 
 ## [최종 매수 종목 결정]
 - 계량분석팀장의 정량 평가와 뉴스분석팀장의 감성 분석을 받아, 후보 5개 중에서 **실제 매수할 종목을 좁힙니다.**
@@ -916,23 +1332,23 @@ class ArquantOrchestrator:
 
 ## 공통
 - 표에 없는 수치는 추정·생성하지 않습니다. 사장님(@사장)의 직접 지시는 최우선입니다.""")
-        self.macro_analyst = create_macro_analyst()
-        self.quant_analyst = create_quant_analyst()
-        self.news_analyst = create_news_analyst()
-        self.trader = create_trader()
-        self.risk_guard = create_risk_guard()
+        self.macro_analyst = create_macro_analyst(injection=_inj)
+        self.quant_analyst = create_quant_analyst(injection=_inj)
+        self.news_analyst = create_news_analyst(injection=_inj)
+        self.trader = create_trader(injection=_inj)
+        self.risk_guard = create_risk_guard(injection=_inj)
         # 사장 피드백 2026-05-18: 수탁자책임실장(policy_filter) 폐지 → 역할은 risk_guard 통합
-        self.post_manager = create_post_manager()
-        self.ops_support = create_ops_support()
+        self.post_manager = create_post_manager(injection=_inj)
+        self.ops_support = create_ops_support(injection=_inj)
         # 뉴스 헤드라인 사전 선별기 — 40건 초과 시 굵직한 40건만 추리는 경량 페르소나 (대시보드 @멘션은 안 받음)
         # 표시 이름은 사장 지시(2026-05-14)에 따라 '전략리서치팀장'으로 통일 (macro_analyst와 페르소나 공유 — model_key/role은 별도 유지).
         self.news_curator = BaseAgent(
-            name="전략리서치팀장", role="news_curator", model_key="news_curator",
+            name="전략리서치팀장", role="news_curator", model_key="news_curator", injection=_inj,
             system_prompt=("당신은 ArQuant '전략리서치팀장'의 뉴스 큐레이션 페르소나입니다. 다수의 증권 속보 헤드라인 중 시장·종목 분석에 가장 가치 있는 것만 골라내는 게 이 단계의 역할입니다.\n"
                 "선정 기준: ① 실적/M&A/규제/소송/증자·감자/관리종목·거래정지/실적 가이던스/대규모 계약 등 실질 이벤트 우선, "
                 "② 단순 시황 요약·일반 사설·반복 속보·재배포는 후순위, ③ 같은 사건 중복 보도는 1건만.\n"
                 "응답은 오직 한 줄 — `선정: 1, 4, 7, 12, ...` (1-base 인덱스 콤마 구분). 다른 설명/주석 절대 금지."))
-        self.broker = get_broker()
+        self.broker = ctx.broker
         self.news_monitor = get_monitor()
         self.current_state = SwarmState.IDLE
         self.cycle_log: Optional[SwarmCycleLog] = None
@@ -946,6 +1362,10 @@ class ArquantOrchestrator:
         self._last_cycle_at: float = 0.0   # epoch of last analysis cycle (for the hourly periodic trigger)
         self._last_session: Optional[str] = None   # previous loop iteration's session (for market-open detection)
         self._last_status_state: Optional[str] = None  # last broadcast status state (suppress 1-min OFF_HOURS spam)
+        # 사장 지시 2026-05-24: 개장 5분 후 KIS 실시세로 '오늘 개장 확정'을 1회 확인한 결과 캐시.
+        # 키 "KR:YYYY-MM-DD"/"US:YYYY-MM-DD" → True(개장 확정)만 적재(이후 호출 생략).
+        # 휴장/확인불가는 적재하지 않아 다음 사이클에 재확인(데이터 지연 자기 교정).
+        self._mkt_open_verified: Dict[str, bool] = {}
         self._trades_executed = 0
         self._trade_log: List[Dict] = []
         self._agents_map = {
@@ -958,11 +1378,17 @@ class ArquantOrchestrator:
         # 운용지원실장 단일 역할만 남으며, 팀장 멘션 라우팅은 빈 매핑으로 비활성화한다.
         self._ops_team_leaders: Dict[str, str] = {}
 
+    async def _emit(self, msg):
+        """이 오케스트레이터(=이 유저)의 사이클 이벤트를 그 유저 WS 연결에만 송신한다.
+        Phase 2 멀티테넌트: 다른 유저 대시보드로 이벤트가 새지 않게 uid 로 라우팅한다."""
+        await _broadcast(msg, uid=self.uid)
+
     async def ceo_directive(self, message: str) -> str:
         # 사장 지시 2026-05-20: 운용지원실장은 ADMIN·일반 유저 모두 사용 가능
         # (프로필 한정 파라미터 조정만 — 코드 자가수정·산하 팀장 폐지).
         _auid, _admin = self._active_actor()
-        mention = re.search(r"@(\S+)", message)
+        # 선두 @<태그> 만 라우팅 태그로 인정한다(문장 중간 @멘션은 본문으로 취급).
+        mention = re.match(r"\s*@(\S+)", message or "")
         if mention:
             name = mention.group(1)
             # 사장 지시 2026-05-20: 운용지원실장은 ADMIN·일반 유저 모두 사용 가능(프로필 한정
@@ -971,6 +1397,8 @@ class ArquantOrchestrator:
             if agent:
                 # 운용지원실장: 자동 분류 후 적절한 팀장 role로 spawn
                 if name == "운용지원실장":
+                    # 운용지원실장은 ADMIN·일반 유저 모두 '프로필 한정 파라미터 튜닝'을 수행한다.
+                    # (운용지원실장은 애초에 소스/서버를 건드릴 능력이 없으므로 별도 거부 게이트가 불필요.)
                     return await self._ops_support_execute(message)
                 # 일반 에이전트는 대화 페르소나 — 설정/코드는 직접 못 바꿈.
                 # 전략/예산 조정이 필요하면 운용지원실장 라인이 '이 프로필 전용' 파라미터로 반영.
@@ -987,19 +1415,23 @@ class ArquantOrchestrator:
                     try:
                         _live_ctx = await self.broker.kr_balance()
                     except Exception as _be:
-                        record_error(name, _be, context="ceo_directive 멘션 잔고 주입 실패")
+                        record_error(name, _be, context="ceo_directive 멘션 잔고 주입 실패", uid=self.uid)
                         _live_ctx = ("[국내 계좌잔고] 조회 실패 — 보유 수량을 단정하지 말고 "
                                      "'확인 불가'로 답하십시오.")
                 resp = await agent.think(f"[🔴 사장 직접 지시] {message}\n\n{_guide}", context=_live_ctx)
-                await _broadcast({"type":"agent_msg","agent":name,"message":resp})
+                await self._emit({"type":"agent_msg","agent":name,"message":resp})
                 # 자동 체이닝 — 운용지원실장(프로필 한정 파라미터 조정)으로 (ADMIN·일반 공통).
                 if self._needs_ops_chain(resp):
                     await self._auto_chain_to_ops(message, source_agent=name, source_response=resp)
                 asyncio.create_task(self._auto_persist_directive(message, resp))   # 체크박스 대체: 자동 판단 저장
                 return resp
-            return f"에이전트 '{name}' 없음. 가능: {', '.join(self._agents_map.keys())}"
+            # Task 8: 잘못된/알 수 없는 태그 → 하드 에러로 막지 말고 가장 적절한 에이전트(운용전략실장)에게
+            # 핸드오프한다. 선두의 잘못된 @태그 토큰만 제거하고 본문을 운용전략실장에게 넘긴다.
+            logger.info("ceo_directive: 알 수 없는 태그 '@%s' — 운용전략실장으로 핸드오프", name)
+            _body = re.sub(r"^\s*@\S+\s*", "", message or "", count=1)
+            message = _body if _body.strip() else (message or "")
         resp = await self.orchestrator.think(f"[🔴 사장 직접 지시] {message}")
-        await _broadcast({"type":"agent_msg","agent":"운용전략실장","message":resp})
+        await self._emit({"type":"agent_msg","agent":"운용전략실장","message":resp})
         # 운용전략실장 응답도 자동 체이닝 — 운용지원실장(프로필 한정 조정)으로 (ADMIN·일반 공통).
         if self._needs_ops_chain(resp):
             await self._auto_chain_to_ops(message, source_agent="운용전략실장", source_response=resp)
@@ -1027,7 +1459,7 @@ class ArquantOrchestrator:
                 return
             from infra.standing_directives import append_directive
             if append_directive(_auid, text):
-                await _broadcast({"type": "agent_msg", "agent": "시스템",
+                await self._emit({"type": "agent_msg", "agent": "시스템",
                                   "message": "📌 위 지시를 '지속 운영 원칙'으로 판단해 상시 지시로 저장했습니다 "
                                              "— 프로필 › 지시사항 관리에서 확인·삭제할 수 있습니다."})
         except Exception as _e:
@@ -1060,26 +1492,16 @@ class ArquantOrchestrator:
                         "operations": "경영관리팀장", "finance": "재무관리팀장"}
         display = ROLE_DISPLAY.get(role, "운용지원실장")
         # 사용자에게 체이닝 사실을 명확히 표시 (UI 로그에 노출)
-        await _broadcast({"type": "agent_msg", "agent": "시스템",
+        await self._emit({"type": "agent_msg", "agent": "시스템",
                           "message": f"🔁 자동 지명 호출: {source_agent} → {display} (role={role}). "
                                      f"사장님 원지시를 그대로 전달합니다."})
         # 워커는 원래 사장 지시 메시지를 받아 동일하게 처리
         await self._ops_support_execute(original_message, role=role)
 
-    @staticmethod
-    def _active_actor() -> tuple:
-        """활성(봇을 장악한) 계정의 (user_id, is_admin).
-
-        사장 피드백 2026-05-18: 운용지원실장·산하 팀장(코드수정·서버재시작)은
-        ADMIN(hh09080) 전용. 조회 실패 시 **default-deny**(비관리자)로 떨어뜨려
-        사고로라도 비관리자 계정에서 전체 소스가 바뀌지 않게 한다."""
-        try:
-            from infra import credentials as _creds
-            _act = _creds.current()
-            return _act.get("user_id"), bool(_act.get("is_admin"))
-        except Exception as _e:
-            logger.warning(f"활성 계정 조회 실패 — 비관리자로 처리: {_e}")
-            return None, False
+    def _active_actor(self) -> tuple:
+        """This orchestrator's (uid, is_admin). Phase 2: identity comes from the owning
+        UserContext, not a global active account."""
+        return self.uid, self.is_admin
 
     def _spawn_ops_support_worker(self, cycle_id: Optional[int] = None, manual_directive: Optional[str] = None,
                                   role: str = "ops_support"):
@@ -1150,7 +1572,7 @@ class ArquantOrchestrator:
                           f"실제 조정 발생 {st['runs_with_changes']}회 / "
                           f"반영된 파라미터 {st['total_applied_changes']}건")
             full = text + stats_line
-            await _broadcast({"type": "agent_msg", "agent": "운용지원실장", "message": full})
+            await self._emit({"type": "agent_msg", "agent": "운용지원실장", "message": full})
             return full
 
         # 사장 피드백 2026-05-18: 운용지원실장 피드백 토글이 OFF면 새 지시는 받지 않는다
@@ -1160,7 +1582,7 @@ class ArquantOrchestrator:
             if not _rt.ops_feedback_enabled(_auid):
                 msg = ("⏸ 이 계정의 운용지원실장 피드백이 현재 **꺼짐(OFF)** 상태입니다. "
                        "대시보드의 '운용지원 피드백' 토글을 켜면 지시·자동 사이클 분석이 재개됩니다.")
-                await _broadcast({"type": "agent_msg", "agent": "운용지원실장", "message": msg})
+                await self._emit({"type": "agent_msg", "agent": "운용지원실장", "message": msg})
                 return msg
         except Exception:
             pass
@@ -1169,14 +1591,14 @@ class ArquantOrchestrator:
         display = "운용지원실장"
 
         # 사장이 내린 지시 원문도 대시보드 로그에 남긴다.
-        await _broadcast({"type":"agent_msg","agent":"사장",
+        await self._emit({"type":"agent_msg","agent":"사장",
                           "message": f"🗣 [사장 → {display}] {message}"})
         self._spawn_ops_support_worker(cycle_id=None, manual_directive=message)
         msg = (f"🛠 {display}: 위 지시를 분석해 **이 프로필 전용** 전략 튜닝 파라미터로 조정안을 "
                f"제시합니다. 전략·예산·익절/손절 같은 '적용 가능 전략' 파라미터가 이 프로필에 "
                f"반영되어 다음 로그인 시 활성화됩니다. "
                f"('@운용지원실장 이력 보여줘'로 이 프로필 반영 내역 조회 가능)")
-        await _broadcast({"type":"agent_msg","agent":display,"message":msg})
+        await self._emit({"type":"agent_msg","agent":display,"message":msg})
         return msg
 
     async def _research_macro_themes(self, session: str, force: bool = False,
@@ -1231,7 +1653,7 @@ class ArquantOrchestrator:
     async def _collect_index_data(self):
         """글로벌 지수 워치리스트 크롤링 (blocking → run_in_executor). Returns the structured dict."""
         self.current_state = SwarmState.DATA_COLLECTION
-        await _broadcast({"type":"status","state":"DATA_COLLECTION","message":"글로벌 지수 수집 중"})
+        await self._emit({"type":"status","state":"DATA_COLLECTION","message":"글로벌 지수 수집 중"})
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, get_index_data)
 
@@ -1245,7 +1667,7 @@ class ArquantOrchestrator:
           US: KIS 시세 + 일봉 (primary) → 실패 시 메시지에 명시"""
         if not codes:
             return "[종목 데이터] 분석 대상 종목 없음"
-        await _broadcast({"type":"status","state":"DATA_COLLECTION","message":f"종목 {len(codes)}개 데이터 수집 중"})
+        await self._emit({"type":"status","state":"DATA_COLLECTION","message":f"종목 {len(codes)}개 데이터 수집 중"})
         loop = asyncio.get_event_loop()
         summaries = []
         empty_us_codes = set()
@@ -1343,7 +1765,7 @@ class ArquantOrchestrator:
         picked = [a for _, a in scored[:effective_limit]]
         # 원래 시간 순서로 다시 정렬해 뉴스 분석가가 흐름을 잡기 쉽게
         picked.sort(key=lambda a: articles.index(a))
-        await _broadcast({"type": "agent_msg", "agent": "전략리서치팀장",
+        await self._emit({"type": "agent_msg", "agent": "전략리서치팀장",
             "message": f"🗂️ 누적 헤드라인 {len(articles)}건 → 결정론적 점수로 굵직한 **{len(picked)}건** 선별 (LLM 미호출, 키워드+종목코드 가중치)"})
         return picked
 
@@ -1431,7 +1853,8 @@ class ArquantOrchestrator:
     async def _build_orders(self, target_codes: List[str], candidate_codes: List[str], quant_report: str, news_report: str,
                             holdings: List[Dict], sell_directives: Optional[Dict[str, str]] = None,
                             market_open: bool = False,
-                            entry_dirs: Optional[Dict[str, Dict[str, Any]]] = None):
+                            entry_dirs: Optional[Dict[str, Dict[str, Any]]] = None,
+                            sell_prices: Optional[Dict[str, Dict[str, Any]]] = None):
         """Assemble OrderDraft JSON in Python (no LLM):
           1) SELL from current holdings — if 사후관리실장 gave a `sell_directives` map ({code: '전량'|'절반'|'보유'|'N주'})
              it is authoritative for the holdings it addresses; holdings it didn't mention fall back to the auto rules
@@ -1442,22 +1865,25 @@ class ArquantOrchestrator:
         US targets get a conservative qty=1 (needs USD cash). Returns (order_obj, price_map, buying_power)."""
         sell_directives = sell_directives or {}
         # live strategy params
-        PER_ORDER_BUDGET_RATIO = runtime.get("PER_ORDER_BUDGET_RATIO"); CONSERVATIVE_STOCK_RATIO = runtime.get("CONSERVATIVE_STOCK_RATIO")
-        PER_ORDER_BUDGET_OVERSHOOT = float(runtime.get("PER_ORDER_BUDGET_OVERSHOOT") or 1.20)
-        MAX_ORDER_QTY = runtime.get("MAX_ORDER_QTY"); MAX_TRADES_PER_CYCLE = runtime.get("MAX_TRADES_PER_CYCLE")
-        ENABLE_SELL_REBALANCE = runtime.get("ENABLE_SELL_REBALANCE"); TAKE_PROFIT_PCT = runtime.get("TAKE_PROFIT_PCT")
-        STOP_LOSS_PCT = runtime.get("STOP_LOSS_PCT"); TRIM_OVER_RATIO = runtime.get("TRIM_OVER_RATIO")
-        ENABLE_CHEAP_FALLBACK = runtime.get("ENABLE_CHEAP_FALLBACK"); ALLOW_US_STOCKS = runtime.get("ALLOW_US_STOCKS")
-        ALLOW_DERIVATIVES = runtime.get("ALLOW_DERIVATIVES")
+        PER_ORDER_BUDGET_RATIO = runtime.get("PER_ORDER_BUDGET_RATIO", uid=self.uid); CONSERVATIVE_STOCK_RATIO = runtime.get("CONSERVATIVE_STOCK_RATIO", uid=self.uid)
+        PER_ORDER_BUDGET_OVERSHOOT = float(runtime.get("PER_ORDER_BUDGET_OVERSHOOT", uid=self.uid) or 1.20)
+        MAX_ORDER_QTY = runtime.get("MAX_ORDER_QTY", uid=self.uid); MAX_TRADES_PER_CYCLE = runtime.get("MAX_TRADES_PER_CYCLE", uid=self.uid)
+        ENABLE_SELL_REBALANCE = runtime.get("ENABLE_SELL_REBALANCE", uid=self.uid); TAKE_PROFIT_PCT = runtime.get("TAKE_PROFIT_PCT", uid=self.uid)
+        STOP_LOSS_PCT = runtime.get("STOP_LOSS_PCT", uid=self.uid); TRIM_OVER_RATIO = runtime.get("TRIM_OVER_RATIO", uid=self.uid)
+        ENABLE_CHEAP_FALLBACK = runtime.get("ENABLE_CHEAP_FALLBACK", uid=self.uid); ALLOW_US_STOCKS = runtime.get("ALLOW_US_STOCKS", uid=self.uid)
+        ALLOW_DERIVATIVES = runtime.get("ALLOW_DERIVATIVES", uid=self.uid)
+        MAX_CYCLE_BUDGET_RATIO = float(runtime.get("MAX_CYCLE_BUDGET_RATIO", uid=self.uid) or 0.4)  # 리스크검증과 동일한 사이클 예산 한도
         report = (quant_report or "") + "\n" + (news_report or "")
         snap = await self.broker.kr_account_snapshot()
         bp = snap["buying_power"]; holdings = holdings or snap.get("holdings") or []
         # 사장 지시 2026-05-21: 자산곡선은 KR+US 통합 총평가로 기록한다(주문 사이징은 KR 기준 bp 유지).
-        try:
-            _pf = await self.broker.portfolio_holdings()
-            record_equity(_pf.get("buying_power") or bp, "cycle", holdings=_pf.get("holdings") or holdings)
-        except Exception:
-            record_equity(bp, "cycle", holdings=holdings)
+        # 사장 지시 2026-05-24: 실제 정규장 세션(요일·휴장 반영)에만 평가금액 추이를 기록한다(장외/주말/휴장 제외).
+        if is_market_session_now():
+            try:
+                _pf = await self.broker.portfolio_holdings()
+                record_equity(self.equity_path, _pf.get("buying_power") or bp, "cycle", holdings=_pf.get("holdings") or holdings)
+            except Exception:
+                record_equity(self.equity_path, bp, "cycle", holdings=holdings)
         cash = float(bp.get("cash", 0.0) or 0.0)
         total = float(bp.get("total_eval", 0.0) or 0.0) or cash
         # 사장 지시 2026-05-14: 1주 예산은 **총평가액** 기준 (실제 spend는 cash로 캡).
@@ -1466,54 +1892,32 @@ class ArquantOrchestrator:
         if market_open:
             target_per_order = total * min(1.0, PER_ORDER_BUDGET_RATIO * 5.0)  # 5배 확대 (균형형이면 50%까지)
         per_order_budget = min(target_per_order, cash) if cash > 0 else 0.0
+        # 단일 종목 비중 한도는 리스크관리실장 검증(total*CONSERVATIVE_STOCK_RATIO)과 동일하게 유지한다.
+        # 버그 2026-05-22: 개장 사이클에서만 이 한도를 60%로 풀어 큰 주문을 만들었으나, 검증부는
+        # 완화를 몰라 25%로 반려 → 고가주가 매번 반려됐다. 사이징을 검증과 일치시켜 통과시킨다.
         per_stock_cap = total * CONSERVATIVE_STOCK_RATIO if total > 0 else 0.0
-        if market_open:
-            # 개장 한도 해제 — 단일 종목 비중 한도도 같이 풀어줘야 큰 사이즈가 통과
-            per_stock_cap = total * min(0.6, CONSERVATIVE_STOCK_RATIO * 3.0)
+        cycle_budget = cash * MAX_CYCLE_BUDGET_RATIO if cash > 0 else 0.0
+        spent_krw = 0.0  # 이번 사이클 매수 누적(원화 환산) — 검증부 사이클 예산 한도를 사이징에 선반영
         held_codes = {str(h.get("code","")).strip() for h in holdings}
+        # 사장 지시 2026-05-22: 사이클 예산을 '매수 대상 종목 수'로 균등 배분해 분산 매수한다.
+        # (한 종목이 예산을 독식해 다음 종목이 '사이클 누적 매수예산 초과'로 반려되던 케이스 방지 —
+        #  QUBT 49주 승인 후 IBM 반려처럼.)
+        _n_buy = max(1, len({str(c).strip() for c in (target_codes or [])
+                             if str(c).strip() and str(c).strip() not in held_codes}))
+        per_name_budget = (cycle_budget / _n_buy) if cycle_budget > 0 else float("inf")
         orders: List[Dict] = []
         price_map: Dict[str, float] = {}
         notes: List[str] = []
 
-        # ── 1) SELL — 사후관리실장 매도결정 우선, 미언급 종목은 자동 규칙 ───────────────
-        _HOLD_WORDS = {"보유", "유지", "hold", "keep", "유보", "관망"}
-        _ALL_WORDS  = {"전량", "전부", "모두", "all", "full", "100%", "청산"}
-        _HALF_WORDS = {"절반", "반", "1/2", "half", "50%"}
+        # ── 1) SELL — 사후관리실장 매도결정 우선, 미언급 종목은 자동 규칙 (KR·US 모두) ──
         if ENABLE_SELL_REBALANCE or sell_directives:
-            for h in holdings:
-                code = str(h.get("code","")).strip(); qty = int(h.get("qty") or 0)
-                if not (code.isdigit() and len(code) == 6) or qty < 1:
-                    continue
-                pnl = float(h.get("pnl_pct") or 0.0); cur = float(h.get("cur_price") or 0.0)
-                price_map[code] = cur
-                reason = None; sell_qty = 0
-                directive = sell_directives.get(code) or sell_directives.get(code.upper())
-                if directive is not None:
-                    dl = str(directive).strip().lower()
-                    if dl in _HOLD_WORDS:
-                        continue
-                    elif dl in _ALL_WORDS:
-                        sell_qty = qty; reason = "사후관리실장 매도 판단 — 전량"
-                    elif dl in _HALF_WORDS:
-                        sell_qty = max(1, qty // 2); reason = "사후관리실장 매도 판단 — 절반"
-                    else:
-                        mnum = re.match(r"(\d+)", dl)
-                        if mnum:
-                            sell_qty = max(1, min(int(mnum.group(1)), qty)); reason = f"사후관리실장 매도 판단 — {sell_qty}주"
-                        else:
-                            continue  # 알 수 없는 지시 → 보유로 간주
-                elif ENABLE_SELL_REBALANCE:
-                    # 사후관리실장이 언급 안 한 종목 → 자동 익절/손절/편중축소 (안전망)
-                    if pnl >= TAKE_PROFIT_PCT:
-                        reason = f"자동 익절 — 평가손익 {pnl:+.1f}% ≥ +{TAKE_PROFIT_PCT:.0f}%"; sell_qty = qty
-                    elif pnl <= -STOP_LOSS_PCT:
-                        reason = f"자동 손절 — 평가손익 {pnl:+.1f}% ≤ -{STOP_LOSS_PCT:.0f}%"; sell_qty = qty
-                    elif TRIM_OVER_RATIO and per_stock_cap > 0 and cur > 0 and (cur * qty) > per_stock_cap:
-                        over = int(((cur * qty) - per_stock_cap) // cur) + 1
-                        sell_qty = max(1, min(over, qty)); reason = f"편중 축소 — 비중 {cur*qty/total*100:.1f}% > {CONSERVATIVE_STOCK_RATIO*100:.0f}% 한도"
-                if reason and sell_qty > 0:
-                    orders.append({"ticker": code, "side": "sell", "qty": sell_qty, "price_type": "market",
-                                   "market": "KR", "reason": f"{h.get('name',code)} {reason} (보유 {qty}주, 평가손익 {pnl:+.1f}%)"})
+            _sell_orders, _sell_px = _assemble_sell_orders(
+                holdings, sell_directives, enable_rebalance=ENABLE_SELL_REBALANCE,
+                take_profit_pct=TAKE_PROFIT_PCT, stop_loss_pct=STOP_LOSS_PCT,
+                trim_over_ratio=TRIM_OVER_RATIO, conservative_ratio=CONSERVATIVE_STOCK_RATIO,
+                per_stock_cap=per_stock_cap, total=total, sell_prices=sell_prices)
+            orders.extend(_sell_orders)
+            price_map.update(_sell_px)
 
         # ── 2) BUY targets ──────────────────────────────────────────────
         affordable_buy_found = False
@@ -1524,10 +1928,7 @@ class ArquantOrchestrator:
             is_kr = code.isdigit() and len(code) == 6
             if not is_kr and not ALLOW_US_STOCKS:
                 notes.append(f"{code}: 해외주식 비활성(ALLOW_US_STOCKS=False) → 제외"); continue
-            ctx = ""
-            idx = report.find(code)
-            if idx >= 0:
-                ctx = report[max(0, idx - 100): idx + 200].replace("\n", " ").strip()
+            ctx = _quant_ctx_for(report, code)
             if is_kr:
                 if code in held_codes:
                     notes.append(f"{code}: 이미 보유 → 신규 매수 생략(분산)"); continue
@@ -1536,8 +1937,10 @@ class ArquantOrchestrator:
                 price_map[code] = price
                 if price <= 0 or per_order_budget <= 0:
                     notes.append(f"{code}: 사이즈 산정 불가(가격={price:,.0f}원, 총평가={total:,.0f}원·예수금={cash:,.0f}원) → 제외"); continue
-                budget = min(per_order_budget, per_stock_cap) if per_stock_cap > 0 else per_order_budget
-                qty = int(budget // price)
+                qty = _affordable_buy_qty(
+                    price, per_order_budget=min(per_order_budget, per_name_budget),
+                    per_stock_cap=(per_stock_cap if per_stock_cap > 0 else float("inf")),
+                    cycle_remaining=max(0.0, cycle_budget - spent_krw))
                 if MAX_ORDER_QTY and MAX_ORDER_QTY > 0:
                     qty = min(qty, MAX_ORDER_QTY)
                 if qty < 1:
@@ -1548,6 +1951,7 @@ class ArquantOrchestrator:
                     else:
                         notes.append(f"{code}: 1주가 {price:,.0f}원 — 예수금 {cash:,.0f}원으로 매수 불가 → 제외"); continue
                 affordable_buy_found = True
+                spent_krw += qty * price
                 # 사장 피드백 2026-05-15 (#4): 계량분석팀장이 지정한 진입가 directive 첨부 (시장가 default)
                 _ed = (entry_dirs or {}).get(code, {"mode": "market", "limit_price": None, "watch_pct": None, "raw": ""})
                 orders.append({"ticker": code, "side": "buy", "qty": qty, "price_type": "market", "market": "KR",
@@ -1565,9 +1969,12 @@ class ArquantOrchestrator:
                     notes.append(f"{tk}: 해외 시세 조회 실패(거래소 미확인) → 제외"); continue
                 if us_px < 0.01:
                     notes.append(f"{tk}: 가격 ${us_px:.4f} — KIS 온라인 주문 최소단위($0.01) 미만 → 주문불가, 제외"); continue
-                _krw_per_usd = 1500.0  # rough; KIS 통합증거금 환산. 정확한 환율은 KIS API에서.
-                _budget_usd = (min(per_order_budget, per_stock_cap) if per_stock_cap > 0 else per_order_budget) / _krw_per_usd
-                qty_us = int(_budget_usd // us_px) if _budget_usd > 0 else 0
+                _krw_per_usd = get_usdkrw(1510.0)  # 사장 지시 2026-05-22: 5분 크롤 라이브 환율(폴백 1510)
+                _budget_usd = per_order_budget / _krw_per_usd  # 표시용(주문당 예산)
+                qty_us = _affordable_buy_qty(
+                    us_px, per_order_budget=min(per_order_budget, per_name_budget) / _krw_per_usd,
+                    per_stock_cap=((per_stock_cap / _krw_per_usd) if per_stock_cap > 0 else float("inf")),
+                    cycle_remaining=max(0.0, cycle_budget - spent_krw) / _krw_per_usd)
                 if MAX_ORDER_QTY and MAX_ORDER_QTY > 0:
                     qty_us = min(qty_us, MAX_ORDER_QTY)
                 if qty_us < 1:
@@ -1581,6 +1988,7 @@ class ArquantOrchestrator:
                         notes.append(f"{tk}: 1주 ${us_px:.2f} — 예수금 ${_cash_usd:,.2f}으로 매수 불가 → 제외"); continue
                 est_krw = us_px * qty_us * _krw_per_usd
                 affordable_buy_found = True
+                spent_krw += est_krw
                 _ed = (entry_dirs or {}).get(tk, {"mode": "market", "limit_price": None, "watch_pct": None, "raw": ""})
                 orders.append({"ticker": tk, "side": "buy", "qty": qty_us, "price_type": "market", "market": "US",
                                "entry_mode": _ed.get("mode"), "entry_limit": _ed.get("limit_price"),
@@ -1704,6 +2112,89 @@ class ArquantOrchestrator:
     _MARKET_OPEN_SESSIONS = ("KR_PRE_MARKET", "US_TRADING")
     _LIVE_SESSIONS = ("KR_PRE_MARKET", "KR_TRADING", "US_TRADING")
 
+    async def _verify_market_open(self, session: str) -> Optional[bool]:
+        """개장 5분 경과 후, KIS 실시세로 '오늘 실제 거래가 있었는지'를 1회 확인한다 (사장 지시 2026-05-24).
+        휴일을 하드코딩 목록으로만 추정하지 말고, 실데이터로 한번 검증하라는 취지.
+          KR: KOSPI(0001) 지수 일봉의 최신 봉 날짜가 '오늘'이면 개장.
+          US: 유동성 큰 티커(AAPL) 일봉의 최신 봉 날짜가 'US 거래일'이면 개장.
+        반환: True=거래중(개장 확정) / False=당일 데이터 없음(휴장 추정) / None=시기상조·확인불가(폴백).
+        주의(거래 누락 방지): True(개장)만 당일 캐시한다. False/None 은 캐시하지 않아 다음 사이클에
+        재확인 → KIS 당일 봉이 늦게 채워진 일시적 지연이 자기 교정된다."""
+        now = _now_kst()
+        is_kr = session in ("KR_TRADING", "KR_PRE_MARKET", "KR_CLOSE_REVIEW")
+        is_us = session == "US_TRADING"
+        if not (is_kr or is_us):
+            return None
+        # KR_PRE_MARKET 은 개장 전이라 당일 봉이 아직 없음 → 확인 보류(폴백).
+        if session == "KR_PRE_MARKET":
+            return None
+        market = "KR" if is_kr else "US"
+        # ── 개장 +5분 경과 판정 ──
+        if is_kr:
+            sh, sm = SCHEDULE["kr_trading"]["start"]
+            past_open5 = (now.hour * 60 + now.minute) >= (sh * 60 + sm + 5)
+            expect = now.strftime("%Y-%m-%d")
+        else:
+            # US 정규장 22:30 개장(야간) — 22:35 이후(당일) 또는 자정~05:00(이미 경과).
+            past_open5 = (now.hour == 22 and now.minute >= 35) or (now.hour == 23) or (now.hour < 5)
+            # US 거래일: KST 저녁(22~24시)=같은 날짜, 자정~새벽(00~05시)=전날.
+            expect = now.strftime("%Y-%m-%d") if now.hour >= 22 else (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        if not past_open5:
+            return None
+        ck = f"{market}:{now.strftime('%Y-%m-%d')}"
+        if self._mkt_open_verified.get(ck):
+            return True
+        try:
+            if is_kr:
+                rows = await self.broker.kr_index_daily("0001", days=5)
+            else:
+                rows = await self.broker.us_daily_chart("AAPL", days=5)
+        except Exception as _e:
+            logger.warning(f"[개장확인] {market} 실시세 확인 실패(폴백) — {_e}")
+            return None
+        if not rows:
+            logger.info(f"[개장확인] {market} 실시세 빈 응답 — 확인 보류(폴백)")
+            return None
+        latest = str(rows[-1].get("date", ""))
+        if latest == expect:
+            self._mkt_open_verified[ck] = True
+            logger.info(f"[개장확인] {market} {expect}: 개장 확정 (KIS 최신 봉={latest})")
+            return True
+        if latest and latest < expect:
+            logger.info(f"[개장확인] {market} {expect}: 당일 봉 없음 → 휴장 추정 (KIS 최신 봉={latest})")
+            return False
+        logger.info(f"[개장확인] {market} {expect}: 판정 보류 (KIS 최신 봉={latest})")
+        return None
+
+    async def _market_closed_today(self, session: str) -> tuple[bool, str]:
+        """이 세션의 시장이 오늘 휴장인지 판정. 우선순위(사장 지시 2026-05-24):
+          1) 주말 → 무조건 휴장 (KIS 호출 안 함, 자명).
+          2) 개장 5분 후 KIS 실시세 확인 → 개장이면 진행(하드코딩 휴장일보다 우선),
+             명백히 당일 봉 없으면 휴장.
+          3) 실확인 전/불가 → 하드코딩 휴장일 목록(폴백).
+        반환: (휴장이면 True, 사유 문자열)."""
+        now = _now_kst()
+        is_kr = session in ("KR_TRADING", "KR_PRE_MARKET", "KR_CLOSE_REVIEW")
+        is_us = session == "US_TRADING"
+        if not (is_kr or is_us):
+            return False, ""
+        # 1) 주말 — 자명한 휴장
+        if (is_kr and is_kr_weekend(now)) or (is_us and is_us_weekend(now)):
+            return True, f"주말 — 사이클 스킵 ({now.strftime('%Y-%m-%d %a')})"
+        # 2) 개장 5분 후 실시세 확인 (1순위 권위)
+        verified = await self._verify_market_open(session)
+        if verified is True:
+            return False, ""
+        if verified is False:
+            mk = "KR" if is_kr else "US"
+            return True, f"{mk} 실거래 확인 결과 오늘 휴장 (KIS 당일 봉 없음) — 사이클 스킵"
+        # 3) 폴백 — 하드코딩 휴장일 목록
+        if is_kr and is_kr_holiday(now):
+            return True, f"KR 휴장일({now.strftime('%Y-%m-%d %a')}) — 사이클 스킵"
+        if is_us and is_us_holiday(now):
+            return True, "US 휴장일/주말 — 사이클 스킵"
+        return False, ""
+
     async def _set_status(self, state: str, message: str, *, force: bool = False):
         """Broadcast a status update only when the state actually changes (or force=True).
         Prevents the every-60s OFF_HOURS spam in the dashboard log."""
@@ -1714,7 +2205,7 @@ class ArquantOrchestrator:
             self.current_state = SwarmState(state)
         except ValueError:
             pass
-        await _broadcast({"type": "status", "state": state, "message": message})
+        await self._emit({"type": "status", "state": state, "message": message})
 
     async def _entry_watch_task(self, ticker: str, qty: int, market: str,
                                  watch_pct: float, baseline_holdings: List[Dict],
@@ -1730,7 +2221,7 @@ class ArquantOrchestrator:
         try:
             initial_px = await (self.broker.kr_last_price(ticker) if is_kr else self.broker.us_last_price(ticker))
             if not initial_px or initial_px <= 0:
-                await _broadcast({"type":"trade_failed",
+                await self._emit({"type":"trade_failed",
                     "message": f"⏰ {ticker} 대기 매수 취소 — 초기가 조회 실패"})
                 return
             target_px = initial_px * (1 + watch_pct / 100.0)
@@ -1738,13 +2229,13 @@ class ArquantOrchestrator:
             elapsed_min = 0
             while time.time() - start < max_wait:
                 if self._stop_event.is_set():
-                    await _broadcast({"type":"trade_failed",
+                    await self._emit({"type":"trade_failed",
                         "message": f"⏰ {ticker} 대기 매수 취소 — 사용자 중지"})
                     return
                 # 시장 마감 체크
                 sess = get_current_session()
                 if (is_kr and sess not in ("KR_TRADING", "KR_PRE_MARKET")) or (not is_kr and sess != "US_TRADING"):
-                    await _broadcast({"type":"trade_failed",
+                    await self._emit({"type":"trade_failed",
                         "message": f"⏰ {ticker} 대기 매수 취소 — 장 마감 ({sess})"})
                     return
                 cur = await (self.broker.kr_last_price(ticker) if is_kr else self.broker.us_last_price(ticker))
@@ -1755,7 +2246,7 @@ class ArquantOrchestrator:
                         triggered = True
                         break
                     if elapsed_min % 5 == 0:  # 5분마다 진행상황 broadcast
-                        await _broadcast({"type":"agent_msg","agent":"트레이딩팀장",
+                        await self._emit({"type":"agent_msg","agent":"트레이딩팀장",
                             "message": f"⏱ {ticker} 분봉 모니터 ({elapsed_min}분 경과): 현재가 {cur:,.2f} / 목표 {target_px:,.2f} ({move_pct:+.2f}%)"})
                 await asyncio.sleep(poll_interval)
                 elapsed_min += 1
@@ -1766,105 +2257,181 @@ class ArquantOrchestrator:
             # 시장 마감 직전 다시 한 번 체크 (KIS가 거부할 수 있으므로)
             sess = get_current_session()
             if (is_kr and sess not in ("KR_TRADING", "KR_PRE_MARKET")) or (not is_kr and sess != "US_TRADING"):
-                await _broadcast({"type":"trade_failed",
+                await self._emit({"type":"trade_failed",
                     "message": f"⏰ {ticker} 대기 매수 취소 — 매수 시점에 장 마감"})
                 return
+            # 주문 직전 보유 스냅샷 — 즉시 체결 확인 + (미확인 시) 폴링 baseline (KR+US)
+            try: _pre_kr = await self.broker.kr_holdings()
+            except Exception: _pre_kr = list(baseline_holdings or [])
+            _pre_us = []
+            if not is_kr:
+                try: _pre_us = await self.broker._overseas_holdings()
+                except Exception: _pre_us = []
             res = await self.broker.place_order(od)
             badge = "⏱ 분봉 진입 매수 발동" if triggered else "⌛ 3시간 타임아웃 매수"
             accepted = all(bad not in res for bad in ("실패", "에러", "거부", "예외", "REJECT"))
-            # 체결 확인 (KR)
+            # 즉시 체결 확인 (KR 2초 후 보유 재조회 / US 는 즉시 확인 불가 → 폴링)
             filled = False; fill_note = ""
             if accepted and is_kr:
                 try:
                     await asyncio.sleep(2.0)
                     self.broker._acct_snap = None
                     after = await self.broker.kr_holdings()
-                    before_qty = next((h["qty"] for h in (baseline_holdings or []) if h["code"] == ticker), 0)
-                    after_qty = next((h["qty"] for h in after if h["code"] == ticker), 0)
+                    before_qty = next((h["qty"] for h in _pre_kr if h.get("code") == ticker), 0) or 0
+                    after_qty = next((h["qty"] for h in after if h.get("code") == ticker), 0) or 0
                     if after_qty > before_qty:
                         filled = True; fill_note = f"보유 {before_qty}→{after_qty}주"
                 except Exception as _e:
                     fill_note = f"체결확인 실패({_e})"
-            _ok = filled or (not is_kr and accepted)
-            if _ok:
+            # 사장 지시 2026-05-21: 즉시 체결 확인된 경우에만 +1. 접수만(미확인)이면 폴링이 확정 시 +1.
+            if filled:
                 self._trades_executed += 1
                 self._trade_log.append({"ts": _now_kst_iso(), "ticker": ticker, "side": "buy",
-                                        "qty": qty, "result": res, "filled": filled, "ok": True, "watch": True})
-            await _broadcast({"type": _trade_event_type(_ok),
-                "message": f"{badge} — {ticker} {qty}주: {res}" + (f" | {fill_note}" if fill_note else ""),
-                "ticker": ticker, "side": "buy", "qty": qty, "filled": filled,
-                "trades_total": self._trades_executed})
+                                        "qty": qty, "result": res, "filled": True, "ok": True, "watch": True})
+            # 모바일 알림 ①: 체결 신청(접수)
+            if accepted:
+                await self._emit({"type": "order_submitted", "agent": "트레이딩팀장",
+                    "message": f"📨 {ticker} 매수 {qty}주 주문 접수 — 체결 확인 중",
+                    "ticker": ticker, "side": "buy", "qty": qty})
+            # 모바일 알림 ②: 체결 완료(즉시) / 또는 실패
+            if filled or not accepted:
+                await self._emit({"type": _trade_event_type(filled),
+                    "message": f"{badge} — {ticker} {qty}주: {res}" + (f" | {fill_note}" if fill_note else ""),
+                    "ticker": ticker, "side": "buy", "qty": qty, "filled": filled,
+                    "trades_total": self._trades_executed})
+            elif accepted:  # 접수만(미확인) → 5분마다 반복 폴링으로 확정 시 카운트
+                asyncio.create_task(self._poll_fills_until_confirmed(
+                    [{"ticker": ticker, "side": "buy", "qty": qty}],
+                    list(_pre_kr) + list(_pre_us)))
             metrics.incr("orders_filled" if filled else "orders_unfilled",
                          market="KR" if is_kr else "US")
         except Exception as e:
             logger.error(f"_entry_watch_task({ticker}) 예외: {e}")
-            await _broadcast({"type":"trade_failed",
+            await self._emit({"type":"trade_failed",
                 "message": f"⚠ {ticker} 분봉 모니터 예외 — {e}"})
             metrics.incr("entry_watch_error", ticker=ticker)
             notifier.alert("CRITICAL", "분봉 진입 모니터 예외",
                            f"{ticker} {qty}주 진입 감시 중단 — {e}",
                            dedup_key=f"entry_watch_error:{ticker}")
 
-    async def _reverify_fills(self, pending: List[Dict], baseline_holdings: List[Dict]):
-        """체결 미확인 주문을 5분 후 다시 확인 (사장 지시 2026-05-14).
-        - pending: [{ticker, side, qty, accepted, filled=False, ...}] 형식의 미확인 주문 목록
-        - baseline_holdings: 실행 직전 holdings 스냅샷 (qty 비교 기준)
-        체결 안 됐다고 판단되면 trades_executed 카운트 차감 + 보정 메시지 broadcast.
-        호가 미체결 주문은 KIS 측에서 장 마감 시 자동 취소되므로 별도 cancel API 호출은 불필요."""
+    def _market_closed_for(self, is_kr: bool) -> bool:
+        """해당 종목 시장이 (지정가 미체결분이 더는 체결될 수 없는) 마감 상태인가.
+        KR: 정규장·동시호가 시간대(프리장 포함)가 아니면 마감. US: US_TRADING 이 아니면 마감."""
+        sess = get_current_session()
+        if is_kr:
+            return sess not in ("KR_PRE_MARKET", "KR_TRADING", "KR_CLOSE_REVIEW")
+        return sess != "US_TRADING"
+
+    async def _maybe_market_close_alert(self, prev_session: str, cur_session: str):
+        """장 마감 전환 시 1회 — 당일·누적 수익률을 모바일 알림(type=market_close)으로 보고
+        (사장 지시 2026-05-21, 모바일 알림 4종 중 ④). KR_TRADING→그외=한국장 마감,
+        US_TRADING→그외=미국장 마감. 전환 순간에만 호출되므로 중복 발송이 없다."""
+        kr_closed = prev_session == "KR_TRADING" and cur_session != "KR_TRADING"
+        us_closed = prev_session == "US_TRADING" and cur_session != "US_TRADING"
+        if not (kr_closed or us_closed):
+            return
+        mkt = "한국" if kr_closed else "미국"
         try:
-            await asyncio.sleep(_REVERIFY_DELAY_SEC)  # 5분 대기 (테스트는 0으로 단축)
-            self.broker._acct_snap = None  # force fresh read
-            after_kr = await self.broker.kr_holdings()
-            # 사장 지시 2026-05-21: US 도 보강한다. 이전엔 US 티커를 continue 로 스킵해
-            # (KR만 6자리 숫자 매칭) 잠정 체결로 카운트된 US 주문이 영구히 차감되지 않았다.
-            try:
-                after_us = await self.broker._overseas_holdings()
-            except Exception:
-                after_us = []
-            adjustments = []
-            for e in pending:
-                tk = str(e.get("ticker","")).strip()
-                side = e.get("side","buy")
-                is_kr_tk = tk.isdigit() and len(tk) == 6
-                after = after_kr if is_kr_tk else after_us
-                before_qty = next((h["qty"] for h in (baseline_holdings or []) if h.get("code") == tk), 0)
-                after_qty = next((h["qty"] for h in after if h.get("code") == tk), 0)
-                truly_filled = (side == "buy" and after_qty > before_qty) or \
-                               (side == "sell" and after_qty < before_qty)
-                if truly_filled:
-                    adjustments.append(f"✓ {tk} {side} — 5분 후 체결 확인 (보유 {before_qty}→{after_qty})")
-                else:
-                    # 미체결 확정 — 누적 카운트 차감
-                    self._trades_executed = max(0, self._trades_executed - 1)
-                    # 사이클 trade_log에서 해당 항목도 제거 (가장 최근 매칭 1개)
-                    for i in range(len(self._trade_log) - 1, -1, -1):
-                        t = self._trade_log[i]
-                        if t.get("ticker") == tk and t.get("side") == side:
-                            self._trade_log.pop(i); break
-                    adjustments.append(f"✗ {tk} {side} — 5분 경과 미체결 → 누적 차감 (현재 {self._trades_executed}건)")
-            if adjustments:
-                # 사장 피드백 2026-05-16: 체결 재확인은 시스템이 아니라 트레이딩팀장이 보고.
-                await _broadcast({"type": "agent_msg", "agent": "트레이딩팀장",
-                    "message": "🕐 5분 후 체결 재확인 결과\n" + "\n".join(adjustments)})
+            k = performance_kpis(self.equity_path)
+        except Exception:
+            k = {}
+        def _p(v): return f"{v:+.2f}%" if isinstance(v, (int, float)) else "-"
+        def _w(v): return f"{v:+,.0f}원" if isinstance(v, (int, float)) else "-"
+        await self._emit({"type": "market_close", "agent": "트레이딩팀장", "market": mkt,
+            "message": (f"🔔 {mkt} 장 마감 — 당일 {_p(k.get('today_pct'))} ({_w(k.get('today_pnl'))}) · "
+                        f"누적 {_p(k.get('cumulative_pct'))} ({_w(k.get('cumulative_pnl'))})"),
+            "today_pct": k.get("today_pct"), "today_pnl": k.get("today_pnl"),
+            "cumulative_pct": k.get("cumulative_pct"), "cumulative_pnl": k.get("cumulative_pnl"),
+            "trades_total": self._trades_executed})
+
+    async def _poll_fills_until_confirmed(self, pending: List[Dict], baseline_holdings: List[Dict]):
+        """접수됐지만 체결 미확인인 주문을 5분마다 '반복' 폴링한다 (사장 지시 2026-05-21).
+
+        - pending: [{ticker, side, qty, ...}] — 실행부에서 즉시 체결이 확인되지 않은 주문들.
+          (즉시 체결된 주문은 실행부에서 이미 +1 했으므로 여기 오지 않는다.)
+        - baseline_holdings: 주문 직전 holdings 스냅샷 (qty 비교 기준; US false-positive 방지).
+
+        매 주기마다 보유 변동을 재확인한다:
+          • 체결 확인  → 그때 누적 카운트 +1, trade_log 기록, 통신로그 '체결 확인됨'
+                         (type=trade_executed → 모바일 '체결 완료' 알림). 그 주문은 목록에서 제거.
+          • 아직 미체결 → 채팅 메시지도, 카운트도 올리지 않고 '조용히' 다음 주기 재시도.
+          • 해당 시장 마감 → 그 주문의 폴링을 조용히 종료 (KIS가 미체결 지정가를 자동 취소).
+        루프 누수 방지를 위해 _POLL_MAX_ATTEMPTS 회 후엔 무조건 종료한다."""
+        remaining = [dict(e) for e in (pending or [])]
+        attempts = 0
+        try:
+            while remaining and attempts < _POLL_MAX_ATTEMPTS and not self._stop_event.is_set():
+                await asyncio.sleep(_REVERIFY_DELAY_SEC)  # 5분 (테스트는 0으로 단축)
+                attempts += 1
+                try:
+                    self.broker._acct_snap = None  # force fresh read
+                    after_kr = await self.broker.kr_holdings()
+                    try:
+                        after_us = await self.broker._overseas_holdings()
+                    except Exception:
+                        after_us = []
+                except Exception as e:
+                    logger.warning(f"_poll_fills 보유조회 실패(다음 주기 재시도): {e}")
+                    continue
+                still: List[Dict] = []
+                for e in remaining:
+                    tk = str(e.get("ticker", "")).strip()
+                    side = e.get("side", "buy")
+                    qty = e.get("qty", 0)
+                    is_kr_tk = tk.isdigit() and len(tk) == 6
+                    after = after_kr if is_kr_tk else after_us
+                    before_qty = next((h["qty"] for h in (baseline_holdings or []) if h.get("code") == tk), 0)
+                    after_qty = next((h["qty"] for h in after if h.get("code") == tk), 0)
+                    truly_filled = (side == "buy" and after_qty > before_qty) or \
+                                   (side == "sell" and after_qty < before_qty)
+                    if truly_filled:
+                        # 확정 시점에 비로소 누적 카운트 +1 + '체결 확인됨' 보고(=모바일 체결완료 알림)
+                        self._trades_executed += 1
+                        self._trade_log.append({"ts": _now_kst_iso(), "ticker": tk, "side": side,
+                                                "qty": qty, "filled": True, "ok": True,
+                                                "fill_note": "5분 폴링 후 체결 확인",
+                                                "fill_currency": ("KRW" if is_kr_tk else "USD")})
+                        await self._emit({"type": "trade_executed", "agent": "트레이딩팀장",
+                            "message": (f"✅ {tk} {('매수' if side == 'buy' else '매도')} {qty}주 체결 확인됨 — "
+                                        f"보유 {before_qty}→{after_qty}주 (누적 체결 {self._trades_executed}건)"),
+                            "ticker": tk, "side": side, "qty": qty, "filled": True,
+                            "trades_total": self._trades_executed})
+                    elif not self._market_closed_for(is_kr_tk):
+                        still.append(e)  # 장중 미체결 → 조용히 다음 주기 재확인
+                    # else: 시장 마감 → 미체결 확정, 조용히 폐기 (메시지·카운트 없음)
+                remaining = still
         except Exception as e:
-            logger.warning(f"_reverify_fills 예외: {e}")
-            # 체결 재확인 실패 = 체결 카운트가 부정확할 수 있음 → 즉시 표면화.
-            metrics.incr("reverify_fills_error")
-            notifier.alert("CRITICAL", "체결 재확인 실패",
-                           f"trades_executed 카운트가 부정확할 수 있음 — {e}",
-                           dedup_key="reverify_fills_error")
+            logger.warning(f"_poll_fills_until_confirmed 예외: {e}")
+            # 폴링 실패 = 체결 카운트가 누락될 수 있음 → 운영자에게 표면화.
+            metrics.incr("poll_fills_error")
+            notifier.alert("WARN", "체결 폴링 예외",
+                           f"미체결 주문 반복 확인 중단 — {e}",
+                           dedup_key="poll_fills_error")
 
     async def _equity_poller(self):
-        """Poll account balance every 5 min so equity_curve has data points outside analysis cycles.
-        Without this the chart would show 9-hour gaps overnight (관측된 버그 2026-05-14)."""
+        """Poll account balance every 5 min during market hours so equity_curve has dense points
+        between analysis cycles. 사장 지시 2026-05-24: 장 운영시간(KR/US 정규장) 외에는 기록하지 않는다
+        — 장외 평가금액 추이는 의미가 없어 포인트를 남기지 않는다."""
         while not self._stop_event.is_set():
             try:
+                # 사장 지시 2026-05-24: 장 운영시간(KR/US 정규장) 외에는 평가금액 추이를 기록하지 않는다
+                # — 장외엔 잔고 폴링·기록 모두 생략(불필요한 KIS 호출도 절약).
                 # 사장 지시 2026-05-21: 자산곡선을 KR+US 통합 총평가로 — portfolio_holdings 가
                 # 국내 nass_amt 에 해외주식 원화환산 평가를 더한 총평가를 돌려준다.
-                snap = await self.broker.portfolio_holdings()
-                bp = snap.get("buying_power") or {}
-                if bp.get("ok"):
-                    record_equity(bp, "poll", holdings=snap.get("holdings") or [])
+                snap = await self.broker.portfolio_holdings() if is_market_session_now() else None
+                bp = (snap or {}).get("buying_power") or {}
+                if snap is not None and bp.get("ok"):
+                    # 사장 지시 2026-05-21: 잔고 확인과 동시에 KOSPI·NASDAQ(QQQ) 현재값을 수집 →
+                    # equity 포인트와 같은 타임스탬프에 저장(벤치마크 일중 오버레이, 검증된 현재가 API만 사용).
+                    kospi = nasdaq = None
+                    try: kospi = await self.broker.kr_index_now("0001") or None
+                    except Exception: kospi = None
+                    try:
+                        _q = await self.broker.us_last_price("QQQ")
+                        nasdaq = _q if (_q and _q > 0) else None
+                    except Exception: nasdaq = None
+                    record_equity(self.equity_path, bp, "poll", holdings=snap.get("holdings") or [],
+                                  kospi=kospi, nasdaq=nasdaq)
             except Exception as e:
                 logger.warning(f"[equity_poller] {e}")
             # 5분 슬립 — 60초 게이트와 결합해 잔고가 자주 안 흔들리는 한 가벼움
@@ -1878,9 +2445,11 @@ class ArquantOrchestrator:
         from infra import weekly_review
         while not self._stop_event.is_set():
             try:
-                if weekly_review.trigger_if_due():
-                    await _broadcast({"type": "agent_msg", "agent": "시스템",
-                        "message": "📅 [주간 피드백 루프] 토요일 KST — 지난 7일 통계를 운용지원실장에 전달했습니다. 결과는 data/weekly_review.log + data/ops_support.log 참고."})
+                _wk_msg = weekly_review.trigger_if_due(uid=self.uid, is_admin=self.is_admin)
+                if _wk_msg:
+                    await self._emit({"type": "agent_msg", "agent": "시스템",
+                        "message": _wk_msg if isinstance(_wk_msg, str) else
+                        "📅 [주간 피드백 루프] 지난 7일 운영을 점검했습니다."})
             except Exception as e:
                 logger.warning(f"[weekly_review_scheduler] {e}")
             # 1시간마다 체크
@@ -1907,6 +2476,11 @@ class ArquantOrchestrator:
         while not self._stop_event.is_set():
             try:
                 session = get_current_session()
+                # 사장 지시 2026-05-21: 장 마감 전환 시 당일·누적 수익률 모바일 알림 (전환 순간 1회)
+                try:
+                    await self._maybe_market_close_alert(self._last_session, session)
+                except Exception as _mce:
+                    logger.warning(f"market_close 알림 실패: {_mce}")
                 # status badge: only emit on transition (no 1-minute 장외 spam)
                 if session == "OFF_HOURS":
                     await self._set_status("OFF_HOURS", f"장외 ({_now_kst().strftime('%H:%M')} KST)")
@@ -1954,7 +2528,7 @@ class ArquantOrchestrator:
                             t = a.get("title", "")
                             if t and t not in seen_titles:
                                 seen_titles.add(t); unique_added.append(a)
-                        await _broadcast({"type": "news", "count": len(unique_added), "ts": self.news_monitor.last_crawl_time,
+                        await self._emit({"type": "news", "count": len(unique_added), "ts": self.news_monitor.last_crawl_time,
                             "message": (f"📰 +{len(unique_added)}건 (KR 누적 {len(self._pending_news_kr)} / "
                                         f"US 누적 {len(self._pending_news_us)}) | 크롤 {self.news_monitor.last_crawl_time or ''}"),
                             "articles": [{"title": a.get("title", ""), "market": a.get("market", "BOTH"),
@@ -1966,33 +2540,34 @@ class ArquantOrchestrator:
                 market_open = (session in self._MARKET_OPEN_SESSIONS) and (self._last_session not in self._LIVE_SESSIONS)
                 periodic_due = (time.time() - self._last_cycle_at) >= PERIODIC_CYCLE_SEC
 
-                # ── 사장 지시 2026-05-14: 사이클 사전 게이트 ──
-                # (1) 휴장일 — KR 세션이면 KR 휴장, US 세션이면 US 휴장 체크 → 사이클 스킵
+                # ── 사장 지시 2026-05-14/2026-05-24: 사이클 사전 게이트 ──
+                # (1) 휴장 — 주말은 자명 스킵, 그 외엔 개장 5분 후 KIS 실시세로 '오늘 개장'을 1회 확인
+                #     (하드코딩 휴장일 목록은 폴백). → _market_closed_today
                 # (2) cash 부족 — 가용 예수금이 최소 매매 단위(현실적 최저가 1주 ~5000원)도 안 되면 스킵
                 # (3) 너무 잦은 사이클 방지 — 직전 사이클이 5분 이내라면 스킵 (트리거 중복 가드)
                 skip_reason = None
                 if first_run or market_open or periodic_due:
                     if (time.time() - self._last_cycle_at) < 300 and not first_run:
                         skip_reason = f"직전 사이클이 {int((time.time()-self._last_cycle_at)/60)}분 전 — 트리거 중복 스킵"
-                    elif session in ("KR_PRE_MARKET", "KR_TRADING") and is_kr_holiday():
-                        skip_reason = f"KR 휴장일({_now_kst().strftime('%Y-%m-%d %a')}) — 사이클 스킵"
-                    elif session == "US_TRADING" and is_us_holiday():
-                        skip_reason = f"US 휴장일/주말 — 사이클 스킵"
                     else:
-                        # cash 가용성 체크 — 한 번의 KIS 호출
-                        try:
-                            _snap = await self.broker.kr_account_snapshot()
-                            _cash = float((_snap.get("buying_power") or {}).get("cash", 0.0) or 0.0)
-                            if _cash < 5000:  # 최저가 종목 1주도 못 살 정도
-                                skip_reason = f"가용 예수금 부족 ({_cash:,.0f}원 < 5,000원) — 분석 비용만 듦, 스킵"
-                        except Exception:
-                            pass  # 잔고 조회 실패는 진행 (broker가 사이클 안에서 재시도)
+                        _closed, _closed_reason = await self._market_closed_today(session)
+                        if _closed:
+                            skip_reason = _closed_reason
+                        else:
+                            # cash 가용성 체크 — 한 번의 KIS 호출
+                            try:
+                                _snap = await self.broker.kr_account_snapshot()
+                                _cash = float((_snap.get("buying_power") or {}).get("cash", 0.0) or 0.0)
+                                if _cash < 5000:  # 최저가 종목 1주도 못 살 정도
+                                    skip_reason = f"가용 예수금 부족 ({_cash:,.0f}원 < 5,000원) — 분석 비용만 듦, 스킵"
+                            except Exception:
+                                pass  # 잔고 조회 실패는 진행 (broker가 사이클 안에서 재시도)
                 if skip_reason and (first_run or market_open or periodic_due):
                     await self._set_status("MONITORING", f"⏭ 사이클 사전 게이트: {skip_reason}", force=True)
                     self._last_cycle_at = time.time()  # 트리거 재무장 방지 — 다음 1시간 후 재시도
                     first_run_pending = False
                     self._last_session = session
-                    for _ in range(NEWS_CHECK_INTERVAL):
+                    for _ in range(admin_config.news_crawl_interval(NEWS_CHECK_INTERVAL)):
                         if self._stop_event.is_set(): break
                         await asyncio.sleep(1)
                     continue
@@ -2030,19 +2605,29 @@ class ArquantOrchestrator:
                             await self._set_status("MONITORING", "사이클 완료 — 감시 재개 (다음 사이클 1시간 뒤)", force=True)
 
                 self._last_session = session
-                for _ in range(NEWS_CHECK_INTERVAL):
+                for _ in range(admin_config.news_crawl_interval(NEWS_CHECK_INTERVAL)):
                     if self._stop_event.is_set(): break
                     await asyncio.sleep(1)
             except Exception as e:
                 self.current_state = SwarmState.ERROR; logger.error(f"루프 오류: {e}")
-                await _broadcast({"type": "error", "message": str(e)})
+                await self._emit({"type": "error", "message": str(e)})
                 # 감시 루프 크래시는 '거래 중'인 줄 알고 멈추는 최악의 조용한 실패.
                 metrics.incr("engine_loop_error")
                 notifier.alert("CRITICAL", "감시 루프 오류 — 30초 후 자동 재시도",
                                str(e), dedup_key="engine_loop_error")
                 await asyncio.sleep(30)
         self.current_state = SwarmState.STOPPED; self.news_monitor.is_running = False
-        await _broadcast({"type": "status", "state": "STOPPED", "message": "감시 중지됨"})
+        await self._emit({"type": "status", "state": "STOPPED", "message": "감시 중지됨"})
+
+    async def _session_holdings(self, session: str) -> List[Dict]:
+        """매도 평가용 보유종목. US 세션엔 해외 보유분을 합쳐야 미국 포지션이 사후관리실장
+        매도 평가에 들어온다. (버그 2026-05-22: kr_holdings()만 써서 US_TRADING 사이클에
+        미국 보유분이 통째로 누락 → 항상 "보유 종목 없음 — 분석 생략"으로 빠졌다.)
+        _overseas_holdings()는 내부에서 예외를 삼키고 []를 반환하므로 KR 보유분은 보존된다."""
+        holdings = await self.broker.kr_holdings()
+        if session == "US_TRADING":
+            holdings = holdings + await self.broker._overseas_holdings()
+        return holdings
 
     async def _run_analysis_cycle(self, news_articles, user_directive, session, market_open: bool = False):
         self.cycle_log = SwarmCycleLog(); self.validation_attempts = 0
@@ -2066,16 +2651,16 @@ class ArquantOrchestrator:
             index_facts = format_indices_for_macro(index_data)
             # 사장 피드백 2026-05-15 (4차): 글로벌 지수 수집 결과는 전략리서치팀장 이름으로 표기 (이름만, 결과는 그대로 수집된 데이터).
             self.cycle_log.log("DATA", "전략리서치팀장", index_report)
-            await _broadcast({"type":"agent_msg","agent":"전략리서치팀장","message":f"📈 지수 수집 완료\n{index_report}"})
+            await self._emit({"type":"agent_msg","agent":"전략리서치팀장","message":f"📈 지수 수집 완료\n{index_report}"})
 
             # current holdings — used both to diversify the orchestrator's picks and for fill confirmation
             holdings = []
             try:
-                holdings = await self.broker.kr_holdings()
+                holdings = await self._session_holdings(session)
             except Exception as _he:
                 # 클린코드 2026-05-19: 침묵 삼킴 제거 — 빈 holdings로 진행하면 보유 종목
                 # 회피·체결확인이 불가하므로 최소한 원인을 남긴다.
-                record_error("_collect_company_data", _he, context="kr_holdings 조회 실패 → 빈 목록 진행")
+                record_error("_collect_company_data", _he, context="세션 보유종목 조회 실패 → 빈 목록 진행", uid=self.uid)
             holdings_str = ("; ".join(f"{h['name']}({h['code']}) {h['qty']}주 손익 {h['pnl_pct']:+.1f}%" for h in holdings) or "없음")
 
             # [2] DART — 사장 피드백 2026-05-15 (#20): DART는 국내 종목만 있으니 KR 장 시간에만 30분 간격으로 가동.
@@ -2087,7 +2672,7 @@ class ArquantOrchestrator:
                 # 사장 피드백 2026-05-16: 장외 DART 생략은 정상 동작이므로 대시보드에 알리지 않음 (내부 처리만).
             elif (time.time() - _dart_cache["ts"]) < _dart_ttl and _dart_cache["value"]:
                 dart_report = _dart_cache["value"]
-                await _broadcast({"type":"agent_msg","agent":"시스템","message":f"♻️ DART 공시 캐시 재사용 ({int((time.time()-_dart_cache['ts'])/60)}분 전) — API 호출 생략"})
+                await self._emit({"type":"agent_msg","agent":"시스템","message":f"♻️ DART 공시 캐시 재사용 ({int((time.time()-_dart_cache['ts'])/60)}분 전) — API 호출 생략"})
             else:
                 _dr = await search_disclosures(bgn_de=(datetime.now()-timedelta(days=3)).strftime("%Y%m%d"))
                 # ITEM2a: QUERY_FAILED는 시스템 리스크 경고, NO_DISCLOSURE는 정상으로 구분
@@ -2099,35 +2684,37 @@ class ArquantOrchestrator:
 
             # [3] NEWS ANALYSIS first — macro now reflects the analyzed news (사장 지시 2026-05-14).
             # 개장 사이클은 뉴스 100건이 들어오므로 macro/orchestrator가 모두 그것을 흡수해야 함.
-            self.current_state = SwarmState.NEWS_ANALYSIS
-            await _broadcast({"type":"status","state":"NEWS_ANALYSIS","message":"뉴스 분석 (증권 속보)"})
-            _session_market_label = "미국 장" if session == "US_TRADING" else "국내 장"
-            news_report = await self.news_analyst.think(
-                f"네이버 금융 '증권 속보' 크롤링 결과입니다 (이번 사이클 누적 {len(news_articles)}건, **{_session_market_label}** 대상):\n{formatted_news}\n\n"
-                f"이 뉴스들을 분석해 다음을 정리하십시오:\n"
-                f"① 직접 언급되거나 직접 영향을 받는 **종목/업종**과 각각의 호재·악재·이벤트 — 가능하면 종목명(또는 6자리 코드)을 함께 적되, "
-                f"뉴스에 실제로 나온 것만 쓰고 모르는 코드는 지어내지 마십시오.\n"
-                f"② 시장 전반 분위기·주목 테마 (1~3줄).\n"
-                f"③ 매크로(금리/환율/원자재/지정학) 시사점 — 전략리서치팀장 매크로 분석에 영감을 줄 수 있는 포인트 1~3개.\n"
-                f"이 분석은 전략리서치팀장 매크로 분석 및 운용전략실장 종목 선정에 최우선으로 반영됩니다.")
-            self.cycle_log.log("NEWS", "뉴스분석팀장", news_report)
-            await _broadcast({"type":"agent_msg","agent":"뉴스분석팀장","message":news_report})
-
-            # 사장 피드백 2026-05-16: 1시간 정기 사이클에 신규 뉴스가 0건이면 신규 매수 파이프라인
-            # (후보 선정·데이터 수집·2패스)을 건너뛰고, 보유 종목 매도 평가(계량분석)만 수행한다.
+            # 사장 지시 2026-05-22: 신규 뉴스 0건(정기 사이클)이면 뉴스분석팀장 호출 자체를 생략하고
+            # 보유 종목 매도 평가(계량분석)만 진행한다 — 뉴스가 없는데 뉴스분석 LLM을 부르는 건 무의미.
             _sell_only = (not news_articles) and (not market_open)
+            self.current_state = SwarmState.NEWS_ANALYSIS
+            await self._emit({"type":"status","state":"NEWS_ANALYSIS","message":"뉴스 분석 (증권 속보)"})
+            _session_market_label = "미국 장" if session == "US_TRADING" else "국내 장"
             if _sell_only:
-                await _broadcast({"type":"agent_msg","agent":"뉴스분석팀장",
-                    "message":"🔕 신규 뉴스 없음 — 이번 사이클은 신규 매수 보류, 보유 종목 매도 평가(계량분석)만 진행합니다."})
+                news_report = "[뉴스분석팀장] 신규 뉴스 없음 — 뉴스 분석 생략. 이번 사이클은 보유 종목 매도 평가(계량분석)만 진행합니다."
+                self.cycle_log.log("NEWS", "뉴스분석팀장", news_report)
+                await self._emit({"type":"agent_msg","agent":"뉴스분석팀장",
+                    "message":"🔕 신규 뉴스 없음 — 뉴스 분석 생략, 보유 종목 매도 평가(계량분석)만 진행합니다."})
+            else:
+                news_report = await self.news_analyst.think(
+                    f"네이버 금융 '증권 속보' 크롤링 결과입니다 (이번 사이클 누적 {len(news_articles)}건, **{_session_market_label}** 대상):\n{formatted_news}\n\n"
+                    f"이 뉴스들을 분석해 다음을 정리하십시오:\n"
+                    f"① 직접 언급되거나 직접 영향을 받는 **종목/업종**과 각각의 호재·악재·이벤트 — 가능하면 종목명(또는 6자리 코드)을 함께 적되, "
+                    f"뉴스에 실제로 나온 것만 쓰고 모르는 코드는 지어내지 마십시오.\n"
+                    f"② 시장 전반 분위기·주목 테마 (1~3줄).\n"
+                    f"③ 매크로(금리/환율/원자재/지정학) 시사점 — 전략리서치팀장 매크로 분석에 영감을 줄 수 있는 포인트 1~3개.\n"
+                    f"이 분석은 전략리서치팀장 매크로 분석 및 운용전략실장 종목 선정에 최우선으로 반영됩니다.")
+                self.cycle_log.log("NEWS", "뉴스분석팀장", news_report)
+                await self._emit({"type":"agent_msg","agent":"뉴스분석팀장","message":news_report})
 
             # [4] MACRO ANALYSIS — cached up to MACRO_CACHE_TTL_SEC. 개장 사이클(market_open)에선 캐시 무시
             # (방금 분석한 뉴스/지수를 반드시 흡수해야 하므로 새로 호출).
             self.current_state = SwarmState.MACRO_ANALYSIS
-            await _broadcast({"type":"status","state":"MACRO_ANALYSIS","message":"매크로 분석"})
+            await self._emit({"type":"status","state":"MACRO_ANALYSIS","message":"매크로 분석"})
             _use_macro_cache = (not market_open) and (time.time() - _macro_cache["ts"]) < MACRO_CACHE_TTL_SEC and _macro_cache["value"]
             if _use_macro_cache:
                 macro_report = _macro_cache["value"]
-                await _broadcast({"type":"agent_msg","agent":"시스템","message":f"♻️ 매크로 분석 캐시 재사용 ({int((time.time()-_macro_cache['ts'])/60)}분 전 생성) — 전략리서치팀장 LLM 호출 생략"})
+                await self._emit({"type":"agent_msg","agent":"시스템","message":f"♻️ 매크로 분석 캐시 재사용 ({int((time.time()-_macro_cache['ts'])/60)}분 전 생성) — 전략리서치팀장 LLM 호출 생략"})
             else:
                 _cache_hint = ("⚡ 개장 사이클 — 캐시 무시, 누적 뉴스 100건 분석 결과를 반영합니다.\n" if market_open else "")
                 # 사장 피드백 2026-05-15 (8차): alibaba/tongyi-deepresearch로 매크로 종합 리서치 (Tavily 대체).
@@ -2199,10 +2786,10 @@ class ArquantOrchestrator:
             if not (macro_report or "").strip() or len((macro_report or "").strip()) < 40:
                 macro_report = "[전략리서치팀장] ⚠️ 매크로 분석 실패(LLM 빈 응답) — 이번 사이클은 검증 지수·뉴스만으로 판단합니다."
                 self.cycle_log.log("MACRO", "전략리서치팀장", macro_report)
-                await _broadcast({"type":"agent_msg","agent":"전략리서치팀장","message":macro_report})
+                await self._emit({"type":"agent_msg","agent":"전략리서치팀장","message":macro_report})
             else:
                 self.cycle_log.log("MACRO", "전략리서치팀장", macro_report)
-                await _broadcast({"type":"agent_msg","agent":"전략리서치팀장","message":macro_report})
+                await self._emit({"type":"agent_msg","agent":"전략리서치팀장","message":macro_report})
 
             # 1주 매수 예산 힌트 — 사장 지시 2026-05-14: **총평가액** 기준 (실제 spend는 예수금으로 캡됨)
             _budget_hint = ""
@@ -2210,7 +2797,7 @@ class ArquantOrchestrator:
                 _bp0 = (await self.broker.kr_account_snapshot()).get("buying_power", {}) or {}
                 _cash0 = float(_bp0.get("cash", 0.0) or 0.0)
                 _total0 = float(_bp0.get("total_eval", 0.0) or 0.0) or _cash0
-                _por = float(runtime.get("PER_ORDER_BUDGET_RATIO") or 0.10)
+                _por = float(runtime.get("PER_ORDER_BUDGET_RATIO", uid=self.uid) or 0.10)
                 _pob = min(_total0 * _por, _cash0) if _cash0 > 0 else 0.0
                 if _total0 > 0:
                     _budget_hint = (f"\n참고 — 현재 총평가 {_total0:,.0f}원 / 예수금 {_cash0:,.0f}원, "
@@ -2235,7 +2822,7 @@ class ArquantOrchestrator:
             if _sell_only:
                 # 사장 피드백 2026-05-16: 신규 뉴스 0건 → 신규 매수 후보 선정 자체를 건너뜀.
                 allocation = "후보종목: 없음"
-                await _broadcast({"type":"agent_msg","agent":"운용전략실장",
+                await self._emit({"type":"agent_msg","agent":"운용전략실장",
                     "message":"[후보 종목 선정] 신규 뉴스 없음 — 신규 매수 후보 선정 생략, 보유 종목 매도 평가만 진행합니다."})
             else:
                 allocation = await self.orchestrator.think(
@@ -2249,13 +2836,18 @@ class ArquantOrchestrator:
                     + f"분석할 후보 종목 **정확히 5개**를 고르십시오.\n"
                     f"⚠️ **최우선**: 위 뉴스분석팀장이 짚은 종목/업종을 먼저 후보에 넣으십시오. (뉴스 원문은 제공되지 않으니 뉴스분석팀장 분석만 참고) "
                     f"뉴스 기반 적격 종목이 5개에 못 미칠 때만 매크로 판단으로 나머지를 채우십시오.\n"
-                    f"종목명만 보고 종목코드를 임의 생성하지 말고 확실히 아는 코드만 쓰십시오. "
+                    f"⚠️ 각 종목은 반드시 **`종목명(종목코드)`** 형식으로 적으십시오 (예: `삼성전자(005930)`). "
+                    f"코드가 확실치 않으면 **종목명만** 정확히 적으면 됩니다 — 시스템이 정확한 코드를 채웁니다. "
+                    f"코드를 임의로 지어내지 마십시오(가짜 코드는 종목 자체가 누락됩니다). 미국 종목은 티커(예: AAPL).\n"
                     f"그 외에는 대형주에 치우치지 말고 시가총액·업종을 분산하고, 위 1주 예산 안에서 매수 가능한(또는 근접한) 종목을 우선하며, 이미 보유한 종목은 가급적 제외하십시오.\n"
-                    f"⚠️ 응답 마지막 줄은 반드시 `후보종목: ...` (5개, 다른 텍스트 없이).")
+                    f"⚠️ 응답 마지막 줄은 반드시 `후보종목: 종목명(코드), ...` (5개, 다른 텍스트 없이).")
                 allocation = _strip_leading_section_marker(allocation, "[후보 종목 선정]", "[최종 매수 종목 결정]")
                 self.cycle_log.log("MACRO", "운용전략실장", allocation)
-                await _broadcast({"type":"agent_msg","agent":"운용전략실장","message":f"[후보 종목 선정]\n{allocation}"})
-            candidate_codes = _extract_codes_after(allocation, "후보종목", "대상종목", "종목코드", "target stocks") or _extract_stock_codes(allocation)
+                await self._emit({"type":"agent_msg","agent":"운용전략실장","message":f"[후보 종목 선정]\n{allocation}"})
+            # 사장 지시 2026-05-22: 운용전략실장의 후보 코드 환각을 이름→코드 검색으로 보정.
+            candidate_codes = _resolve_candidate_codes(
+                allocation, session=session, resolver=resolve_kr_stock_code, name_check=get_stock_name
+            ) or _extract_stock_codes(allocation)
             # Hard filter — enforce session/market boundary on candidates (LLM이 가끔 어김).
             # US 세션엔 KR 6자리 코드 제외, KR 세션엔 US 티커 제외. 장외엔 양쪽 모두 허용.
             if session == "US_TRADING":
@@ -2270,7 +2862,7 @@ class ArquantOrchestrator:
                 _bp_snap = (await self.broker.kr_account_snapshot()).get("buying_power", {}) or {}
                 _cash_pre = float(_bp_snap.get("cash", 0.0) or 0.0)
                 _total_pre = float(_bp_snap.get("total_eval", 0.0) or 0.0) or _cash_pre
-                _krw_usd_pre = 1500.0
+                _krw_usd_pre = get_usdkrw(1510.0)  # 사장 지시 2026-05-22: 5분 크롤 라이브 환율(폴백 1510)
                 # 사장 결정 2026-05-16: 사전 필터도 최종 게이트와 **동일한 '예수금 기준 1주' 규칙**을 사용.
                 # → 비싼 종목을 계량분석 전에 일관되게 제외(또는 통과)해, "왜 퀀트 후에야 빠지지?" 혼선 제거.
                 if _cash_pre > 0:
@@ -2295,7 +2887,7 @@ class ArquantOrchestrator:
                             kept.append(c)
                     if dropped:
                         # 사장 피드백 2026-05-15 (4차): 사전 필터 결과를 운용전략실장 후보 선정 메시지의 연장으로 통합.
-                        await _broadcast({"type":"agent_msg","agent":"운용전략실장",
+                        await self._emit({"type":"agent_msg","agent":"운용전략실장",
                             "message": (f"후보 사전 필터 — 1주 가격이 예수금({_cash_pre:,.0f}원)으로 매수 불가라 제외: {', '.join(dropped)}\n"
                                         f"최종 후보 종목: {', '.join(kept) or '없음'}")})
                         candidate_codes = kept
@@ -2303,9 +2895,9 @@ class ArquantOrchestrator:
                 logger.warning(f"후보 사전 필터 실패: {_e}")
 
             # 분석 대상 = 후보 ∪ 보유(KR) — 보유분은 사후관리실장의 매도 판단을 위해 함께 분석
-            held_kr = [c for c in (str(h.get("code","")).strip() for h in (holdings or [])) if c.isdigit() and len(c) == 6]
+            held_session = _codes_for_session(holdings, session)
             analysis_codes, _seen = [], set()
-            for c in (candidate_codes + held_kr):
+            for c in (candidate_codes + held_session):
                 if c and c not in _seen:
                     _seen.add(c); analysis_codes.append(c)
             analysis_codes = analysis_codes[:8]
@@ -2313,20 +2905,20 @@ class ArquantOrchestrator:
             # [4] DATA — 3yr daily/supply + 분봉 for analysis_codes, + per-stock DART (+ 종목명 맵)
             company_data = ""; per_dart: Dict[str, str] = {}; name_map: Dict[str, str] = {}
             if analysis_codes:
-                await _broadcast({"type":"status","state":"DATA_COLLECTION","message":f"종목 {len(analysis_codes)}개 데이터 수집"})
+                await self._emit({"type":"status","state":"DATA_COLLECTION","message":f"종목 {len(analysis_codes)}개 데이터 수집"})
                 company_data = await self._collect_company_data(analysis_codes)
                 per_dart, name_map = await self._collect_per_stock_dart(analysis_codes, days=90, limit=8)
                 if per_dart:
                     company_data += "\n\n[종목별 최근 DART 공시]\n" + "\n".join(f"[{k}]\n{v}" for k, v in per_dart.items())
                 # 사장 피드백 2026-05-15 (4차): 데이터 수집 완료는 계량분석팀장 이름으로 (실제 분석 주체).
                 self.cycle_log.log("DATA", "계량분석팀장", f"분석 종목: {analysis_codes}")
-                await _broadcast({"type":"agent_msg","agent":"계량분석팀장","message":f"📊 데이터 수집 완료 — 후보 {len(candidate_codes)}개 / 보유 {len(held_kr)}개 (공시 {len(per_dart)}건)"})
+                await self._emit({"type":"agent_msg","agent":"계량분석팀장","message":f"📊 데이터 수집 완료 — 후보 {len(candidate_codes)}개 / 보유 {len(held_session)}개 (공시 {len(per_dart)}건)"})
 
                 # ── 데이터 없는 종목 자동 제외 가드 (사장 지시 2026-05-14) ──
                 # 데이터 수집 후 일봉 누적 0행인 종목은 분석/매수 대상에서 제외 — LLM이 빈 데이터로
                 # 0점 평가하는 패턴 차단. 보유 종목은 매도 판단 위해 유지.
                 from tools.market_data import load_daily_csv as _load_daily
-                held_set = set(held_kr)
+                held_set = set(held_session)
                 no_data_codes = []
                 for c in list(candidate_codes):
                     if c in held_set:
@@ -2350,7 +2942,7 @@ class ArquantOrchestrator:
                     _msg_lines = [f"🚫 일봉 데이터 없는 종목 평가 제외 (LLM 계량평가 생략): {', '.join(no_data_codes)} → 후보 {len(candidate_codes)} → {len(_kept)}개"]
                     if _delisted_suspects:
                         _msg_lines.append(f"⚠️ 상장폐지/거래정지 의심: {', '.join(_delisted_suspects)} (다음 사이클 후보 선정 시 사전 확인 필요)")
-                    await _broadcast({"type":"agent_msg","agent":"계량분석팀장",
+                    await self._emit({"type":"agent_msg","agent":"계량분석팀장",
                         "message": "\n".join(_msg_lines)})
                     candidate_codes = _kept
                     # 버그+정책 수정 2026-05-19 (사장님 지시: "데이터 없으면 평가 자체를 안 함"):
@@ -2374,10 +2966,10 @@ class ArquantOrchestrator:
             # 직전엔 후보+보유 전체를 한 번에 평가해 응답이 토큰 한계에 걸려 글자가 깨지는 일이 잦았음.
             # 시장 분리(#4): US 세션엔 KR 보유종목 분석 생략, KR 세션엔 US 보유종목 분석 생략.
             self.current_state = SwarmState.QUANT_ANALYSIS
-            await _broadcast({"type":"status","state":"QUANT_ANALYSIS","message":"퀀트 분석 (종목별 평가)"})
+            await self._emit({"type":"status","state":"QUANT_ANALYSIS","message":"퀀트 분석 (종목별 평가)"})
             # 후보·보유 종목 라인 — Pass 2 orchestrator 프롬프트에서 사용 (사장 피드백 2026-05-15 — 누락 복구)
             _cand_line = ", ".join(_nm(c) for c in candidate_codes) or "(없음)"
-            _held_line = ", ".join(_nm(c) for c in held_kr) or "(없음)"
+            _held_line = ", ".join(_nm(c) for c in held_session) or "(없음)"
             _quant_codes = list(analysis_codes or [])
             # 세션별 시장 필터 — 반대편 시장 종목은 평가에서 제외
             # 사장 피드백 2026-05-16: 미국장 세션엔 KR 종목을 보유분 포함 **완전 제외**.
@@ -2389,9 +2981,10 @@ class ArquantOrchestrator:
             _quant_scores: Dict[str, int] = {}
             _quant_sections: List[str] = []
             _entry_dirs: Dict[str, Dict[str, Any]] = {}  # 사장 피드백 #4: 진입가 directive 저장
+            _sell_prices: Dict[str, Dict[str, Any]] = {}  # 사장 지시 2026-05-22: 보유종목 매도가 directive
             for _qcode in _quant_codes:
                 _qname = _nm(_qcode)
-                _is_held = _qcode in held_kr
+                _is_held = _qcode in held_session
                 _qrole = "보유" if _is_held else "후보"
                 # 버그 수정 2026-05-19 (치명적): 마커가 '\n[{code}]'였는데 실제 퀀트 블록은
                 # format_quant_data_for_agent가 '[{code} 퀀트 데이터]'로 출력 → 마커가 요약줄
@@ -2409,12 +3002,14 @@ class ArquantOrchestrator:
                 _quant_resp = ""
                 _base_prompt = (
                     f"[종목 단독 평가 — {_qrole}] {_qname}\n"
-                    f"현재 세션: {session} / 최대 매수 종목 수 (참고): {runtime.get('MAX_TRADES_PER_CYCLE')}\n\n"
+                    f"현재 세션: {session} / 최대 매수 종목 수 (참고): {runtime.get('MAX_TRADES_PER_CYCLE', uid=self.uid)}\n\n"
                     f"뉴스분석팀장 분석 발췌:\n{news_report[:1200]}\n\n"
                     f"종목 데이터:\n{_stock_data or '(데이터 부족)'}\n\n"
                     f"최근 DART 공시:\n{_per_dart_str or '(공시 없음)'}\n\n"
                     f"위 데이터를 **여러 계량 기법으로 평가**하고, 매수 적합도 0~10점 + 한 줄 코멘트로 응답하십시오. "
-                    f"마지막 줄은 반드시 `퀀트점수: {_qcode}=점수` (1종목 1점수)")
+                    f"마지막 줄은 반드시 `퀀트점수: {_qcode}=점수` (1종목 1점수)"
+                    + (f". 보유 종목이므로 매수 분석이 아니라 **매도 분석**을 하고 `매도가: {_qcode}=시장가|숫자` 줄도 제시하십시오."
+                       if _is_held else f". 후보 종목이면 `진입가: {_qcode}=시장가|숫자` 줄도 제시 가능."))
                 for _attempt in range(3):
                     try:
                         self.quant_analyst.reset_history()  # 종목 간 컨텍스트 누수 방지
@@ -2437,7 +3032,7 @@ class ArquantOrchestrator:
                     _quant_resp = (f"{_qname}\n- 분석 실패: 모델이 분석 대신 도구호출을 반복 출력해 "
                                    f"해당 종목은 데이터 부족으로 처리합니다 (매수 후보에서 제외 권고).\n"
                                    f"퀀트점수: {_qcode}=0")
-                await _broadcast({"type":"agent_msg","agent":"계량분석팀장",
+                await self._emit({"type":"agent_msg","agent":"계량분석팀장",
                     "message": f"📊 [{_qrole}] {_qname}\n\n{_quant_resp}"})
                 # 점수 추출
                 _ms = re.search(rf"퀀트점수\s*[:：][^\n]*\b{re.escape(_qcode)}\s*=\s*(\d+)", _quant_resp or "")
@@ -2449,6 +3044,11 @@ class ArquantOrchestrator:
                 _entry = _parse_entry_directive(_quant_resp, _qcode)
                 if _entry["mode"] != "market":
                     _entry_dirs[_qcode] = _entry
+                # 사장 지시 2026-05-22: 보유 종목은 매도가(지정가) directive 파싱 — 트레이딩팀장이 그 가격으로 매도.
+                if _is_held:
+                    _sp = _parse_sell_price(_quant_resp, _qcode)
+                    if _sp["mode"] == "limit":
+                        _sell_prices[_qcode] = _sp
                 _quant_sections.append(f"[{_qrole}] {_qname}\n{_quant_resp}")
                 await asyncio.sleep(0.3)
             # 통합 리포트 (이후 운용전략실장·사후관리실장 입력용)
@@ -2458,10 +3058,13 @@ class ArquantOrchestrator:
             if _entry_dirs:
                 quant_report += "\n\n진입가 지시: " + "; ".join(
                     f"{k}={v.get('raw') or v.get('mode')}" for k, v in _entry_dirs.items())
+            if _sell_prices:
+                quant_report += "\n\n매도가 지시: " + "; ".join(
+                    f"{k}={v.get('raw') or v.get('mode')}" for k, v in _sell_prices.items())
             self.cycle_log.log("QUANT", "계량분석팀장", quant_report)
 
             # ── PASS 2: 운용전략실장 → 최종 매수 종목 (전략 프리셋에 따라 1~N개) ──────
-            _N = int(runtime.get("MAX_TRADES_PER_CYCLE") or 2)
+            _N = int(runtime.get("MAX_TRADES_PER_CYCLE", uid=self.uid) or 2)
             # 사장 지시 2026-05-14: 개장 사이클은 뉴스 100건 정보를 최대 활용 — 매매 건수 한도 확대
             if market_open:
                 _N = min(8, max(_N, _N * 3))  # 3배 또는 8개 중 작은 값
@@ -2471,7 +3074,7 @@ class ArquantOrchestrator:
                 # 사장 피드백 2026-05-16: 신규 뉴스 없음(또는 후보 0) → 신규 매수 결정 자체를 생략.
                 final_view = "최종종목: 없음"
                 if _sell_only:
-                    await _broadcast({"type":"agent_msg","agent":"운용전략실장",
+                    await self._emit({"type":"agent_msg","agent":"운용전략실장",
                         "message":"[최종 매수 종목 결정] 신규 매수 보류 (신규 뉴스 없는 사이클) — 보유 종목 매도 평가로 진행."})
                 picked = []
             else:
@@ -2489,7 +3092,7 @@ class ArquantOrchestrator:
                     f"⚠️ 응답 마지막 줄은 반드시 `최종종목: ...` (후보 목록에 있던 코드만, N개 이하; 없으면 `최종종목: 없음`).")
                 final_view = _strip_leading_section_marker(final_view, "[최종 매수 종목 결정]", "[후보 종목 선정]")
                 self.cycle_log.log("DRAFT", "운용전략실장", final_view)
-                await _broadcast({"type":"agent_msg","agent":"운용전략실장","message":f"[최종 매수 종목 결정]\n{final_view}"})
+                await self._emit({"type":"agent_msg","agent":"운용전략실장","message":f"[최종 매수 종목 결정]\n{final_view}"})
                 picked = _extract_codes_after(final_view, "최종종목", "대상종목", "종목코드", "target stocks")
             cand_set = set(candidate_codes)
             target_codes = ([c for c in picked if c in cand_set] if cand_set else picked)[:_N]
@@ -2514,7 +3117,7 @@ class ArquantOrchestrator:
                     _holdings_this_market.append(_h)  # 장외엔 양쪽 모두 분석 가능
             sell_directives: Dict[str, str] = {}
             if _holdings_this_market:
-                await _broadcast({"type":"status","state":"QUANT_ANALYSIS","message":"사후관리 — 보유 종목 매도 판단"})
+                await self._emit({"type":"status","state":"QUANT_ANALYSIS","message":"사후관리 — 보유 종목 매도 판단"})
                 _orig_holdings = holdings  # 매도 결정 후 모든 종목에 다시 사용
                 holdings = _holdings_this_market  # 사후관리실장 입력은 이 시장 종목만
                 # 보유기간 정보(holdings_history 기반) — 사후관리실장이 단기/중장기 판단할 때 사용
@@ -2526,22 +3129,40 @@ class ArquantOrchestrator:
                 holding_period_str = "\n".join(period_lines) if period_lines else "  (보유기간 데이터 없음 — 신규 관찰)"
                 # 사장 피드백 2026-05-15 (#24): 데이트레이딩 회피 룰은 전략 프리셋에서 토글.
                 # ALLOW_DAY_TRADING=True(기본)면 보유기간 가이드 자체를 안 보냄 — 사후관리실장이 자유롭게 판단.
-                _allow_day = bool(runtime.get("ALLOW_DAY_TRADING"))
-                _min_hold = float(runtime.get("MIN_HOLDING_DAYS_FOR_SELL") or 0.0)
+                _allow_day = bool(runtime.get("ALLOW_DAY_TRADING", uid=self.uid))
+                _min_hold = float(runtime.get("MIN_HOLDING_DAYS_FOR_SELL", uid=self.uid) or 0.0)
                 if _allow_day:
                     _hold_guide = "보유기간은 참고만 — **데이트레이딩 허용(전략 설정)**, 신호가 명확하면 단기 매도 OK."
                 else:
                     _hold_guide = (f"**보유기간 가중** — {_min_hold}일 미만은 데이트레이딩 회피, "
                                    f"7일 이상은 트렌드 점검.")
-                pm_view = await self.post_manager.think(
+                # 사장 지시 2026-05-24: 사후관리실장 프롬프트에 현재 세션을 명시한다.
+                # (버그 2026-05-23 04:47: 세션 정보가 없어 LLM이 'KR 장중이라 미국 시장 닫힘'으로
+                #  환각 → US_TRADING 인데도 QUBT/UUP/DAL 매도 신호를 '매매 불가'로 무시하고 보유.)
+                # 아래 보유 종목은 이미 현재 세션에서 거래 가능한 것만 필터링돼 들어온다.
+                _pm_session_hint = _post_manager_session_hint(session)
+                _pm_prompt = (
+                    f"{_pm_session_hint}\n\n"
                     f"전략리서치팀장 매크로 보고:\n{macro_report}\n\n현재 보유 종목: {holdings_str}\n\n"
                     f"보유기간 (Arquant 자체 관찰):\n{holding_period_str}\n\n"
                     f"계량분석팀장 평가:\n{quant_report}\n\n뉴스분석팀장 평가:\n{news_report}\n\n"
                     f"위 매크로 → 퀀트 → 뉴스 → 평가손익 순으로 가중해 보유 종목별로 매도/보유를 결정하십시오. "
-                    f"{_hold_guide} "
+                    f"{_hold_guide} 종목별 사유에 '시장이 닫혀 매매 불가' 같은 세션 추측을 쓰지 마십시오 (위 세션 안내가 사실). "
                     f"마지막 줄은 반드시 `매도결정: 코드=전량/절반/보유, ...` (보유 종목 전체).")
+                # 사장 지시 2026-05-22: 빈 응답/에러 시 재시도 (계량분석팀장과 동일 패턴) —
+                # 직전 사이클에서 사후관리실장이 'API 응답 비어있음'으로 매도 평가가 통째 빠진 버그.
+                pm_view = ""
+                for _pm_attempt in range(3):
+                    try:
+                        pm_view = await self.post_manager.think(_pm_prompt)
+                    except Exception as _pe:
+                        pm_view = f"[사후관리실장 에러] {_pe}"
+                    if pm_view and pm_view.strip() and "에러" not in pm_view[:80] and "응답 비어" not in pm_view:
+                        break
+                    if _pm_attempt < 2:
+                        await asyncio.sleep(1.0)
                 self.cycle_log.log("RISK", "사후관리실장", pm_view)
-                await _broadcast({"type":"agent_msg","agent":"사후관리실장","message":pm_view})
+                await self._emit({"type":"agent_msg","agent":"사후관리실장","message":pm_view})
                 sell_directives = _parse_sell_decisions(pm_view)
                 holdings = _orig_holdings  # 후속 처리(주문 조립·이력 기록)는 전체 보유 종목 사용
                 # 사장 피드백 2026-05-15 (#5, #13): 반대편 시장 보유 종목은 자동 '보유' 처리.
@@ -2559,22 +3180,22 @@ class ArquantOrchestrator:
             elif holdings:
                 # 반대편 시장 보유만 있는 상황 — 사장 피드백 2026-05-15 (#5, #13): 분석 생략 + 전체 자동 '보유'.
                 _other_mkt = "US" if session in ("KR_TRADING", "KR_PRE_MARKET", "KR_CLOSE_REVIEW") else "KR"
-                await _broadcast({"type":"agent_msg","agent":"사후관리실장",
+                await self._emit({"type":"agent_msg","agent":"사후관리실장",
                     "message": f"📭 현재 세션({session})의 보유 종목 없음 — 분석 생략 ({_other_mkt} 보유분은 해당 시장 사이클에서 처리)."})
                 for _h in (holdings or []):
                     _hc = str(_h.get("code", "")).strip()
                     if _hc:
                         sell_directives[_hc] = "보유"
             else:
-                await _broadcast({"type":"agent_msg","agent":"사후관리실장","message":"보유 종목 없음 — 매도 판단 불필요"})
+                await self._emit({"type":"agent_msg","agent":"사후관리실장","message":"보유 종목 없음 — 매도 판단 불필요"})
 
             # [7] ORDER DRAFT — assembled in Python: buys = 2패스 최종종목, sells = 사후관리실장 매도결정.
             #     The trader LLM is only invoked as a *fallback* when Python has nothing to act on.
             self.current_state = SwarmState.ORDER_DRAFTING
-            await _broadcast({"type":"status","state":"ORDER_DRAFTING","message":"주문 초안 (잔고 비율 기반 사이징)"})
+            await self._emit({"type":"status","state":"ORDER_DRAFTING","message":"주문 초안 (잔고 비율 기반 사이징)"})
             order_obj, price_map, buying_power = await self._build_orders(
                 target_codes, candidate_codes, quant_report, news_report, holdings, sell_directives=sell_directives,
-                market_open=market_open, entry_dirs=_entry_dirs)
+                market_open=market_open, entry_dirs=_entry_dirs, sell_prices=_sell_prices)
             order_draft = json.dumps(order_obj, ensure_ascii=False, indent=2)
             # 사장 피드백 2026-05-15 (3차): 트레이더 호출은 EXECUTION 이후로 이동.
             # 여기서는 시스템 상태 메시지로 "조립 완료, 리스크 검증 이동" 만 알린다.
@@ -2582,14 +3203,14 @@ class ArquantOrchestrator:
                 _drafting_msg = f"주문 {len(order_obj['orders'])}건 조립 완료 → 리스크 검증으로 이관"
             else:
                 _drafting_msg = "ℹ️ 잔고/한도 조건상 신규 주문 없음. " + ("; ".join(order_obj.get("sizing_notes") or []))[:240]
-            await _broadcast({"type":"status","state":"ORDER_DRAFTING","message": _drafting_msg})
+            await self._emit({"type":"status","state":"ORDER_DRAFTING","message": _drafting_msg})
             self.cycle_log.log("DRAFT", "트레이딩팀장", order_draft)
 
             # [8] RISK — 사장 지시 2026-05-14: 1차(결정론) + 2차(DART 공시) 통합 실행 후 **한 번에** 출력
             self.current_state = SwarmState.RISK_VALIDATION
-            await _broadcast({"type":"status","state":"RISK_VALIDATION","message":"리스크 검증 (결정론 + DART)"})
+            await self._emit({"type":"status","state":"RISK_VALIDATION","message":"리스크 검증 (결정론 + DART)"})
             self.validation_attempts = 1
-            risk_result = validate_order_draft(order_draft, "", buying_power=buying_power, price_map=price_map)
+            risk_result = validate_order_draft(order_draft, "", buying_power=buying_power, price_map=price_map, uid=self.uid)
             risk_approved = bool(risk_result["approved"])
             approved_orders = [r for r in risk_result["results"] if r["status"] == "APPROVED"]
             # 2차 DART 재심 — 매도(리스크 감소)는 통과, 매수만 공시 기반 재확인
@@ -2615,13 +3236,13 @@ class ArquantOrchestrator:
             unified_lines.append(f"\n▶ 최종 결과: {'✅ 승인' if risk_approved else '❌ 미승인'} ({len(approved_orders)}건)")
             unified_msg = "\n".join(unified_lines)
             self.cycle_log.log("RISK", "리스크관리실장", unified_msg)
-            await _broadcast({"type":"agent_msg","agent":"리스크관리실장","message":unified_msg})
+            await self._emit({"type":"agent_msg","agent":"리스크관리실장","message":unified_msg})
 
             # [9] EXECUTION — place KIS orders: sells(사후관리) 우선, 매수는 전략 N개까지. qty from sizing.
             self.current_state = SwarmState.EXECUTION
             exec_results: List[Dict] = []
             # 사장 지시 2026-05-14: 개장 사이클은 _exec_N(Pass2에서 확대됨)을 사용
-            _max_trades = _exec_N if market_open else runtime.get("MAX_TRADES_PER_CYCLE"); _max_qty = runtime.get("MAX_ORDER_QTY")
+            _max_trades = _exec_N if market_open else runtime.get("MAX_TRADES_PER_CYCLE", uid=self.uid); _max_qty = runtime.get("MAX_ORDER_QTY", uid=self.uid)
             if risk_approved and LIVE_TRADING and approved_orders:
                 _ap_sells = [r for r in approved_orders if (r.get("side") or "buy") == "sell"]
                 _ap_buys  = [r for r in approved_orders if (r.get("side") or "buy") != "sell"]
@@ -2650,16 +3271,17 @@ class ArquantOrchestrator:
                     _elimit = r.get("entry_limit")
                     _ewatch_pct = r.get("entry_watch_pct")
                     _side = r.get("side") or "buy"
-                    # 매도는 항상 시장가 (사후관리 결정에 따른 즉시 청산).
+                    # 사장 지시 2026-05-22: 매도는 계량분석팀장이 '매도가'를 숫자로 제시한 경우 그 지정가로,
+                    # 아니면 시장가(즉시 청산). watch 모드는 매도에 적용하지 않는다.
                     if _side == "sell":
-                        _emode = "market"
+                        _emode = "limit" if (_emode == "limit" and _elimit and float(_elimit) > 0) else "market"
                     # 대기(watch) 모드 — 백그라운드 태스크 spawn, 즉시 체결 대기 카운트 X
                     if _emode == "watch" and _ewatch_pct is not None:
                         asyncio.create_task(self._entry_watch_task(
                             ticker=tk, qty=qty, market=("KR" if is_kr else "US"),
                             watch_pct=float(_ewatch_pct), baseline_holdings=list(holdings or []),
                             reason=r.get("reason", "")))
-                        await _broadcast({"type":"agent_msg","agent":"트레이딩팀장",
+                        await self._emit({"type":"agent_msg","agent":"트레이딩팀장",
                             "message": f"⏱ {tk} {qty}주 분봉 모니터링 시작 — {_ewatch_pct:+.1f}% 도달 시 시장가 매수 (최대 3시간, 장 마감 시 취소)"})
                         # exec_results에는 'pending watch'로 기록 (체결 카운트 X)
                         exec_results.append({"ticker": tk, "side": _side, "qty": qty,
@@ -2735,16 +3357,14 @@ class ArquantOrchestrator:
                             except Exception: fill_price = None
                         else:
                             fill_price = sell_ref_price if sell_ref_price > 0 else None
-                    # 사장 피드백 2026-05-15 (#8, #15): "체결"은 holdings 변동이 확인됐을 때만 카운트.
-                    # 접수(accepted=True)만으로는 누적 실매매 카운트를 올리지 않는다 — 호가 미체결 가능성 있음.
-                    # 미국 종목은 KIS holdings 즉시 확인이 어렵기 때문에 일단 'accepted'로 잠정 카운트 후,
-                    # 5분 후 _reverify_fills가 실제 보유 변동 없으면 차감한다.
+                    # 사장 지시 2026-05-21: 누적 실매매 체결 카운트는 '즉시 체결이 확인된' 경우에만 +1.
+                    # 접수(accepted)만으론 올리지 않는다 — 미확인 주문은 _poll_fills_until_confirmed 가
+                    # 5분마다 반복 확인해, 실제 보유 변동이 잡히는 그 시점에 비로소 +1 한다(차감 로직 없음).
                     is_us = not is_kr
-                    ok = filled or (is_us and accepted)  # KR: 체결 확인 필수 / US: 접수=잠정 체결
+                    ok = filled  # 즉시 체결 확인된 주문만 카운트 (KR 2초 후 보유 확인 / US 는 즉시 확인 불가 → 폴링)
                     # 사장 지시 2026-05-19: 매수·매도 시점의 KIS 실매입평균가(pchs_avg_pric)를
                     # 거래에 직접 박는다. 매도는 주문 직전 평단(before_avg)=청산 로트의 실제
-                    # 매수평단, 매수는 체결 후 블렌딩 평단(after_avg). 이게 없으면 실현수익률을
-                    # 로그 FIFO 재구성으로 추정해야 해 명목/실제가 어긋났다(근본 원인).
+                    # 매수평단, 매수는 체결 후 블렌딩 평단(after_avg).
                     avg_cost = (float(before_avg or 0.0) if od.side == "sell"
                                 else float(after_avg or before_avg or 0.0))
                     rec = {"ticker": tk, "side": od.side, "qty": qty, "result": res,
@@ -2755,13 +3375,20 @@ class ArquantOrchestrator:
                     if ok:
                         self._trades_executed += 1
                         self._trade_log.append({"ts": _now_kst_iso(), **rec})
-                    badge = "✅ 실매매 체결확인" if filled else ("📨 주문 접수(체결 미확인 — 5분 후 재확인)" if accepted else "⚠ 주문 실패")
-                    await _broadcast({"type": _trade_event_type(ok),
-                        "message": f"{badge} — {res}" + (f" | {fill_note}" if fill_note else ""),
-                        "ticker": tk, "side": od.side, "qty": qty, "filled": filled,
-                        "fill_price": fill_price, "fill_currency": ("USD" if is_us else "KRW"),
-                        "avg_cost": avg_cost,
-                        "trades_total": self._trades_executed})
+                    # 모바일 알림 ①: 체결 신청(주문 접수 성공) — 즉시 체결이든 미확인이든 '접수'된 순간 1회.
+                    if accepted:
+                        await self._emit({"type": "order_submitted", "agent": "트레이딩팀장",
+                            "message": f"📨 {tk} {('매수' if od.side == 'buy' else '매도')} {qty}주 주문 접수 — 체결 확인 중",
+                            "ticker": tk, "side": od.side, "qty": qty})
+                    # 모바일 알림 ②: 체결 완료(즉시 확인) / 또는 주문 실패. 미확인(접수만)은 폴링이 추후 처리.
+                    if filled or not accepted:
+                        badge = "✅ 실매매 체결확인" if filled else "⚠ 주문 실패"
+                        await self._emit({"type": _trade_event_type(filled),
+                            "message": f"{badge} — {res}" + (f" | {fill_note}" if fill_note else ""),
+                            "ticker": tk, "side": od.side, "qty": qty, "filled": filled,
+                            "fill_price": fill_price, "fill_currency": ("USD" if is_us else "KRW"),
+                            "avg_cost": avg_cost,
+                            "trades_total": self._trades_executed})
                     self.cycle_log.log("EXEC", "시스템", f"{tk} {od.side} x{qty} → {res} | {fill_note}")
                 # 사장 피드백 2026-05-15 (#15): 체결과 접수 분리 표기
                 _filled_cnt = sum(1 for e in exec_results if e.get("filled"))
@@ -2770,17 +3397,17 @@ class ArquantOrchestrator:
                 if _accepted_only:
                     _exec_msg += f" (+ 접수만 {_accepted_only}건, 5분 후 재확인)"
                 _exec_msg += f" / 누적 체결 {self._trades_executed}건"
-                await _broadcast({"type":"execution_ready", "message": _exec_msg, "draft": order_draft})
-                # ── 사장 지시 2026-05-14: 5분 후 미체결 재확인 백그라운드 태스크 spawn ──
-                # 즉시 holdings 조회는 체결을 못 잡을 수 있으므로 5분 더 기다린 후 재검증.
-                # accepted=True/filled=False인 주문이 실제로 안 채워졌으면 trades_executed 카운트 차감.
+                await self._emit({"type":"execution_ready", "message": _exec_msg, "draft": order_draft})
+                # ── 사장 지시 2026-05-21: 미체결 주문 5분마다 '반복' 체결 확인 백그라운드 태스크 spawn ──
+                # 접수만 되고 즉시 체결이 확인 안 된 주문은 그 시점부터 5분마다 보유 변동을 재확인하다
+                # 체결이 잡히면 그때 누적 카운트 +1 + '체결 확인됨' 보고. 그때까지는 조용히(메시지 없음).
                 _unconfirmed = [e for e in exec_results if e.get("accepted") and not e.get("filled")]
                 if _unconfirmed:
-                    asyncio.create_task(self._reverify_fills(_unconfirmed, list(holdings or []) + _us_baseline))
+                    asyncio.create_task(self._poll_fills_until_confirmed(_unconfirmed, list(holdings or []) + _us_baseline))
             elif risk_approved and not LIVE_TRADING:
-                await _broadcast({"type":"execution_ready","message":"✅ 리스크 승인 (LIVE_TRADING=False — 실주문 생략)","draft":order_draft})
+                await self._emit({"type":"execution_ready","message":"✅ 리스크 승인 (LIVE_TRADING=False — 실주문 생략)","draft":order_draft})
             else:
-                await _broadcast({"type":"execution_skipped","message":"❌ 리스크 미승인 — 실행 없음"})
+                await self._emit({"type":"execution_skipped","message":"❌ 리스크 미승인 — 실행 없음"})
 
             # [9.5] 트레이딩팀장 체결 보고 — 결정론적 템플릿 (사장 피드백 2026-05-18)
             # 더 이상 LLM을 호출하지 않는다: 보고 내용이 전부 사실(종목·수량·체결여부·체결가·사유)
@@ -2816,8 +3443,8 @@ class ArquantOrchestrator:
                         _badge = "✅ 체결확인"
                         _note = (e.get("fill_note") or "").strip()
                     elif e.get("accepted"):
-                        _badge = "📨 접수(5분 후 재확인)"
-                        _note = "호가 미체결 가능 — 5분 후 보유 변동 재확인"
+                        _badge = "📨 접수(체결 확인 중)"
+                        _note = "호가 미체결 가능 — 5분마다 보유 변동 반복 확인(체결 시 누적 +1)"
                     else:
                         _badge = "⚠️ 실패"
                         _note = (e.get("result") or "")[:100]
@@ -2852,7 +3479,7 @@ class ArquantOrchestrator:
                 _tail += f" / 누적 체결 {self._trades_executed}건"
                 _parts.append(_tail)
                 _trader_msg = "\n".join(_parts)
-                await _broadcast({"type":"agent_msg","agent":"트레이딩팀장", "message": _trader_msg})
+                await self._emit({"type":"agent_msg","agent":"트레이딩팀장", "message": _trader_msg})
                 self.cycle_log.log("REPORT", "트레이딩팀장", _trader_msg)
             except Exception as _te:
                 logger.warning(f"트레이더 체결 보고 조립 실패: {_te}")
@@ -2866,13 +3493,14 @@ class ArquantOrchestrator:
                 f"실매매: {exec_summary} / 누적 체결 {self._trades_executed}건\n"
                 f"3~5줄로 결과 요약과 다음 사이클 유의사항만.")
             self.cycle_log.final_report = report
-            await _broadcast({"type":"cycle_complete","report":report,"trades_total":self._trades_executed})
+            await self._emit({"type":"cycle_complete","report":report,"trades_total":self._trades_executed})
             self._cycle_history.append(self.cycle_log.to_dict())
 
             # ── Persist cycle to SQLite (사장 지시 2026-05-14 — 백테스트/장기 분석용) ──
             new_cycle_id = None
             try:
                 new_cycle_id = cycle_store.record_cycle({
+                    "uid": self.uid,
                     "started_at": self.cycle_log.started_at,
                     "ended_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                     "session": session, "market_open": market_open,
@@ -2927,10 +3555,10 @@ class ArquantOrchestrator:
             if new_cycle_id:
                 try:
                     self._spawn_ops_support_worker(new_cycle_id, role="ops_support")
-                    await _broadcast({"type":"agent_msg","agent":"운용지원실장",
+                    await self._emit({"type":"agent_msg","agent":"운용지원실장",
                         "message": (f"🛠 [OPS#{new_cycle_id}] 사이클 #{new_cycle_id} 점검 시작 — "
-                                    f"운용지원실장이 데이터 부족·출력 깨짐 등 버그를 직접 진단합니다. "
-                                    f"고칠 게 없으면 실장 선에서 종료, 있으면 담당 팀장에게 구체 수정만 위임합니다.")})
+                                    f"운용지원실장이 직전 사이클을 분석해 조정 가능한 전략 파라미터를 점검합니다. "
+                                    f"바꿀 게 없으면 그대로 두고, 필요한 항목만 조정합니다.")})
                 except Exception as _e:
                     logger.warning(f"ops_support 워커 spawn 실패: {_e}")
 
@@ -2939,6 +3567,7 @@ class ArquantOrchestrator:
             if self.cycle_log: self.cycle_log.log("ERROR","시스템",str(e)); self._cycle_history.append(self.cycle_log.to_dict())
             try:
                 cycle_store.record_cycle({
+                    "uid": self.uid,
                     "started_at": self.cycle_log.started_at if self.cycle_log else _now_kst().strftime("%Y-%m-%d %H:%M:%S"),
                     "ended_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
                     "session": session, "market_open": market_open,
@@ -2951,20 +3580,22 @@ class ArquantOrchestrator:
     def get_status(self):
         _next_cycle_sec = max(0, int(PERIODIC_CYCLE_SEC - (time.time() - self._last_cycle_at))) if self._last_cycle_at else None
         return {"current_state":self.current_state.value,"session":get_current_session(),
-            "time_kst":_now_kst().strftime("%H:%M:%S"),"is_trading":is_trading_hours(),
+            "time_kst":_now_kst().strftime("%H:%M:%S"),"is_trading":is_market_session_now(),
             "validation_attempts":self.validation_attempts,"cycle_history_count":len(self._cycle_history),
             "pending_news":len(self._pending_news_kr) + len(self._pending_news_us),
             "pending_news_kr":len(self._pending_news_kr),"pending_news_us":len(self._pending_news_us),
             "next_cycle_sec":_next_cycle_sec,
             "trades_executed":self._trades_executed,"trade_log":self._trade_log[-5:],
-            "live_trading":LIVE_TRADING,"strategy":runtime.active(),
+            "live_trading":LIVE_TRADING,"strategy":runtime.active(uid=self.uid),
             "news_monitor":self.news_monitor.get_status(),
             "watchlist":list(INDEX_WATCHLIST.keys()),
             "schedule":{k:v["desc"] for k,v in SCHEDULE.items()}}
     def get_history(self): return self._cycle_history
 
-_swarm: Optional[ArquantOrchestrator] = None
+# Phase 2 멀티테넌트: 전역 단일 스왐(get_swarm/_swarm) 폐지.
+# 스왐은 유저별 UserContext.swarm(lazy ArquantOrchestrator(ctx))로 생성되며,
+# 라이프사이클(start/stop)은 server/app.py 의 _start_uid/_stop_uid 가 관리한다.
 def get_swarm():
-    global _swarm
-    if _swarm is None: _swarm = ArquantOrchestrator()
-    return _swarm
+    raise RuntimeError(
+        "get_swarm() is retired in Phase 2 — use UserContext.swarm (per-uid). "
+        "server/app.py routes by request.state.user_id → REGISTRY.get_or_create(uid).swarm.")

@@ -90,6 +90,16 @@ class MainActivity : ComponentActivity() {
 
     @androidx.compose.runtime.Composable
     private fun AuthedApp(onLogout: () -> Unit) {
+        // 사장 지시 2026-05-21: 인증되면 WsRelayService(foreground service)를 기동해 앱이
+        // 백그라운드여도 WebSocket 연결을 유지 → 체결/장마감 등 푸시 알림이 계속 도착한다.
+        // 로그아웃으로 이 화면이 사라지면 onDispose 에서 서비스를 멈춰 연결을 정리한다.
+        // (회전 등은 manifest configChanges 로 Activity 가 재생성되지 않아 churn 없음)
+        val svcCtx = androidx.compose.ui.platform.LocalContext.current
+        androidx.compose.runtime.DisposableEffect(Unit) {
+            val intent = android.content.Intent(svcCtx, com.arquant.mobile.service.WsRelayService::class.java)
+            androidx.core.content.ContextCompat.startForegroundService(svcCtx, intent)
+            onDispose { svcCtx.stopService(intent) }
+        }
         // DashViewModel 은 화면 렌더에 쓰지 않지만, 생성 시 WsManager.connect() 가
         // 호출되어 WebSocket 기반 네이티브 푸시 알림(TradeNotifier)이 계속 동작한다.
         // UI 자체는 서버 웹 페이지를 그대로 띄우는 WebView 가 담당한다.

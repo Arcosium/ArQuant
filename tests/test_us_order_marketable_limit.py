@@ -54,8 +54,13 @@ class _FakeSession:
         return _FakeResp(self._resp)
 
 
+_TEST_CREDS = {"kis_app_key": "K", "kis_app_secret": "S",
+               "kis_account_no": "12345678-01",
+               "kis_base_url": "https://openapi.koreainvestment.com:9443"}
+
+
 def _broker_with_fakes(monkeypatch, *, last_price, daily_rows=None, resp_payload=None):
-    b = KISBroker()
+    b = KISBroker(_TEST_CREDS)
     fake = _FakeSession(resp_payload)
 
     async def _tok():

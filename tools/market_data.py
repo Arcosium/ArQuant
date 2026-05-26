@@ -5,7 +5,7 @@ Adapted from KRX Quant Simulator CrawlerUtil:
   - 종목 3년치 일봉 + 수급 크롤링 (네이버 금융 HTML)
   - 분봉 데이터는 KIS API 사용 (kis_broker.kr_minute_chart)
 """
-import os, csv, logging, time
+import os, csv, re, json, logging, time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -85,6 +85,44 @@ def _fetch_index(key: str) -> Dict:
     return {"value": None, "change": None, "rate": None, "ok": False}
 
 
+# ── 라이브 USD/KRW 환율 (사장 지시 2026-05-22) ──────────────────────────────
+# 환율은 계속 변하므로 하드코딩하지 않는다. 5분 지수 크롤(get_index_data)이 USDKRW 를
+# 가져올 때마다 캐시를 갱신하고, 모든 USD↔KRW 환산(예산·리스크 사이징)이 이 값을 읽는다.
+# 디스크에도 영속해 재시작 직후 첫 사이클도 직전 환율을 쓰게 한다.
+_FX_CACHE_PATH = Path(__file__).resolve().parent.parent / "data" / "usdkrw_fx.json"
+_LAST_FX = 0.0
+
+def set_usdkrw(rate) -> None:
+    """라이브 환율 갱신 (sanity 500~5000 범위만 채택)."""
+    global _LAST_FX
+    try:
+        r = float(rate)
+    except (TypeError, ValueError):
+        return
+    if 500.0 < r < 5000.0:
+        _LAST_FX = r
+        try:
+            _FX_CACHE_PATH.parent.mkdir(exist_ok=True)
+            _FX_CACHE_PATH.write_text(json.dumps({"rate": r, "ts": time.time()}), encoding="utf-8")
+        except Exception:
+            pass
+
+def get_usdkrw(default: float = 1500.0) -> float:
+    """최신 라이브 USD/KRW 환율. 미수집 시 디스크 캐시 → 그래도 없으면 default."""
+    global _LAST_FX
+    if _LAST_FX and _LAST_FX > 0:
+        return _LAST_FX
+    try:
+        d = json.loads(_FX_CACHE_PATH.read_text(encoding="utf-8"))
+        r = float(d.get("rate") or 0.0)
+        if 500.0 < r < 5000.0:
+            _LAST_FX = r
+            return r
+    except Exception:
+        pass
+    return float(default)
+
+
 def get_index_data() -> Dict[str, Dict]:
     """Structured snapshot of every watchlist index — only validated numbers, never garbage.
     Returns {key: {"name","value","change","rate","ok"}}; ok=False ⇒ value/change/rate are None."""
@@ -96,6 +134,10 @@ def get_index_data() -> Dict[str, Dict]:
         if v is None or v <= 0:
             d = {"value": None, "change": None, "rate": None, "ok": False}
         out[key] = {"name": info["name"], **d}
+    # 사장 지시 2026-05-22: 크롤한 원/달러 환율을 라이브 캐시에 반영(예산·리스크 환산이 읽음)
+    _fx = out.get("USDKRW") or {}
+    if _fx.get("ok") and _fx.get("value"):
+        set_usdkrw(_fx["value"])
     return out
 
 
@@ -154,6 +196,33 @@ def get_stock_name(code: str) -> str:
     if name:
         _NAME_CACHE[code] = name
     return name
+
+
+_CODE_CACHE: Dict[str, str] = {}
+def resolve_kr_stock_code(name: str) -> str:
+    """종목명 → 6자리 KR 코드 (네이버 금융 검색). 실패 시 ''.
+
+    운용전략실장(LLM)이 종목명만 알고 코드를 환각(123456 등)할 때, 이름으로 정확한 코드를
+    채우는 폴백 (사장 지시 2026-05-22). 네이버 검색은 EUC-KR 인코딩을 요구한다.
+    첫 번째 매칭(가장 관련도 높은 종목)의 코드를 돌려준다."""
+    name = (name or "").strip()
+    if not name or re.fullmatch(r"\d{6}", name):
+        return name if re.fullmatch(r"\d{6}", name) else ""
+    if name in _CODE_CACHE:
+        return _CODE_CACHE[name]
+    code = ""
+    try:
+        from urllib.parse import quote
+        q = quote(name.encode("euc-kr"))
+        r = requests.get(f"https://finance.naver.com/search/search.naver?query={q}", headers=HEADERS, timeout=6)
+        r.encoding = "euc-kr"
+        m = re.findall(r"/item/main\.naver\?code=(\d{6})", r.text)
+        code = m[0] if m else ""
+    except Exception:
+        code = ""
+    if code:
+        _CODE_CACHE[name] = code
+    return code
 
 
 def crawl_index_snapshot(data: Optional[Dict[str, Dict]] = None) -> str:

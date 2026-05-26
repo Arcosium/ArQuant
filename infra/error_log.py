@@ -20,12 +20,14 @@ logger = logging.getLogger("ERROR_LOG")
 
 
 def record_error(component: str, exc: Optional[BaseException] = None,
-                  *, context: str = "", level: str = "error") -> None:
+                  *, context: str = "", level: str = "error", uid=None) -> None:
     """에러를 최대한 상세히 기록한다.
 
     component : 어디서 났는지 (예: "운용전략실장", "_run_analysis_cycle", "ops_support.llm_propose")
     exc       : 잡은 예외 객체 (없으면 context 만 기록)
     context   : 추가 정황 (모델명, 종목, 단계 등 — 진단에 필요한 무엇이든)
+    uid       : Phase 2 멀티테넌트 — 그 유저의 이벤트 로그(data/<uid>/trade_log.json)에 적는다.
+                None 이면 (전역 워커 등 uid 없는 컨텍스트) journald 에만 남고 파일엔 기록되지 않는다.
     """
     try:
         etype = type(exc).__name__ if exc is not None else "Error"
@@ -60,7 +62,7 @@ def record_error(component: str, exc: Optional[BaseException] = None,
                     "context": context,
                     "traceback": tb,
                 },
-            })
+            }, uid=uid)
         except Exception as _persist_err:  # noqa: BLE001 — 영속화 실패해도 본 흐름 유지
             logger.debug(f"error_log 영속화 실패: {_persist_err!r}")
     except Exception as _fatal:  # noqa: BLE001 — record_error 자체는 절대 예외 전파 금지

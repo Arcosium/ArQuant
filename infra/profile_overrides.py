@@ -8,10 +8,13 @@ ArQuant — 프로필 한정 런타임 오버라이드 + 비관리자 제안 이
     • 비관리자 계정                     → 소스·서버 불가침. 대신 '튜닝 파라미터'만
                                           이 모듈을 통해 **해당 프로필 전용**으로 저장
 
-격리가 성립하는 이유:
-  credentials.set_active() 가 '활성 계정은 언제나 단 하나'를 강제한다. 따라서 활성
-  프로필의 오버라이드를 runtime 의 최상위 레이어로 올렸다가 계정 전환 시 교체하면,
-  전역 runtime 상태가 곧 '현재 활성 프로필의 상태'가 된다. 계정별 코드 로딩이 필요 없다.
+격리 (Phase 1 → Phase 2):
+  Phase 1 에선 credentials.set_active() 가 '활성 계정은 언제나 단 하나'를 강제해,
+  활성 프로필 오버라이드를 runtime 전역 레이어에 올렸다가 전환 시 교체하는 방식으로
+  격리를 흉내냈다. Phase 2 멀티테넌트로 전환하며 그 단일 활성 계정 개념(set_active)은
+  폐지됐다. 프로필별 저장/조회(load/save/last_updated 등)는 그대로 uid 기준이라 정상이나,
+  activate() 가 쓰던 runtime 전역 레이어 적용 경로는 더 이상 호출되지 않는다
+  (유저별 runtime 레이어 분리는 별도 작업으로 남음 — Task 7 범위 밖 concern).
 
 보안 경계:
   허용 키 = config.STRATEGY_TUNABLE_KEYS (UI '전략' 탭이 쓰는 그 화이트리스트).
@@ -164,21 +167,35 @@ def clear_overrides(uid: int) -> None:
         pass
 
 
-# ─── 활성 프로필 → runtime 레이어 ──────────────────────────────────────────────
-def activate(uid: Optional[int], is_admin: bool = False) -> Dict[str, Any]:
-    """credentials.set_active() 에서 호출. 활성 계정의 프로필 오버라이드를 runtime
-    최상위 레이어로 올린다. ADMIN 이거나 오버라이드가 없으면 레이어를 비워서
-    직전 비관리자 프로필의 튜닝이 다음 세션으로 새지 않게 한다.
-
-    반환: 실제 적용된 오버라이드 dict (로깅/응답용)."""
-    ov = {} if (is_admin or uid is None) else load(uid)
+def last_updated(uid: Optional[int]) -> Optional[str]:
+    """이 프로필 오버라이드가 마지막으로 갱신된 시각(KST 'YYYY-MM-DD HH:MM:SS').
+    운용지원실장이 파라미터를 조정할 때마다 set_overrides 가 overrides.json 을 다시 쓰므로
+    그 파일 mtime 이 곧 '마지막 파라미터 업데이트 시각'이다. 오버라이드가 없으면 None
+    (→ 호출부가 전략 선택 시각 active.since 로 폴백). 사장 지시 2026-05-21."""
+    if uid is None:
+        return None
+    p = _overrides_path(uid)
+    if not p.exists():
+        return None
     try:
-        import runtime
-        runtime.set_profile_overrides(ov)
-    except Exception as e:
-        logger.warning("runtime.set_profile_overrides 실패(uid=%s): %s", uid, e)
+        return datetime.fromtimestamp(p.stat().st_mtime, KST).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+# ─── 활성 프로필 → runtime 레이어 (LEGACY no-op) ───────────────────────────────
+def activate(uid: Optional[int], is_admin: bool = False) -> Dict[str, Any]:
+    """(LEGACY no-op) 과거: 활성 계정의 프로필 오버라이드를 runtime 전역 최상위 레이어로 올렸다.
+
+    Task 10 멀티테넌트 마무리로 runtime.get(key, uid) 가 프로필 오버라이드를 디스크에서
+    uid 별로 직접 읽도록 바뀌면서, 전역 레이어를 미리 올려둘 필요가 사라졌다(이 함수는
+    이미 orphan 이었다). 하위호환을 위해 시그니처만 유지하고 적용 시점에 실제로 쓰일
+    오버라이드를 (로깅/응답용으로) 반환만 한다 — runtime 전역 상태는 건드리지 않는다.
+
+    반환: 적용 대상 오버라이드 dict (admin/uid=None 이면 빈 dict)."""
+    ov = {} if (is_admin or uid is None) else load(uid)
     if ov:
-        logger.info("프로필 오버라이드 활성화 uid=%s keys=%s", uid, list(ov.keys()))
+        logger.info("프로필 오버라이드 (uid=%s keys=%s) — runtime.get(uid) 가 디스크에서 직접 적용", uid, list(ov.keys()))
     return ov
 
 
@@ -219,10 +236,9 @@ def proposal_summary_text(uid: Optional[int], limit: int = 20) -> str:
     """비관리자 계정의 '@운용지원실장 이력 보여줘' 응답용 사람-친화 텍스트."""
     h = load_proposals(uid)[-limit:]
     if not h:
-        return ("📋 (비관리자 프로필) 운용지원실장 제안 이력이 아직 없습니다.\n"
-                "ℹ️ 이 계정은 공유 소스 코드를 변경할 수 없습니다. 운용지원실장에게 내린 "
-                "튜닝 지시는 이 프로필 전용 파라미터로만 반영됩니다 "
-                "(전략·예산·익절/손절 등). 소스 구조 변경은 ADMIN(hh09080) 전용입니다.")
+        return ("📋 운용지원실장 제안 이력이 아직 없습니다.\n"
+                "ℹ️ 운용지원실장에게 내린 튜닝 지시는 이 프로필 전용 파라미터로 반영됩니다 "
+                "(전략·예산·익절/손절 등).")
     lines = [f"📋 (비관리자 프로필) 운용지원실장 제안·프로필 반영 이력 — 최근 {len(h)}건:"]
     for i, r in enumerate(h, 1):
         ts = r.get("ts", "?")

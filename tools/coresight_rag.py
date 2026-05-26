@@ -20,22 +20,14 @@ logger = logging.getLogger("CORESIGHT_RAG")
 _DENY_RESULT = "[Coresight] 비활성 — 이 계정에서는 Coresight 조회를 사용할 수 없습니다."
 
 
-def _get_active_uid() -> Optional[int]:
-    """활성 계정 uid 반환. 실패 시 None (default-deny). main_swarm._active_actor() 와
-    동일 패턴 — infra.credentials.current() 가 단일 진실원."""
-    try:
-        from infra import credentials as _creds
-        act = _creds.current()
-        return act.get("user_id")
-    except Exception as e:
-        logger.debug("Coresight 게이트: 활성 계정 조회 실패 — 거부 처리: %s", e)
-        return None
+def _is_admin_active(uid: Optional[int] = None) -> bool:
+    """주어진 uid 가 ADMIN 인지 확인. uid 불명·실패 → False (deny-by-default, fail-soft).
 
-
-def _is_admin_active() -> bool:
-    """활성 계정이 ADMIN 인지 확인. 실패·None → False (deny-by-default, fail-soft)."""
+    Phase 2 멀티테넌트: 전역 활성 계정(credentials.current) 폐지 → 호출자가 uid 를
+    명시적으로 넘긴다. query_coresight 는 현재 런타임 도구로 와이어링되어 있지 않고
+    (프롬프트 노출은 _coresight_tool_line 이 주입 uid 로 게이트한다) uid 없이 직접
+    호출되면 default-deny 다."""
     try:
-        uid = _get_active_uid()
         if uid is None:
             return False
         from infra.auth_store import is_admin
@@ -45,17 +37,20 @@ def _is_admin_active() -> bool:
         return False
 
 
-async def query_coresight(query: str, top_k: int = 5) -> str:
+async def query_coresight(query: str, top_k: int = 5, uid: Optional[int] = None) -> str:
     """
     Search Coresight knowledge base files in real-time.
     Performs keyword-based search across all Coresight JSON log files.
 
-    Admin-only gate: 비관리자 또는 활성 계정 불명 시 빈/거부 문자열 반환.
+    Admin-only gate: 비관리자 또는 uid 불명 시 빈/거부 문자열 반환.
     에이전트 루프에서 예외를 올리지 않는다(fail-soft).
+
+    Phase 2 멀티테넌트: 전역 활성 계정 폐지 → 호출자가 uid 를 넘긴다(없으면 default-deny).
 
     Args:
         query: Search query text (Korean or English)
         top_k: Maximum number of results to return
+        uid: 호출 유저 id — ADMIN 게이트 판정용 (없으면 거부)
 
     Returns:
         Formatted string of relevant knowledge snippets, or denial message for non-admin.
@@ -63,7 +58,7 @@ async def query_coresight(query: str, top_k: int = 5) -> str:
     # ── ADMIN 전용 게이트 — deny-by-default, fail-soft ──────────────────────────
     # 예외도 포함해 fail-soft: 어떤 오류가 나도 에이전트 루프를 죽이지 않는다.
     try:
-        _admin = _is_admin_active()
+        _admin = _is_admin_active(uid)
     except Exception as _e:
         logger.info("Coresight 게이트 오류 — 거부 처리(fail-soft): %s", _e)
         _admin = False

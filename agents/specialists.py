@@ -12,14 +12,16 @@ from agents.base_agent import BaseAgent
 # (정보 누출·열거 방지 — commit a21a06a 보안 사고방식과 일관)
 # 런타임 query_coresight() 자체도 비관리자 호출 시 빈 결과로 fail-soft 반환하므로
 # 이중 방어(defense-in-depth).
-def _coresight_tool_line(description: str) -> str:
-    """활성 계정이 admin이면 Coresight 도구 설명 줄 반환, 아니면 빈 문자열.
-    실패(계정 불명 포함) 시 deny-by-default — 빈 문자열 반환(fail-soft).
-    에이전트 생성 루프를 절대 크래시하지 않는다."""
+def _coresight_tool_line(description: str, injection=None) -> str:
+    """이 에이전트의 소유 유저(injection['uid'])가 admin이면 Coresight 도구 설명 줄 반환,
+    아니면 빈 문자열. 실패(uid 불명 포함) 시 deny-by-default — 빈 문자열 반환(fail-soft).
+    에이전트 생성 루프를 절대 크래시하지 않는다.
+
+    Phase 2 멀티테넌트: 전역 활성 계정(credentials.current) 폐지 → 에이전트 생성 시
+    주입된 uid 로 판정한다(유저별 격리)."""
     try:
-        from infra import credentials as _creds
         from infra.auth_store import is_admin
-        uid = _creds.current().get("user_id")
+        uid = (injection or {}).get("uid")
         if uid is not None and is_admin(uid):
             return f"\n- query_coresight: {description}"
     except Exception:
@@ -27,12 +29,13 @@ def _coresight_tool_line(description: str) -> str:
     return ""
 
 
-def create_macro_analyst() -> BaseAgent:
+def create_macro_analyst(injection=None) -> BaseAgent:
     """전략리서치팀 (Macro Analyst)"""
     return BaseAgent(
         name="전략리서치팀장",
         role="macro_analyst",
         model_key="macro_analyst",
+        injection=injection,
         system_prompt="""당신은 NPS Swarm v1.0의 '전략리서치팀(Macro Analyst)'입니다.
 
 ## 역할
@@ -70,16 +73,17 @@ def create_macro_analyst() -> BaseAgent:
 - `tools.global_search.deep_research`: 매 매크로 분석 직전 자동 종합 리서치 (위 컨텍스트 주입됨, 가격 X)
 - `tools.news_monitor`: 네이버 금융 증권 속보 (10분 주기 크롤, KR/US/BOTH 자동 분류 — alibaba)
 - `tools.dart_disclosure`: KR 공시 + 직전연도 요약재무"""
-        + _coresight_tool_line("과거 전략 기록"),
+        + _coresight_tool_line("과거 전략 기록", injection),
     )
 
 
-def create_quant_analyst() -> BaseAgent:
+def create_quant_analyst(injection=None) -> BaseAgent:
     """계량분석팀 (Quant Analyst) — 운용전략실장이 1차로 고른 후보 종목을 다각도로 평가"""
     return BaseAgent(
         name="계량분석팀장",
         role="quant_analyst",
         model_key="quant_analyst",
+        injection=injection,
         system_prompt="""당신은 ArQuant v1.0의 '계량분석팀장(Quant Analyst)'입니다.
 
 ## 역할
@@ -137,23 +141,25 @@ def create_quant_analyst() -> BaseAgent:
 - 평가: 호재·악재 균형
 
 ▶ 결론
-- 매수 적합도 점수: 0~10 (각 섹션 가중치 명시 — 예: 추세 30% + 평균회귀 20% + 변동성 15% + 수급 20% + 뉴스 15%)
+- 매수 적합도 점수: 0~10. **반드시 다음 고정 가중치로만 산정**(종목마다 다른 가중치 사용 금지 — 변경 금지):
+  추세·모멘텀 30% + 평균회귀·과열 20% + 변동성·리스크 15% + 수급·거래량 20% + 뉴스·이벤트 15%.
+  각 섹션을 0~10으로 평가한 뒤 이 고정 가중치로 가중평균해 최종 점수를 내십시오 — 운용전략실장이 종목 간 점수를 직접 비교하므로 산식이 통일돼야 합니다.
 - 핵심 리스크 1~2개
 - 보유 종목이면 매도/보유 추천 한 줄
 
 ## 응답의 **마지막 두 줄**은 반드시 다음 형식(다른 텍스트 없이):
   `퀀트점수: 005930=7`     ← 1종목 1점수만
-  `진입가: 005930=시장가`  ← 선택. 생략 시 시장가. 가능한 값:
+  ▷ **후보(신규 매수 대상)** 종목이면 — `진입가: 005930=시장가`  ← 생략 시 시장가. **가능한 값은 두 가지뿐**:
        • `시장가` (즉시 시장가 매수 권장)
        • `58000` (지정가 매수 — KIS limit 주문으로 큐잉, 장 마감 시 자동 취소)
-       • `관망 -1.5%` (현재가에서 -1.5% 떨어지면 분봉 모니터링 후 시장가 매수, 최대 3시간 대기)
-       • `관망 +1.0%` (현재가 대비 +1.0% 돌파 시 매수 — 모멘텀 추격)
+  ▷ **보유 종목**이면 — `매도가: 005930=시장가`  ← 진입가 대신 **매도가**를 제시(사장 지시 2026-05-22). 사후관리실장이 매도 결정 시 트레이딩팀장이 이 가격으로 주문합니다. **가능한 값은 두 가지뿐**:
+       • `시장가` (즉시 청산이 옳을 때 — 손절·급락 회피·추세 붕괴)
+       • `305000` (목표 지정가 매도 — KIS limit 주문, 장 마감 시 자동 취소)
 
-## 진입 타이밍 가이드 (사장 피드백 2026-05-15 #4)
-- 강한 매수 신호이며 즉시 진입이 필요할 때만 `시장가`로 답하십시오.
-- 단기 과열(RSI 75+)·이격 큰 종목은 일정 % 조정 후 진입이 안전하지만, '관망' 모드는 아직 구현되지 않았습니다. 대신 원하는 진입 가격을 지정가로 제시하십시오 (예: `진입가: 005930=58000`).
-- 지지선·이전 저항선 등 명확한 가격 레벨이 있으면 `숫자` (예: `진입가: 005930=58000`) 지정.
-- 보유 종목 평가에는 진입가가 의미 없으니 생략 가능.
+## 진입가/매도가 가이드 (사장 피드백 2026-05-15 #4 · 2026-05-22 매수/매도 분리·포맷 통일)
+- 후보 종목: 강한 매수 신호로 즉시 진입이 필요하면 `진입가: code=시장가`, 특정 가격에 사고 싶으면 `진입가: code=숫자`(지정가). '관망' 같은 상대 표현은 금지 — 시스템이 일관되게 해석하지 못합니다.
+- 보유 종목: 매수 분석이 아니라 **매도 분석**을 하십시오(추세 붕괴·목표가 도달·리스크). 급히 청산할 상황이면 `매도가: code=시장가`, 목표가까지 들고 가려면 `매도가: code=숫자`(지정가). 보유 종목엔 진입가를 쓰지 마십시오.
+- 가격은 항상 `숫자`(원/달러 단위)로만 지정 — 현재가 대비 % 식의 상대 표현은 금지.
 
 ## ⛔ 절대 규칙 — 도구 호출/코드 출력 금지 (사장 피드백 2026-05-18)
 - **필요한 종목 데이터(일봉·지표·수급·DART)는 이미 위 프롬프트에 전부 주입되어 있습니다.** 추가로 도구를 호출할 필요가 전혀 없습니다.
@@ -163,12 +169,13 @@ def create_quant_analyst() -> BaseAgent:
     )
 
 
-def create_news_analyst() -> BaseAgent:
+def create_news_analyst(injection=None) -> BaseAgent:
     """해외주식 뉴스 (News Analyst)"""
     return BaseAgent(
         name="뉴스분석팀장",
         role="news_analyst",
         model_key="news_analyst",
+        injection=injection,
         system_prompt="""당신은 NPS Swarm v1.0 해외주식실의 '뉴스 분석가(News Analyst)'입니다.
 
 ## 역할
@@ -202,16 +209,17 @@ def create_news_analyst() -> BaseAgent:
 
 ## 사용 가능 도구
 - naver_realtime_search: 네이버 실시간 뉴스 스크래핑"""
-        + _coresight_tool_line("과거 뉴스 분석 기록 조회"),
+        + _coresight_tool_line("과거 뉴스 분석 기록 조회", injection),
     )
 
 
-def create_trader() -> BaseAgent:
+def create_trader(injection=None) -> BaseAgent:
     """트레이딩팀장 (Trader) — 실행 결과 + 매매 사유를 사장님께 한국어 자연어로 정리해 보고."""
     return BaseAgent(
         name="트레이딩팀장",
         role="trader",
         model_key="trader",
+        injection=injection,
         system_prompt="""당신은 ArQuant v1.0의 '트레이딩팀장(Trader)'입니다.
 
 ## 역할 (사장 피드백 2026-05-15 3차)
@@ -243,12 +251,13 @@ def create_trader() -> BaseAgent:
     )
 
 
-def create_post_manager() -> BaseAgent:
+def create_post_manager(injection=None) -> BaseAgent:
     """사후관리실장 (Post-Management / Portfolio Review) — 현재 보유 종목 매도 판단"""
     return BaseAgent(
         name="사후관리실장",
         role="post_manager",
         model_key="post_manager",
+        injection=injection,
         system_prompt="""당신은 ArQuant v1.0의 '사후관리실장(Post-Management Officer)'입니다.
 
 ## 역할
@@ -283,16 +292,17 @@ def create_post_manager() -> BaseAgent:
 
 ## 사용 가능 도구
 - analyze_stock_technical: 보유 종목 기술적 분석"""
-        + _coresight_tool_line("과거 매도 판단 기록 조회"),
+        + _coresight_tool_line("과거 매도 판단 기록 조회", injection),
     )
 
 
-def create_ops_support() -> BaseAgent:
+def create_ops_support(injection=None) -> BaseAgent:
     """운용지원실장 (Ops Support) — 진단 + 프로필 한정 전략 파라미터 조정 (코드 자가수정 없음)"""
     return BaseAgent(
         name="운용지원실장",
         role="ops_support",
         model_key="ops_support",
+        injection=injection,
         system_prompt="""당신은 ArQuant v1.0의 '운용지원실장(Operations Support)'입니다.
 
 ## 역할 (사장 지시 2026-05-20)

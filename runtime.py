@@ -22,25 +22,47 @@ _HIST = _DIR / "strategy_history.json"
 _USER_PRESETS = _DIR / "user_presets.json"  # 사장 지시 2026-05-14: 사용자 정의 프리셋 영구 저장
 _OPS_FLAG = _DIR / "ops_feedback.json"      # 사장 피드백 2026-05-18: 운용지원실장 피드백 on/off 토글
 
-_state = {"name": config.DEFAULT_STRATEGY, "params": dict(config.STRATEGY_PRESETS[config.DEFAULT_STRATEGY]),
-          "since": datetime.now().isoformat()}
+# ── 전략 상태 — 프로필(계정)별 (Task 10: 멀티테넌트 마무리) ──────────────────────
+# "전략" = 튜닝 트레이딩 파라미터 묶음(sizing·TP/SL·리스크게이트·뉴스임계...).
+# 이전엔 _state 가 프로세스 전역 단일 dict 라 한 계정의 전략/파라미터 변경이 모든
+# 계정에 적용됐다(멀티테넌트 격리 깨짐). 이제 _notif_settings/_cost_mode 와 동일한
+# {"_default":..., "<uid>":...} 키드 패턴으로 uid 별로 분리한다.
+# 저장 형식: {"_default": {name,params,since}, "<uid>": {name,params,since}}.
+# 구버전 flat 포맷({name,params,since})은 로드 시 _default 로 자동 이관(하위호환).
+def _default_state() -> dict:
+    return {"name": config.DEFAULT_STRATEGY,
+            "params": dict(config.STRATEGY_PRESETS[config.DEFAULT_STRATEGY]),
+            "since": datetime.now().isoformat()}
+
+
+_states: dict = {"_default": _default_state()}
+
+
+def _strat_key(uid=None) -> str:
+    return str(int(uid)) if uid is not None else "_default"
+
+
+def _get_state(uid=None) -> dict:
+    """그 uid 의 전략 상태. 미설정 시 _default 로 폴백(없으면 새 기본 생성)."""
+    return _states.get(_strat_key(uid)) or _states.get("_default") or _default_state()
+
 
 # 사장 피드백 2026-05-18: 프로필 한정 오버라이드 레이어 (최상위 우선순위).
-# credentials.set_active() 가 활성 계정의 비관리자 오버라이드를 여기로 올리고,
-# 계정 전환·ADMIN 로그인 시 {} 로 교체한다 → 전역 strategy 선택(아래 _state)을
-# 건드리지 않으면서 활성 프로필 한정 튜닝만 얹는다. 단일 활성 계정 불변식 덕에 격리 성립.
-_profile_overrides: dict = {}
+# Task 10: 전역 인메모리 레이어를 폐지하고 get(key, uid) 가 디스크
+# (infra.profile_overrides.load(uid) = data/profiles/<uid>/overrides.json)를 직접 참조한다.
+# uid=None 이면 프로필 오버라이드 미적용(시스템 기본).
 
 
 def set_profile_overrides(d: dict | None):
-    """활성 프로필의 튜닝 오버라이드 교체 (None/{} = 레이어 해제). 재시작 불필요 —
-    get() 이 즉시 최상위로 참조한다. infra.profile_overrides.activate() 가 호출자."""
-    global _profile_overrides
-    _profile_overrides = dict(d or {})
+    """(LEGACY no-op) 과거 전역 오버라이드 레이어 교체용. Task 10 에서 프로필 오버라이드는
+    get(key, uid) 가 디스크에서 uid 별로 직접 읽으므로 전역 레이어는 폐지됐다.
+    하위호환을 위한 thin shim — 아무 동작도 하지 않는다."""
+    return None
 
 
 def profile_overrides() -> dict:
-    return dict(_profile_overrides)
+    """(LEGACY) 전역 오버라이드 레이어는 폐지됨 — 항상 빈 dict."""
+    return {}
 
 
 # ── 운용지원실장 피드백 on/off — 프로필(계정)별 (사장 지시 2026-05-20) ───────────
@@ -147,9 +169,59 @@ def set_cost_display_mode(mode: str, uid=None) -> str:
     return mode
 
 
+# ── 모바일 알림 설정 — 프로필(계정)별 (사장 지시 2026-05-21) ──────────────────────
+# 모바일 앱(네이티브 WsManager)이 띄울 4종 푸시 알림을 프로필별로 on/off:
+#   order_submitted(체결 신청) · trade(체결 완료) · cycle(사이클 완료) · market_close(장 마감)
+# 저장 형식: {"_default": {order_submitted,trade,cycle,market_close}, "<uid>": {...}} (전부 기본 ON).
+# 웹 대시보드 표시는 이 설정과 무관(항상 전체) — 이 토글은 '모바일 푸시'만 게이트한다.
+_NOTIF_FILE = _DIR / "notif_settings.json"
+_NOTIF_KEYS = ("order_submitted", "trade", "cycle", "market_close")
+_NOTIF_DEFAULT = {k: True for k in _NOTIF_KEYS}
+_notif_settings: dict = {"_default": dict(_NOTIF_DEFAULT)}
+
+
+def _notif_key(uid=None) -> str:
+    return str(int(uid)) if uid is not None else "_default"
+
+
+def _clean_notif(d: dict) -> dict:
+    return {k: bool((d or {}).get(k, True)) for k in _NOTIF_KEYS}
+
+
+def _load_notif_settings():
+    global _notif_settings
+    try:
+        if _NOTIF_FILE.exists():
+            d = json.loads(_NOTIF_FILE.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                _notif_settings = {k: _clean_notif(v) for k, v in d.items() if isinstance(v, dict)}
+                _notif_settings.setdefault("_default", dict(_NOTIF_DEFAULT))
+    except Exception:
+        pass
+
+
+def notif_settings(uid=None) -> dict:
+    """프로필(uid)별 모바일 알림 설정. 미설정 시 _default(전부 ON)로 폴백."""
+    st = _notif_settings.get(_notif_key(uid)) or _notif_settings.get("_default") or _NOTIF_DEFAULT
+    return _clean_notif(st)
+
+
+def set_notif_settings(settings: dict, uid=None) -> dict:
+    """모바일 알림 설정 변경 — 프로필(uid)별. 부분 갱신 허용. 재시작 불필요."""
+    global _notif_settings
+    cur = notif_settings(uid)
+    cur.update({k: bool(v) for k, v in (settings or {}).items() if k in _NOTIF_KEYS})
+    _notif_settings[_notif_key(uid)] = cur
+    try:
+        _NOTIF_FILE.write_text(json.dumps(_notif_settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return cur
+
+
 def _persist():
     try:
-        _STATE.write_text(json.dumps(_state, ensure_ascii=False, indent=2), encoding="utf-8")
+        _STATE.write_text(json.dumps(_states, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -167,14 +239,28 @@ def _append_history(entry: dict):
         pass
 
 
+def _normalize_state(d: dict) -> dict:
+    return {"name": d.get("name", "custom"), "params": dict(d.get("params") or {}),
+            "since": d.get("since", datetime.now().isoformat())}
+
+
 def _load():
-    global _state
+    global _states
     try:
         if _STATE.exists():
             d = json.loads(_STATE.read_text(encoding="utf-8"))
-            if isinstance(d, dict) and d.get("params"):
-                _state = {"name": d.get("name", "custom"), "params": dict(d["params"]),
-                          "since": d.get("since", datetime.now().isoformat())}
+            if not isinstance(d, dict):
+                return
+            if d.get("params"):
+                # 구버전 flat 포맷({name,params,since}) → _default 로 이관(하위호환)
+                _states = {"_default": _normalize_state(d)}
+            else:
+                # 키드 포맷({"_default":..., "<uid>":...})
+                loaded = {k: _normalize_state(v) for k, v in d.items()
+                          if isinstance(v, dict) and v.get("params")}
+                if loaded:
+                    _states = loaded
+                _states.setdefault("_default", _default_state())
     except Exception:
         pass
 
@@ -182,19 +268,28 @@ def _load():
 _load()
 _load_ops_feedback()
 _load_cost_mode()
+_load_notif_settings()
 if not _HIST.exists():
-    _append_history({"name": _state["name"], "params": _state["params"], "by": "init"})
+    _dflt = _get_state(None)
+    _append_history({"name": _dflt["name"], "params": _dflt["params"], "by": "init"})
 
 
-def get(key, default=None):
-    """Live tunable value. 우선순위 (사장 피드백 2026-05-18):
-      1) 활성 프로필 오버라이드 (비관리자 운용지원실장 튜닝 — 프로필 한정)
-      2) 전역 전략 프리셋/커스텀 (대시보드 '전략' 탭 — ADMIN/공통)
+def get(key, default=None, uid=None):
+    """Live tunable value — 프로필(uid)별. 우선순위 (Task 10):
+      1) 이 uid 의 프로필 오버라이드 (비관리자 운용지원실장 튜닝 — 디스크에서 직접 로드,
+         data/profiles/<uid>/overrides.json). uid=None 이면 미적용.
+      2) 이 uid 의 전략 프리셋/커스텀 params (대시보드 '전략' 탭). uid=None → _default.
       3) config 모듈 상수 → 호출자 default
     """
-    if key in _profile_overrides:
-        return _profile_overrides[key]
-    p = _state.get("params") or {}
+    if uid is not None:
+        try:
+            from infra import profile_overrides as _po
+            ov = _po.load(uid)
+            if key in ov:
+                return ov[key]
+        except Exception:
+            pass
+    p = _get_state(uid).get("params") or {}
     if key in p:
         return p[key]
     return getattr(config, key, default)
@@ -226,21 +321,25 @@ def _preset_label(name):
     return "사용자 지정" if name == "custom" else name
 
 
-def active() -> dict:
+def active(uid=None) -> dict:
+    """그 uid 의 활성 전략(이름·라벨·since + 효과적 params). uid=None → _default."""
+    st = _get_state(uid)
     keys = config.STRATEGY_TUNABLE_KEYS
-    return {"name": _state["name"], "label": _preset_label(_state["name"]),
-            "since": _state.get("since"), "params": {k: get(k) for k in keys}}
+    return {"name": st["name"], "label": _preset_label(st["name"]),
+            "since": st.get("since"), "params": {k: get(k, uid=uid) for k in keys}}
 
 
-def list_presets() -> list:
+def list_presets(uid=None) -> list:
     """Built-in presets first, then user-saved presets (사장 지시 2026-05-14).
-    Each row carries `source` ∈ {'builtin','user'} so the UI can show a delete button for user ones."""
+    Each row carries `source` ∈ {'builtin','user'} so the UI can show a delete button for user ones.
+    `active` 플래그는 그 uid 의 활성 전략 기준(uid=None → _default)."""
+    cur_name = _get_state(uid)["name"]
     keys = config.STRATEGY_TUNABLE_KEYS
     out = []
     for name, pr in config.STRATEGY_PRESETS.items():
         out.append({"name": name, "label": pr.get("label", name), "source": "builtin",
                     "params": {k: pr.get(k, getattr(config, k, None)) for k in keys},
-                    "active": name == _state["name"]})
+                    "active": name == cur_name})
     for name, pr in _load_user_presets().items():
         # user names cannot collide with builtins — skip if they somehow do (builtin wins)
         if name in config.STRATEGY_PRESETS:
@@ -248,7 +347,7 @@ def list_presets() -> list:
         params = pr.get("params") or {}
         out.append({"name": name, "label": pr.get("label", name), "source": "user",
                     "params": {k: params.get(k, getattr(config, k, None)) for k in keys},
-                    "active": name == _state["name"]})
+                    "active": name == cur_name})
     return out
 
 
@@ -290,9 +389,12 @@ def delete_user_preset(name: str) -> dict:
     removed = presets.pop(name)
     _save_user_presets(presets)
     _append_history({"name": name, "by": "dashboard:delete_preset", "removed": removed.get("label", name)})
-    # if the deleted preset was active, fall back to balanced
-    if _state.get("name") == name:
-        set_strategy(config.DEFAULT_STRATEGY, by="auto_fallback_after_delete")
+    # 사용자 프리셋은 전역 공유 정의다. 삭제 시, 이 프리셋을 활성으로 쓰던 모든 프로필을
+    # DEFAULT_STRATEGY 로 폴백시킨다(전역 단일 _state 시절엔 한 개였으나 이제 uid 별).
+    for k, st in list(_states.items()):
+        if isinstance(st, dict) and st.get("name") == name:
+            _uid = None if k == "_default" else int(k)
+            set_strategy(config.DEFAULT_STRATEGY, by="auto_fallback_after_delete", uid=_uid)
     return {"ok": True, "message": f"사용자 프리셋 '{name}' 삭제됨", "presets": list_presets()}
 
 
@@ -306,19 +408,19 @@ def history() -> list:
     return []
 
 
-def set_strategy(name: str, custom: dict = None, by: str = "user") -> dict:
-    """Activate a preset by name OR apply custom params. (사장 지시 2026-05-14: 사용자 프리셋도 인식)
+def set_strategy(name: str, custom: dict = None, by: str = "user", uid=None) -> dict:
+    """Activate a preset by name OR apply custom params — 프로필(uid)별. uid=None → _default.
+    (사장 지시 2026-05-14: 사용자 프리셋도 인식)
     Resolution order: builtin → user → 'custom' (use supplied params).
     """
-    global _state
     keys = set(config.STRATEGY_TUNABLE_KEYS)
     if name in config.STRATEGY_PRESETS:
         params = {k: v for k, v in config.STRATEGY_PRESETS[name].items() if k in keys}
-        _state = {"name": name, "params": params, "since": datetime.now().isoformat()}
+        new_state = {"name": name, "params": params, "since": datetime.now().isoformat()}
     elif name in _load_user_presets():
         up = _load_user_presets()[name].get("params") or {}
-        _state = {"name": name, "params": {k: up.get(k, getattr(config, k, None)) for k in keys},
-                  "since": datetime.now().isoformat()}
+        new_state = {"name": name, "params": {k: up.get(k, getattr(config, k, None)) for k in keys},
+                     "since": datetime.now().isoformat()}
     else:
         # 'custom' or unknown → use supplied params (filtered to known keys), defaulting from balanced
         base = dict(config.STRATEGY_PRESETS[config.DEFAULT_STRATEGY])
@@ -326,9 +428,11 @@ def set_strategy(name: str, custom: dict = None, by: str = "user") -> dict:
             for k, v in custom.items():
                 if k in keys:
                     base[k] = v
-        _state = {"name": "custom", "params": {k: base.get(k) for k in config.STRATEGY_TUNABLE_KEYS},
-                  "since": datetime.now().isoformat()}
+        new_state = {"name": "custom", "params": {k: base.get(k) for k in config.STRATEGY_TUNABLE_KEYS},
+                     "since": datetime.now().isoformat()}
+    _states[_strat_key(uid)] = new_state
     _persist()
-    _append_history({"name": _state["name"], "label": _preset_label(_state["name"]),
-                     "params": _state["params"], "by": by})
-    return active()
+    _append_history({"name": new_state["name"], "label": _preset_label(new_state["name"]),
+                     "params": new_state["params"], "by": by,
+                     "uid": (None if uid is None else int(uid))})
+    return active(uid)
