@@ -38,10 +38,3 @@ def test_llm_propose_surfaces_exception_via_record_error(monkeypatch):
     res = asyncio.run(w.llm_propose("프롬프트", role="ops_support"))
     assert res == {}, "예외 시 빈 dict 로 안전 폴백"
     assert calls, "LLM 호출 예외가 record_error 로 표면화돼야 한다"
-
-
-def test_llm_diagnose_surfaces_exception_via_record_error(monkeypatch):
-    calls = _patch_boom(monkeypatch)
-    res = asyncio.run(w.llm_diagnose("프롬프트"))
-    assert res.get("action") == "none", "예외 시 안전하게 none 으로 폴백"
-    assert calls, "진단 LLM 예외가 record_error 로 표면화돼야 한다"

@@ -795,6 +795,7 @@ const agents=[
   {name:"트레이딩팀장",role:"주문 실행·결과 보고",color:"#ef4444",level:1},
   {name:"리스크관리실장",role:"리스크 게이트·DART 재심",color:"#8b5cf6",level:0},
   {name:"사후관리실장",role:"보유 종목 매도 판단",color:"#f43f5e",level:0},
+  {name:"펀드기획팀장",role:"진입 thesis 설정·매도 직전 상기",color:"#ec4899",level:1},
   {name:"운용지원실장",role:"진단·프로필 전략 조정",color:"#14b8a6",level:0},
 ];
 const al=document.getElementById('agentList');
@@ -1472,8 +1473,9 @@ function renderKpis(k){
     _setKpi('kWeek','kWeekP',k.week_pnl,k.week_pct);
     _setKpi('kMonth','kMonthP',k.month_pnl,k.month_pct);
     const md=document.getElementById('kMdd');if(md){md.textContent=(k.mdd_pct==null?'-':k.mdd_pct.toFixed(2)+'%');md.className='kv'+(k.mdd_pct<0?' neg':'');}
-    const cu=document.getElementById('kCur');if(cu)cu.textContent=(k.current==null?'-':Math.round(k.current).toLocaleString()+'원');
   }
+  // 사장 지시 2026-05-28: 자산곡선이 비어도(백업 도구 wipe 등) '현재 평가액' 은 항상 표시 — 서버가 broker 폴백 값을 박아준다.
+  const cu=document.getElementById('kCur');if(cu)cu.textContent=(k.current==null?'-':Math.round(k.current).toLocaleString()+'원');
   const win=document.getElementById('kWin'),winSub=document.getElementById('kWinSub'),hold=document.getElementById('kHold');
   if(k.has_trades){
     if(win){win.textContent=k.win_rate_pct.toFixed(0)+'%';win.className='kv'+(k.win_rate_pct>=50?' pos':' neg');}

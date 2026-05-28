@@ -4,7 +4,7 @@ Arquant v1.0 - KIS Broker (확장판)
   국내주식 시세/주문/잔고, 해외주식, 장내채권, 해외선물옵션, 국내선물옵션
   일봉/분봉 실시간 데이터 CSV 누적 수집
 """
-import asyncio, aiohttp, time, logging, os, csv, json
+import asyncio, aiohttp, time, logging, os, csv, json, math
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from enum import Enum
@@ -39,6 +39,44 @@ def _clean_kis_msg(msg: str) -> str:
     s = _re.sub(r"\s*문의\s*(?:바랍니다|하세요)?\.?\s*$", "", s)
     s = _re.sub(r"\s{2,}", " ", s).strip(" .·,")
     return s.strip()
+
+
+def kr_net_valuation(scts_eval: float, cash_d2: float, cash_d1: float,
+                     prev_settled: Optional[float] = None):
+    """현재 평가액(국내 구성) = 국내 유가증권평가액 + D+2 예수금. (해외 외화평가총액은 호출부에서 더한다)
+
+    사장 지시 2026-05-28: D+2(prvs_rcdl_excc_amt)가 정상 정산예수금이다. KIS가 결제 과도기에
+    D+2/D+1 을 0 으로 깜빡이면 직전 정상 D+2 를 유지한다 — D0(dnca_tot_amt)로 폴백하면 미결제
+    매수분이 아직 안 빠져 부풀려진 값이라 자산곡선이 스파이크 친다(hh09080 +4.9M 유령점프, 2026-05-28).
+    시그니처에 D0 를 받지 않아 구조적으로 폴백이 불가능하다.
+    반환: (kr_valuation, settled_cash) — settled_cash 는 carry-forward 적용된 D+2."""
+    if cash_d2 and cash_d2 > 0:
+        settled = float(cash_d2)
+    elif prev_settled and prev_settled > 0:
+        settled = float(prev_settled)
+    elif cash_d1 and cash_d1 > 0:
+        settled = float(cash_d1)
+    else:
+        settled = 0.0
+    return float(scts_eval or 0.0) + settled, settled
+
+
+def marketable_us_limit(side: str, limit_price: float, cur_price: float):
+    """US 명시 지정가가 호가 반대쪽이면 체결가능 가격으로 클램프. 사장 지시 2026-05-28.
+
+    매수 지정가 < 현재가(시세 아래 매수 = 미체결) → 현재가×1.003(센트 올림).
+    매도 지정가 > 현재가(시세 위 매도 = 미체결) → 현재가×0.997(센트 내림).
+    이미 체결가능(매수 limit≥현재가 / 매도 limit≤현재가)이면 지정가 그대로.
+    현재가 미확보(cur_price<=0)면 지정가 유지(주문 미차단 — 데이터 결손으로 주문 막지 않음).
+    반환: (price, clamped: bool)."""
+    lp = round(float(limit_price or 0.0), 2)
+    if not cur_price or cur_price <= 0:
+        return lp, False
+    if side == "buy" and lp < cur_price:
+        return math.ceil(cur_price * 1.003 * 100) / 100.0, True
+    if side == "sell" and lp > cur_price:
+        return math.floor(cur_price * 0.997 * 100) / 100.0, True
+    return lp, False
 
 
 def excd_to_excg(excd: Optional[str]) -> str:
@@ -103,31 +141,94 @@ class KISBroker:
         except Exception as e:
             logger.warning(f"토큰 캐시 저장 실패: {e}")
 
-    async def token(self) -> str:
+    # KIS가 토큰을 '서버측에서 조기 무효화'했을 때 응답에 나타나는 마커 (rt_cd≠0 + 아래 문구/코드).
+    # 로컬 expires_at 은 미래인데 KIS는 만료로 거부하는 글리치(잔고 0원의 근본원인)를 _authed_json 이 잡아 강제 재발급한다.
+    _TOKEN_EXPIRED_MARKERS = ("기간이 만료된 token", "expired token", "egw00123", "egw00121")
+    # KIS 초당 거래건수/호출 제한 거부 마커 — 거부(rt_cd≠0, 미체결 확정)라 재전송 안전. 사장 지시 2026-05-28.
+    _RATE_LIMIT_MARKERS = ("초당 거래건수", "거래건수를 초과", "egw00201", "초당 허용", "초당 호출")
+    _RATE_LIMIT_BACKOFF_SEC = 0.35
+    _RATE_LIMIT_MAX_RETRY = 3
+
+    def _resp_token_expired(self, d: Any) -> bool:
+        """KIS 응답이 '토큰 만료/무효' 거부인가. 정상(rt_cd==0)·다른 거부 사유는 False."""
+        if not isinstance(d, dict) or str(d.get("rt_cd", "")) == "0":
+            return False
+        blob = f"{d.get('msg_cd','')} {d.get('msg1','')}".lower()
+        return any(m in blob for m in self._TOKEN_EXPIRED_MARKERS)
+
+    def _resp_rate_limited(self, d: Any) -> bool:
+        """KIS 응답이 '초당 거래건수/호출 초과' 거부인가. 정상(rt_cd==0)·다른 거부는 False."""
+        if not isinstance(d, dict) or str(d.get("rt_cd", "")) == "0":
+            return False
+        blob = f"{d.get('msg_cd','')} {d.get('msg1','')}".lower()
+        return any(m in blob for m in self._RATE_LIMIT_MARKERS)
+
+    async def _authed_json(self, make_request):
+        """make_request: async (tok:str) -> dict(파싱된 KIS JSON). 토큰을 주입해 1회 호출하고,
+        KIS가 '만료 토큰'으로 거부하면 token(force=True) 강제 재발급 후 **딱 1회** 재시도한다.
+        추가로 '초당 거래건수 초과' rate-limit 거부면 간격을 두고 재전송한다(주문 드롭 금지 —
+        거부는 미체결 확정이라 재전송이 안전, 사장 지시 2026-05-28).
+        모든 잔고/주문 경로가 이 한 곳을 통해 죽은-토큰 고착·rate-limit 드롭을 자가치유한다."""
+        tok = await self.token()
+        d = await make_request(tok)
+        if self._resp_token_expired(d):
+            logger.warning("KIS '기간이 만료된 token' 응답 — 토큰 강제 재발급 후 1회 재시도")
+            try:
+                tok = await self.token(force=True)
+            except Exception as e:
+                logger.error(f"토큰 강제 재발급 실패: {e}")
+                return d
+            d = await make_request(tok)
+        attempts = 0
+        while self._resp_rate_limited(d) and attempts < self._RATE_LIMIT_MAX_RETRY:
+            attempts += 1
+            delay = self._RATE_LIMIT_BACKOFF_SEC * attempts
+            logger.warning(f"KIS rate-limit(초당 거래건수 초과) — {delay:.2f}s 후 재전송 {attempts}/{self._RATE_LIMIT_MAX_RETRY}")
+            if delay > 0:
+                await asyncio.sleep(delay)
+            d = await make_request(tok)
+        return d
+
+    async def _get_json(self, path: str, tr_id: str, params: Dict[str, Any]) -> Dict:
+        """단순 GET 조회 보일러플레이트(세션·토큰·헤더 구성)를 한 곳으로 모으고,
+        _authed_json 을 태워 **시세/조회 경로도 토큰 만료 자가치유**되게 한다
+        (과거엔 주문/잔고만 self-heal 됐고 시세는 await self.token() 직호출이라 비대칭).
+        path 는 base_url 뒤에 붙는 절대경로. 반환: 파싱된 KIS JSON 전체."""
+        async def _do(tok):
+            s = await self._s()
+            async with s.get(f"{self.base_url}{path}", headers=self._h(tok, tr_id), params=params) as r:
+                return await r.json()
+        return await self._authed_json(_do)
+
+    async def token(self, force: bool = False) -> str:
         now = time.time()
-        # 1) in-memory
-        if self._token and now < self._token_exp - self._TOKEN_SAFETY_SEC:
-            return self._token
-        # 2) disk cache (survives restarts / shared across clients using the same appkey)
-        cached = self._load_token_file()
-        if cached and now < float(cached.get("expires_at", 0)) - self._TOKEN_SAFETY_SEC:
-            self._token = cached["access_token"]; self._token_exp = float(cached["expires_at"])
-            return self._token
-        # 3) expired (or none) → issue a fresh one, once, and persist it
+        if not force:
+            # 1) in-memory
+            if self._token and now < self._token_exp - self._TOKEN_SAFETY_SEC:
+                return self._token
+            # 2) disk cache (survives restarts / shared across clients using the same appkey)
+            cached = self._load_token_file()
+            if cached and now < float(cached.get("expires_at", 0)) - self._TOKEN_SAFETY_SEC:
+                self._token = cached["access_token"]; self._token_exp = float(cached["expires_at"])
+                return self._token
+        # 3) expired (or none, or forced) → issue a fresh one, once, and persist it
         s = await self._s()
         async with s.post(f"{self.base_url}/oauth2/tokenP", json={
             "grant_type":"client_credentials","appkey":self.app_key,"appsecret":self.app_secret}) as r:
             d = await r.json()
         if "access_token" not in d:
-            # rate-limited (EGW00133) or transient error → fall back to a still-valid disk token if any
-            if cached and now < float(cached.get("expires_at", 0)) - 60:
-                logger.warning(f"토큰 재발급 실패({d}) — 캐시된 토큰 재사용")
-                self._token = cached["access_token"]; self._token_exp = float(cached["expires_at"])
-                return self._token
+            # rate-limited (EGW00133) or transient error → fall back to a still-valid disk token if any.
+            # 단, force(=KIS가 방금 그 토큰을 만료로 거부)면 같은 죽은 토큰을 재사용해선 안 된다.
+            if not force:
+                cached = self._load_token_file()
+                if cached and now < float(cached.get("expires_at", 0)) - 60:
+                    logger.warning(f"토큰 재발급 실패({d}) — 캐시된 토큰 재사용")
+                    self._token = cached["access_token"]; self._token_exp = float(cached["expires_at"])
+                    return self._token
             raise Exception(f"토큰 실패: {d}")
         self._token = d["access_token"]; self._token_exp = now + d.get("expires_in", 86400)
         self._save_token_file(self._token, self._token_exp)
-        logger.info(f"KIS 신규 토큰 발급 (만료 {datetime.fromtimestamp(self._token_exp, KST):%Y-%m-%d %H:%M})")
+        logger.info(f"KIS {'강제 ' if force else ''}신규 토큰 발급 (만료 {datetime.fromtimestamp(self._token_exp, KST):%Y-%m-%d %H:%M})")
         return self._token
 
     # 모의투자 tr_id: 대부분 실전 첫 글자 'T'→'V'. 단 해외주식 매도만 예외
@@ -154,11 +255,9 @@ class KISBroker:
 
     # ═══════════════════ 국내주식 시세 ═══════════════════
     async def kr_price(self, code: str) -> Dict:
-        tok = await self.token(); s = await self._s()
-        async with s.get(f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price",
-            headers=self._h(tok,"FHKST01010100"),
-            params={"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code}) as r:
-            return (await r.json()).get("output",{})
+        d = await self._get_json("/uapi/domestic-stock/v1/quotations/inquire-price", "FHKST01010100",
+            {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code})
+        return d.get("output", {})
 
     async def kr_price_str(self, code: str) -> str:
         d = await self.kr_price(code)
@@ -251,57 +350,141 @@ class KISBroker:
 
     # ═══════════════════ 국내주식 주문 ═══════════════════
     async def kr_buy(self, code: str, qty: int, price: int = 0) -> str:
-        tok = await self.token(); s = await self._s(); c, p = self._acnt()
+        s = await self._s(); c, p = self._acnt()
         # 사장 지시 2026-05-19: 지정가(price>0)면 ORD_DVSN="00"(지정가), 없으면 "01"(시장가).
         # 기존 '"01" if price else "01"'은 지정가 주문도 시장가로 체결시키던 버그.
         body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":"00" if price else "01",
                 "ORD_QTY":str(qty),"ORD_UNPR":str(price) if price else "0","CTAC_TLNO":""}
-        async with s.post(f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash",
-            headers=self._h(tok,"TTTC0802U"), json=body) as r:
-            d = await r.json()
+        async def _do(tk):
+            async with s.post(f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash",
+                headers=self._h(tk,"TTTC0802U"), json=body) as r:
+                return await r.json()
+        d = await self._authed_json(_do)
         return f"[국내매수] {code} {qty}주 → {_clean_kis_msg(d.get('msg1',''))}" if d.get("rt_cd")=="0" else f"[실패] {_clean_kis_msg(d.get('msg1',''))}"
 
+    async def kr_pending_orders(self, code: Optional[str] = None) -> List[Dict]:
+        """정정·취소가능 주문 조회(TTTC0084R). code 주면 해당 종목으로 필터.
+        반환 각 행: {odno, ord_gno_brno, pdno, ord_qty, ord_unpr, ord_dvsn_cd, sll_buy_dvsn_cd, ord_tmd, ...}.
+        sll_buy_dvsn_cd: '01'=매도, '02'=매수.
+        """
+        s = await self._s(); c, p = self._acnt()
+        async def _do(tk):
+            out: List[Dict] = []
+            fk = ""; nk = ""
+            for _ in range(5):
+                async with s.get(f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl",
+                    headers=self._h(tk, "TTTC0084R"),
+                    params={"CANO":c,"ACNT_PRDT_CD":p,
+                            "CTX_AREA_FK100":fk,"CTX_AREA_NK100":nk,
+                            "INQR_DVSN_1":"0","INQR_DVSN_2":"0"}) as r:
+                    d = await r.json()
+                if d.get("rt_cd") != "0":
+                    return {"ok": False, "rows": []}
+                out.extend(d.get("output") or [])
+                fk = (d.get("ctx_area_fk100") or "").strip()
+                nk = (d.get("ctx_area_nk100") or "").strip()
+                if not nk:
+                    break
+            return {"ok": True, "rows": out}
+        try:
+            d = await self._authed_json(_do)
+        except Exception as e:
+            logger.warning(f"[펜딩조회] 실패: {e}")
+            return []
+        if not d.get("ok"):
+            return []
+        rows = d.get("rows") or []
+        if code:
+            t = (code or "").lstrip("0")
+            rows = [r for r in rows if ((r.get("pdno") or "").lstrip("0") == t)]
+        return rows
+
+    async def kr_cancel(self, order: Dict) -> str:
+        """KR 펜딩 주문 취소(TTTC0803U). order = kr_pending_orders() 의 한 행."""
+        s = await self._s(); c, p = self._acnt()
+        body = {
+            "CANO": c, "ACNT_PRDT_CD": p,
+            "KRX_FWDG_ORD_ORGNO": (order.get("ord_gno_brno") or "").strip(),
+            "ORGN_ODNO": (order.get("odno") or "").strip(),
+            "ORD_DVSN": (order.get("ord_dvsn_cd") or order.get("ord_dvsn") or "00").strip(),
+            "RVSE_CNCL_DVSN_CD": "02",            # 02=취소
+            "ORD_QTY": "0",
+            "ORD_UNPR": "0",
+            "QTY_ALL_ORD_YN": "Y",                # 전량 취소
+        }
+        async def _do(tk):
+            async with s.post(f"{self.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl",
+                headers=self._h(tk, "TTTC0803U"), json=body) as r:
+                return await r.json()
+        d = await self._authed_json(_do)
+        pdno = order.get("pdno", ""); odno = order.get("odno", "")
+        return (f"[국내취소] {pdno} {odno} → {_clean_kis_msg(d.get('msg1',''))}"
+                if d.get("rt_cd") == "0"
+                else f"[취소실패] {pdno} {odno} → {_clean_kis_msg(d.get('msg1',''))}")
+
     async def kr_sell(self, code: str, qty: int, price: int = 0) -> str:
-        tok = await self.token(); s = await self._s(); c, p = self._acnt()
+        # 사장 지시 2026-05-28: 새 매도 판단이 들어오면 같은 종목의 살아있는 펜딩 매도는 폐기하고 신규로 대체.
+        # 배경: KIS는 펜딩 주문이 ord_psbl_qty(매도가능수량)를 깎아, 보유 1주에 28,000원 펜딩 매도가 있으면
+        # 후속 매도 시도가 모두 "주문 가능한 수량을 초과했습니다"로 거부된다(003490 사례 5/28 14:09·15:20).
+        # 펜딩 취소가 실패해도 신규 매도는 어떻게든 전송(다중 폴백 — 사장 룰).
+        try:
+            pending = await self.kr_pending_orders(code)
+            for r in pending:
+                if (r.get("sll_buy_dvsn_cd") or "").strip() == "01":
+                    cres = await self.kr_cancel(r)
+                    logger.info(f"[국내매도] 사전 펜딩 취소: {cres}")
+        except Exception as e:
+            logger.warning(f"[국내매도] 펜딩 취소 시도 실패(무시하고 신규 전송): {e}")
+        s = await self._s(); c, p = self._acnt()
         # 사장 지시 2026-05-19: 지정가(price>0)면 ORD_DVSN="00"(지정가), 없으면 "01"(시장가).
         # 기존 '"01" if price else "01"'은 지정가 매도도 시장가로 체결시키던 버그.
         body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":"00" if price else "01",
                 "ORD_QTY":str(qty),"ORD_UNPR":str(price) if price else "0","CTAC_TLNO":""}
-        async with s.post(f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash",
-            headers=self._h(tok,"TTTC0801U"), json=body) as r:
-            d = await r.json()
+        async def _do(tk):
+            async with s.post(f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash",
+                headers=self._h(tk,"TTTC0801U"), json=body) as r:
+                return await r.json()
+        d = await self._authed_json(_do)
         return f"[국내매도] {code} {qty}주 → {_clean_kis_msg(d.get('msg1',''))}" if d.get("rt_cd")=="0" else f"[실패] {_clean_kis_msg(d.get('msg1',''))}"
 
     # ── one canonical balance read (paginated) → cached 8s; everything else derives from it ──
     _SNAP_TTL = 8.0
+    # 보유=0인데 (총평가 − 예수금)이 이 값(원)보다 크면 KIS 빈-보유 글리치로 보고 직전 보유를 유지.
+    _HOLDINGS_GLITCH_MIN_GAP = 5000.0
     async def _raw_balance(self) -> Dict:
-        """Single inquire-balance call with tr_cont pagination. Returns {output1:[...],output2:{...},ok,rt_cd,msg1}."""
-        tok = await self.token(); s = await self._s(); c, p = self._acnt()
-        out1: List[Dict] = []; out2: Dict = {}; rt = ""; msg = ""
-        fk = ""; nk = ""; tr_cont = ""
-        for _ in range(5):
-            headers = self._h(tok, "TTTC8434R")
-            if tr_cont in ("F", "M"):
-                headers["tr_cont"] = "N"
-            async with s.get(f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance",
-                headers=headers,
-                params={"CANO":c,"ACNT_PRDT_CD":p,"AFHR_FLPR_YN":"N","OFL_YN":"","INQR_DVSN":"02",
-                        "UNPR_DVSN":"01","FUND_STTL_ICLD_YN":"N","FNCG_AMT_AUTO_RDPT_YN":"N",
-                        "PRCS_DVSN":"01","CTX_AREA_FK100":fk,"CTX_AREA_NK100":nk}) as r:
-                tr_cont = r.headers.get("tr_cont","")
-                d = await r.json()
-            rt = d.get("rt_cd",""); msg = d.get("msg1","")
-            if rt != "0":
-                break
-            out1.extend(d.get("output1") or [])
-            o2list = d.get("output2") or []
-            if o2list: out2 = o2list[0]
-            fk = (d.get("ctx_area_fk100") or "").strip(); nk = (d.get("ctx_area_nk100") or "").strip()
-            if tr_cont not in ("F", "M") or not nk:
-                break
-        ok = (rt == "0")
-        logger.info(f"[잔고] rt_cd={rt} msg='{msg}' output1_rows={len(out1)} tot_evlu={out2.get('tot_evlu_amt','?')} dnca={out2.get('dnca_tot_amt','?')}")
-        return {"output1": out1, "output2": out2, "ok": ok, "rt_cd": rt, "msg1": msg}
+        """Single inquire-balance call with tr_cont pagination. Returns {output1:[...],output2:{...},ok,rt_cd,msg1}.
+        토큰 만료 거부 시 _authed_json 이 강제 재발급+1회 재시도(잔고 0원 글리치 자가치유)."""
+        c, p = self._acnt()
+        async def _do(tok):
+            s = await self._s()
+            out1: List[Dict] = []; out2: Dict = {}; rt = ""; msg = ""
+            fk = ""; nk = ""; tr_cont = ""
+            for _ in range(5):
+                headers = self._h(tok, "TTTC8434R")
+                if tr_cont in ("F", "M"):
+                    headers["tr_cont"] = "N"
+                async with s.get(f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance",
+                    headers=headers,
+                    params={"CANO":c,"ACNT_PRDT_CD":p,"AFHR_FLPR_YN":"N","OFL_YN":"","INQR_DVSN":"02",
+                            "UNPR_DVSN":"01","FUND_STTL_ICLD_YN":"N","FNCG_AMT_AUTO_RDPT_YN":"N",
+                            "PRCS_DVSN":"01","CTX_AREA_FK100":fk,"CTX_AREA_NK100":nk}) as r:
+                    tr_cont = r.headers.get("tr_cont","")
+                    d = await r.json()
+                rt = d.get("rt_cd",""); msg = d.get("msg1","")
+                if rt != "0":
+                    break
+                out1.extend(d.get("output1") or [])
+                o2list = d.get("output2") or []
+                if o2list: out2 = o2list[0]
+                fk = (d.get("ctx_area_fk100") or "").strip(); nk = (d.get("ctx_area_nk100") or "").strip()
+                if tr_cont not in ("F", "M") or not nk:
+                    break
+            return {"output1": out1, "output2": out2, "ok": (rt == "0"), "rt_cd": rt, "msg1": msg}
+        d = await self._authed_json(_do)
+        o2 = d.get("output2") or {}
+        logger.info(f"[잔고] rt_cd={d.get('rt_cd')} msg='{d.get('msg1')}' output1_rows={len(d.get('output1') or [])} "
+                    f"tot_evlu={o2.get('tot_evlu_amt','?')} dnca={o2.get('dnca_tot_amt','?')}")
+        return d
 
     async def kr_account_snapshot(self, force: bool = False) -> Dict:
         """{"buying_power":{cash,total_eval,pnl_ratio,ok}, "holdings":[{code,name,qty,avg_price,cur_price,pnl_amt,pnl_pct}], "ok":bool, "ts":float}.
@@ -310,32 +493,27 @@ class KISBroker:
         cached = getattr(self, "_acct_snap", None)
         if cached and not force and (now - cached.get("ts", 0)) < self._SNAP_TTL:
             return cached
-        def _f(x):
-            try: return float(str(x).replace(",",""))
-            except (TypeError, ValueError): return 0.0
-        def _i(x):
-            try: return int(float(str(x).replace(",","")))
-            except (TypeError, ValueError): return 0
+        _f, _i = self._num, self._int   # 숫자 파서는 _num/_int(staticmethod)로 일원화
         try:
             d = await self._raw_balance()
         except Exception as e:
             logger.warning(f"[잔고스냅샷] 실패: {e}")
             d = {"output1": [], "output2": {}, "ok": False}
         o2 = d.get("output2") or {}
-        # ── Cash: KIS의 dnca_tot_amt(D0 예수금)는 당일 매도대금(D+2 미수령)을 포함하지 않아,
-        #    매도→매수 직후엔 실제 '주문가능금액'보다 한참 작게 잡힌다. 그래서 D+2/D+1 정산예수금
-        #    (prvs_rcdl_excc_amt / nxdy_excc_amt — 매도대금 반영분)을 우선 사용하고, 없을 때만 D0 예수금. ──
-        cash_d2 = _f(o2.get("prvs_rcdl_excc_amt")); cash_d1 = _f(o2.get("nxdy_excc_amt")); cash_d0 = _f(o2.get("dnca_tot_amt"))
-        cash = cash_d2 or cash_d1 or cash_d0
-        scts = _f(o2.get("scts_evlu_amt"))   # 유가증권평가금액
-        # 총평가(순자산): nass_amt(순자산금액) → tot_evlu_amt 순으로 신뢰. 단, KIS가 D+2 매도대금을
-        # 아직 합산하지 않은 과도기 값이면(유가증권+현금보다 작으면) 직접 재구성해 평가금액 추이가 튀지 않게 한다.
-        total = _f(o2.get("nass_amt")) or _f(o2.get("tot_evlu_amt")) or 0.0
-        recon = scts + cash
-        if recon > 0 and total < recon * 0.97:
-            total = recon
-        if total <= 0:
-            total = cash
+        # ── Cash: D+2 정산예수금(prvs_rcdl_excc_amt, 매도대금 반영분)이 실제 가용·평가 기준이다.
+        #    D0(dnca_tot_amt)는 미결제 매수분이 안 빠져 부풀려져 자산곡선을 튀게 하므로 평가·사이징에
+        #    절대 쓰지 않는다(사장 지시 2026-05-28). D+2 가 0 으로 깜빡이면 직전 정상 D+2 를 유지. ──
+        cash_d2 = _f(o2.get("prvs_rcdl_excc_amt")); cash_d1 = _f(o2.get("nxdy_excc_amt"))
+        scts = _f(o2.get("scts_evlu_amt"))   # 국내 유가증권평가금액
+        # 현재 평가액(자산곡선) = 국내 유가증권평가액 + D+2 예수금. 해외(외화평가총액)는 portfolio_holdings 가 더한다.
+        # 사장 지시 2026-05-28: D+2(prvs_rcdl_excc_amt)가 정상 정산예수금이다. KIS가 결제 과도기에 D+2/D+1 을
+        # 0 으로 깜빡이면 직전 정상 D+2 를 유지(disk 영속) — D0(dnca_tot_amt)로 폴백하면 미결제 매수분이 아직
+        # 안 빠져 부풀려진 값이라 자산곡선이 스파이크 친다(hh09080 +4.9M 유령점프, 사장 보고 2026-05-28).
+        _prev_settled = self._get_settled_cash_cache()
+        total, settled = kr_net_valuation(scts, cash_d2, cash_d1, _prev_settled)
+        cash = settled                       # 예수금=D+2(정산). 주문 사이징도 D0 부풀림 없이 실제 가용분만 쓴다.
+        if cash_d2 > 0:
+            self._set_settled_cash_cache(cash_d2)
         pnl = _f(o2.get("evlu_pfls_smtl_amt"))
         pnl_ratio = (pnl / total) if total > 0 else 0.0
         holdings = []
@@ -350,7 +528,7 @@ class KISBroker:
                 "holdings": holdings, "ok": bool(d.get("ok")), "ts": now}
         # Keep last-good holdings if this read succeeded structurally but came back empty while
         # total_eval clearly implies positions exist (transient KIS quirk) — avoids UI flicker.
-        if cached and not holdings and total > cash + 5000 and cached.get("holdings"):
+        if cached and not holdings and total > cash + self._HOLDINGS_GLITCH_MIN_GAP and cached.get("holdings"):
             snap["holdings"] = cached["holdings"]
             snap["holdings_stale"] = True
             # 사장 지시 2026-05-21: KIS가 보유목록을 빈 채 주면서 nass_amt(총평가)를 부풀려
@@ -360,21 +538,11 @@ class KISBroker:
             if prev_total > 0:
                 snap["buying_power"]["total_eval"] = prev_total
                 snap["buying_power"]["total_stale"] = True
-        # Transient cash=0 protection (관측된 버그 2026-05-14 09:58): KIS가 잔고는 정상이지만
-        # 예수금 필드 3개(D0/D1/D2) 모두 0으로 반환하는 케이스가 있다. 이 경우 신규 매수가
-        # 통째로 막힘. 캐시된 직전 cash가 있으면 그것을 유지하고 stale 플래그를 단다.
+        # 결제예수금 글리치 방어 (cash 가 0 으로 resolve = D+2/D+1 모두 0 + last-good 캐시도 없음):
+        # 평소엔 kr_net_valuation 의 D+2 carry-forward(disk 영속)가 막지만, 콜드스타트/깊은 글리치로
+        # settled 가 0 이 되면 cash·total 이 함께 무너진다(2026-05-14 cash=0 버그, 2026-05-22 결제 과도기).
+        # 이 때만 직전 정상 스냅샷(cash·total)을 유지해 자산곡선 스파이크를 막는다. D0 로는 절대 폴백하지 않는다.
         if cached and snap["ok"] and cash <= 0:
-            prev_cash = float((cached.get("buying_power") or {}).get("cash") or 0.0)
-            if prev_cash > 0:
-                snap["buying_power"]["cash"] = prev_cash
-                snap["buying_power"]["cash_stale"] = True
-                logger.warning(f"[잔고스냅샷] KIS가 cash=0 반환 — 캐시된 예수금 {prev_cash:,.0f}원 유지 (stale)")
-        # 결제예수금(D+1/D+2) 0 글리치 (사장 보고 2026-05-22): KIS는 거래 직후 결제 과도기에
-        # prvs_rcdl_excc_amt(D+2)·nxdy_excc_amt(D+1)를 0으로 깜빡인다. 그러면 cash 가 dnca_tot_amt
-        # (D0, 미결제 매수분이 아직 안 빠진 예수금)로 튀고 nass_amt 도 D0 기준이라, 통합 총평가에서
-        # 그 매수금액이 해외평가와 이중계상돼 자산곡선이 스파이크 친다(US 매수 직후 폴 등).
-        # settled(D1/D2)=0 & D0>0 은 글리치로 보고 직전 정상값(settled 기반 cash/total)을 유지한다.
-        elif cached and snap["ok"] and cash_d2 <= 0 and cash_d1 <= 0 and cash_d0 > 0:
             _prev_bp = cached.get("buying_power") or {}
             prev_cash = float(_prev_bp.get("cash") or 0.0)
             prev_total = float(_prev_bp.get("total_eval") or 0.0)
@@ -384,7 +552,7 @@ class KISBroker:
             if prev_total > 0:
                 snap["buying_power"]["total_eval"] = prev_total
                 snap["buying_power"]["total_stale"] = True
-            logger.warning(f"[잔고스냅샷] 결제예수금(D1/D2)=0 글리치 — 직전 정상값 유지 "
+            logger.warning(f"[잔고스냅샷] 결제예수금=0 글리치 — 직전 정상값 유지 "
                            f"(cash={prev_cash:,.0f}, total={prev_total:,.0f})")
         self._acct_snap = snap
         return snap
@@ -410,7 +578,7 @@ class KISBroker:
         Returns 0.0 only when both sources fail."""
         try:
             d = await self.kr_price(code)
-            px = float(str(d.get("stck_prpr","0")).replace(",",""))
+            px = self._num(d.get("stck_prpr"))
             if px > 0:
                 return px
         except Exception as e:
@@ -444,14 +612,16 @@ class KISBroker:
         해야 한다 — 이전엔 qty를 합산해 2주가 4주로 부풀던 버그. 실보유는 present-balance로 검증함."""
         seen: Dict[str, Dict] = {}
         try:
-            tok = await self.token(); s = await self._s(); c, p = self._acnt()
+            s = await self._s(); c, p = self._acnt()
             for excd in ("NASD", "NYSE", "AMEX"):
                 try:
-                    async with s.get(f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance",
-                        headers=self._h(tok,"TTTS3012R"),
-                        params={"CANO":c,"ACNT_PRDT_CD":p,"OVRS_EXCG_CD":excd,"TR_CRCY_CD":"USD",
-                                "CTX_AREA_FK200":"","CTX_AREA_NK200":""}) as r:
-                        d = await r.json()
+                    async def _do(tk, _excd=excd):
+                        async with s.get(f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance",
+                            headers=self._h(tk,"TTTS3012R"),
+                            params={"CANO":c,"ACNT_PRDT_CD":p,"OVRS_EXCG_CD":_excd,"TR_CRCY_CD":"USD",
+                                    "CTX_AREA_FK200":"","CTX_AREA_NK200":""}) as r:
+                            return await r.json()
+                    d = await self._authed_json(_do)
                     for h in (d.get("output1") or []):
                         q = self._int(h.get("ovrs_cblc_qty"))
                         if q <= 0:
@@ -509,16 +679,24 @@ class KISBroker:
         포함하지 않으므로, 통합 총평가 보정에 쓸 해외 원화평가합계를 별도 조회한다.
         실패/모의투자 미지원 시 {ok:False}. (실전 전용 — 모의 base_url 이면 시도하되 실패 허용.)"""
         try:
-            tok = await self.token(); s = await self._s(); c, p = self._acnt()
-            async with s.get(f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-present-balance",
-                headers=self._h(tok, "CTRP6504R"),
-                params={"CANO":c,"ACNT_PRDT_CD":p,"WCRC_FRCR_DVSN_CD":"02","NATN_CD":"840",
-                        "TR_MKET_CD":"00","INQR_DVSN_CD":"00"}) as r:
-                d = await r.json()
+            s = await self._s(); c, p = self._acnt()
+            async def _do(tk):
+                async with s.get(f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-present-balance",
+                    headers=self._h(tk, "CTRP6504R"),
+                    params={"CANO":c,"ACNT_PRDT_CD":p,"WCRC_FRCR_DVSN_CD":"02","NATN_CD":"840",
+                            "TR_MKET_CD":"00","INQR_DVSN_CD":"00"}) as r:
+                    return await r.json()
+            d = await self._authed_json(_do)
             if d.get("rt_cd") != "0":
                 return {"ok": False, "krw_value": 0.0, "exrt": 0.0}
             o3 = d.get("output3") or {}
-            krw_value = self._num(o3.get("evlu_amt_smtl_amt"))   # 해외 평가금액합계(원화환산)
+            # 사장 지시 2026-05-28: 외화평가총액 = frcr_evlu_tota (USD 예수금 포함, 원화환산).
+            # 이전엔 evlu_amt_smtl_amt(해외 '주식만' 평가합계)를 더해 USD 예수금 484불(~727K)이 빠져
+            # 우리 화면이 KIS 앱 총자산보다 ~737K 낮게 표시됐다(사장 보고 2026-05-28).
+            krw_value = self._num(o3.get("frcr_evlu_tota"))
+            if krw_value <= 0:
+                # 스키마 변동·모의계좌·USD 미보유 → 이전 필드로 폴백
+                krw_value = self._num(o3.get("evlu_amt_smtl_amt"))
             o2 = d.get("output2") or []
             exrt = self._num(o2[0].get("frst_bltn_exrt")) if o2 else 0.0
             return {"ok": True, "krw_value": krw_value, "exrt": exrt}
@@ -557,6 +735,33 @@ class KISBroker:
         try:
             self._overseas_cache_path().write_text(
                 json.dumps({"krw": float(krw), "ts": float(ts)}, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    # 사장 지시 2026-05-28: D+2 예수금 last-good 영속 — KIS가 결제 과도기에 D+2/D+1 을 0 으로 깜빡일 때
+    # D0(부풀려진 값)로 폴백하지 않고 직전 정상 D+2 를 유지하기 위함(재시작 콜드스타트 포함). per-uid.
+    def _settled_cash_path(self) -> Path:
+        return self._token_path.parent / "settled_cash_cache.json"
+
+    def _get_settled_cash_cache(self) -> float:
+        c = getattr(self, "_settled_cash", None)
+        if c is not None:
+            return c
+        try:
+            p = self._settled_cash_path()
+            if p.exists():
+                self._settled_cash = float(json.loads(p.read_text(encoding="utf-8")).get("d2") or 0.0)
+                return self._settled_cash
+        except Exception:
+            pass
+        self._settled_cash = 0.0
+        return self._settled_cash
+
+    def _set_settled_cash_cache(self, d2: float) -> None:
+        self._settled_cash = float(d2)
+        try:
+            self._settled_cash_path().write_text(
+                json.dumps({"d2": float(d2)}, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
 
@@ -636,15 +841,13 @@ class KISBroker:
 
     # ═══════════════════ 국내주식 순위/업종 ═══════════════════
     async def kr_volume_rank(self) -> str:
-        tok = await self.token(); s = await self._s()
-        async with s.get(f"{self.base_url}/uapi/domestic-stock/v1/quotations/volume-rank",
-            headers=self._h(tok,"FHPST01710000"),
-            params={"FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20171",
-                    "FID_INPUT_ISCD":"0000","FID_DIV_CLS_CODE":"0","FID_BLNG_CLS_CODE":"0",
-                    "FID_TRGT_CLS_CODE":"111111111","FID_TRGT_EXLS_CLS_CODE":"000000",
-                    "FID_INPUT_PRICE_1":"","FID_INPUT_PRICE_2":"","FID_VOL_CNT":"",
-                    "FID_INPUT_DATE_1":""}) as r:
-            data = (await r.json()).get("output",[])
+        d = await self._get_json("/uapi/domestic-stock/v1/quotations/volume-rank", "FHPST01710000",
+            {"FID_COND_MRKT_DIV_CODE":"J","FID_COND_SCR_DIV_CODE":"20171",
+             "FID_INPUT_ISCD":"0000","FID_DIV_CLS_CODE":"0","FID_BLNG_CLS_CODE":"0",
+             "FID_TRGT_CLS_CODE":"111111111","FID_TRGT_EXLS_CLS_CODE":"000000",
+             "FID_INPUT_PRICE_1":"","FID_INPUT_PRICE_2":"","FID_VOL_CNT":"",
+             "FID_INPUT_DATE_1":""})
+        data = d.get("output", [])
         self._last_volrank = data  # cache raw for kr_volume_rank_list()
         lines = ["[거래량 순위 TOP 10]\n"]
         for i, d in enumerate(data[:10], 1):
@@ -661,8 +864,7 @@ class KISBroker:
                 data = getattr(self, "_last_volrank", []) or []
             out = []
             for d in data:
-                try: px = float(str(d.get("stck_prpr","0")).replace(",",""))
-                except (TypeError, ValueError): px = 0.0
+                px = self._num(d.get("stck_prpr"))
                 code = (d.get("mksc_shrn_iscd") or "").strip()
                 if code and px > 0:
                     out.append({"code": code, "name": (d.get("hts_kor_isnm") or "").strip(), "price": px})
@@ -671,30 +873,26 @@ class KISBroker:
             return []
 
     async def kr_sector(self, sector_code: str = "0001") -> str:
-        tok = await self.token(); s = await self._s()
-        async with s.get(f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice",
-            headers=self._h(tok,"FHKUP03500100"),
-            params={"FID_COND_MRKT_DIV_CODE":"U","FID_INPUT_ISCD":sector_code,
-                    "FID_INPUT_DATE_1":(datetime.now()-timedelta(days=30)).strftime("%Y%m%d"),
-                    "FID_INPUT_DATE_2":datetime.now().strftime("%Y%m%d"),
-                    "FID_PERIOD_DIV_CODE":"D"}) as r:
-            data = (await r.json()).get("output2",[])
+        d = await self._get_json("/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice", "FHKUP03500100",
+            {"FID_COND_MRKT_DIV_CODE":"U","FID_INPUT_ISCD":sector_code,
+             "FID_INPUT_DATE_1":(datetime.now()-timedelta(days=30)).strftime("%Y%m%d"),
+             "FID_INPUT_DATE_2":datetime.now().strftime("%Y%m%d"),
+             "FID_PERIOD_DIV_CODE":"D"})
+        data = d.get("output2", [])
         return f"[업종지수 {sector_code}] {len(data)}일 데이터 조회 완료"
 
     async def kr_index_daily(self, index_code: str = "0001", days: int = 40) -> List[Dict]:
         """지수 일별 종가 (KOSPI=0001, KOSDAQ=1001). 벤치마크 오버레이용.
         반환: [{"date":"YYYY-MM-DD","close":float}, ...] 오름차순. 실패 시 []."""
-        tok = await self.token(); s = await self._s()
         end = datetime.now(KST).strftime("%Y%m%d")
         start = (datetime.now(KST) - timedelta(days=days * 2)).strftime("%Y%m%d")
         out: List[Dict] = []
         try:
-            async with s.get(f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice",
-                headers=self._h(tok, "FHKUP03500100"),
-                params={"FID_COND_MRKT_DIV_CODE":"U","FID_INPUT_ISCD":index_code,
-                        "FID_INPUT_DATE_1":start,"FID_INPUT_DATE_2":end,
-                        "FID_PERIOD_DIV_CODE":"D"}) as r:
-                data = (await r.json()).get("output2", []) or []
+            resp = await self._get_json("/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice", "FHKUP03500100",
+                {"FID_COND_MRKT_DIV_CODE":"U","FID_INPUT_ISCD":index_code,
+                 "FID_INPUT_DATE_1":start,"FID_INPUT_DATE_2":end,
+                 "FID_PERIOD_DIV_CODE":"D"})
+            data = resp.get("output2", []) or []
             for x in data:
                 d = (x.get("stck_bsop_date") or "").strip()
                 c = x.get("bstp_nmix_prpr") or x.get("stck_clpr") or ""
@@ -865,7 +1063,6 @@ class KISBroker:
         현재가 미확보면 0 전송 대신 실패 문자열 반환(원칙 #14: 데이터 결손을
         주문가능 조건으로 오인 금지). 거래소는 시세 프로브가 캐싱한 값을 매핑.
         반환: dict(주문 바디) 또는 str(실패 — 미전송)."""
-        import math
         tk = (ticker or "").strip().upper()
         explicit = False
         try:
@@ -892,8 +1089,12 @@ class KISBroker:
                 # 없음(상장폐지/미지원 추정). 0 전송은 원래 버그 재현이라 금지.
                 return (f"[US{'매수' if side == 'buy' else '매도'} 실패] {tk} "
                         f"현재가·일봉 모두 미확보 — 단가 산출 불가, 주문 미전송")
-        if explicit:           # 명시 지정가: 센트 정밀도만 정규화
-            unpr = round(lp, 2)
+        if explicit:           # 명시 지정가: 호가 반대쪽이면 체결가능 가격으로 클램프(사장 지시 2026-05-28)
+            cur = await self.us_last_price(tk)
+            unpr, _clamped = marketable_us_limit(side, lp, cur)
+            if _clamped:
+                logger.warning(f"[US주문] {tk} {side} 명시 지정가 ${lp:.2f}가 호가 반대쪽 "
+                               f"(현재 ${cur:.2f}) → 체결가능 ${unpr:.2f}로 클램프")
         elif side == "buy":    # 매수: 현재가보다 살짝 위(체결 보장), 센트 올림
             unpr = math.ceil(lp * 1.003 * 100) / 100.0
         else:                   # 매도: 현재가보다 살짝 아래, 센트 내림
@@ -908,10 +1109,12 @@ class KISBroker:
         body = await self._overseas_order_body(ticker, qty, price, side="buy", excd=excd)
         if isinstance(body, str):
             return body
-        tok = await self.token(); s = await self._s()
-        async with s.post(f"{self.base_url}/uapi/overseas-stock/v1/trading/order",
-            headers=self._h(tok,"TTTT1002U"), json=body) as r:
-            d = await r.json()
+        s = await self._s()
+        async def _do(tk):
+            async with s.post(f"{self.base_url}/uapi/overseas-stock/v1/trading/order",
+                headers=self._h(tk,"TTTT1002U"), json=body) as r:
+                return await r.json()
+        d = await self._authed_json(_do)
         msg = _clean_kis_msg(d.get('msg1', ''))
         # KR(kr_buy)과 대칭: rt_cd≠0(거부)면 [실패] 프리픽스 — 호출부 accepted 휴리스틱이
         # "주문가능금액을 초과" 같은 거부를 잡아 잠정 체결로 오판하지 않게 한다.
@@ -923,36 +1126,36 @@ class KISBroker:
         body = await self._overseas_order_body(ticker, qty, price, side="sell", excd=excd)
         if isinstance(body, str):
             return body
-        tok = await self.token(); s = await self._s()
-        async with s.post(f"{self.base_url}/uapi/overseas-stock/v1/trading/order",
-            headers=self._h(tok,"TTTT1006U"), json=body) as r:
-            d = await r.json()
+        s = await self._s()
+        async def _do(tk):
+            async with s.post(f"{self.base_url}/uapi/overseas-stock/v1/trading/order",
+                headers=self._h(tk,"TTTT1006U"), json=body) as r:
+                return await r.json()
+        d = await self._authed_json(_do)
         msg = _clean_kis_msg(d.get('msg1', ''))
         return (f"[US매도] {ticker} {qty}주 @ ${body['OVRS_ORD_UNPR']} → {msg}"
                 if d.get("rt_cd") == "0" else
                 f"[US매도 실패] {ticker} {qty}주 → {msg}")
 
     async def us_balance(self) -> str:
-        tok = await self.token(); s = await self._s(); c, p = self._acnt()
-        async with s.get(f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance",
-            headers=self._h(tok,"TTTS3012R"),
-            params={"CANO":c,"ACNT_PRDT_CD":p,"OVRS_EXCG_CD":"NASD","TR_CRCY_CD":"USD",
-                    "CTX_AREA_FK200":"","CTX_AREA_NK200":""}) as r:
-            d = await r.json()
-        out1 = d.get("output1",[]); out2 = d.get("output2",{})
-        lines = [f"[해외 계좌잔고] 총평가: ${out2.get('tot_evlu_pfls_amt','?')}\n"]
-        for h in out1:
-            lines.append(f"  📊 {h.get('ovrs_item_name','')} ({h.get('ovrs_pdno','')}): {h.get('ovrs_cblc_qty','')}주 | "
-                         f"${h.get('now_pric2','')} | 손익: ${h.get('evlu_pfls_amt','')}")
+        # NASD/NYSE/AMEX 전 거래소를 순회·중복제거하는 _overseas_holdings 를 재사용한다.
+        # (과거 버그: 여기서 OVRS_EXCG_CD=NASD 하드코딩이라 NYSE/AMEX 종목이 통째로 누락됐다.)
+        holdings = await self._overseas_holdings()
+        if not holdings:
+            return "[해외 계좌잔고] 보유 종목 없음"
+        total_eval = sum(self._num(h.get("qty")) * self._num(h.get("cur_price")) for h in holdings)
+        total_pnl = sum(self._num(h.get("pnl_amt")) for h in holdings)
+        lines = [f"[해외 계좌잔고] 총평가: ${total_eval:,.2f} | 평가손익: ${total_pnl:,.2f}\n"]
+        for h in holdings:
+            lines.append(f"  📊 {h['name']} ({h['code']}): {h['qty']}주 | "
+                         f"${self._num(h.get('cur_price')):,.2f} | 손익: ${self._num(h.get('pnl_amt')):,.2f}")
         return "\n".join(lines)
 
     # ═══════════════════ 장내채권 ═══════════════════
     async def bond_price(self, code: str) -> str:
-        tok = await self.token(); s = await self._s()
-        async with s.get(f"{self.base_url}/uapi/domestic-bond/v1/quotations/inquire-price",
-            headers=self._h(tok,"FHKBJ773401C0"),
-            params={"FID_COND_MRKT_DIV_CODE":"B","FID_INPUT_ISCD":code}) as r:
-            d = (await r.json()).get("output",{})
+        resp = await self._get_json("/uapi/domestic-bond/v1/quotations/inquire-price", "FHKBJ773401C0",
+            {"FID_COND_MRKT_DIV_CODE":"B","FID_INPUT_ISCD":code})
+        d = resp.get("output", {})
         return f"[채권시세] {code} | {d.get('bond_prpr','')} | 수익률: {d.get('bond_ytm','')}"
 
     async def bond_buy(self, code: str, qty: int, price: float) -> str:
@@ -966,11 +1169,9 @@ class KISBroker:
 
     # ═══════════════════ 해외선물옵션 ═══════════════════
     async def futures_price(self, code: str, excd: str = "CME") -> str:
-        tok = await self.token(); s = await self._s()
-        async with s.get(f"{self.base_url}/uapi/overseas-futureoption/v1/quotations/inquire-price",
-            headers=self._h(tok,"HHDFS76200200"),
-            params={"EXCD":excd,"SYMB":code}) as r:
-            d = (await r.json()).get("output",{})
+        resp = await self._get_json("/uapi/overseas-futureoption/v1/quotations/inquire-price", "HHDFS76200200",
+            {"EXCD":excd,"SYMB":code})
+        d = resp.get("output", {})
         return f"[해외선물] {code} | {d.get('last','?')} | {d.get('rate','')}%"
 
     async def futures_buy(self, code: str, qty: int, price: float, excd: str = "CME") -> str:
@@ -985,11 +1186,9 @@ class KISBroker:
 
     # ═══════════════════ 국내선물옵션 ═══════════════════
     async def kr_futures_price(self, code: str) -> str:
-        tok = await self.token(); s = await self._s()
-        async with s.get(f"{self.base_url}/uapi/domestic-futureoption/v1/quotations/inquire-price",
-            headers=self._h(tok,"FHMIF10000000"),
-            params={"FID_COND_MRKT_DIV_CODE":"F","FID_INPUT_ISCD":code}) as r:
-            d = (await r.json()).get("output",{})
+        resp = await self._get_json("/uapi/domestic-futureoption/v1/quotations/inquire-price", "FHMIF10000000",
+            {"FID_COND_MRKT_DIV_CODE":"F","FID_INPUT_ISCD":code})
+        d = resp.get("output", {})
         return f"[국내선물] {code} | {d.get('futs_prpr','?')} | {d.get('prdy_ctrt','')}%"
 
     # ═══════════════════ 통합 잔고 ═══════════════════
@@ -1011,10 +1210,14 @@ class KISBroker:
                 return await self.us_buy(order.ticker, order.qty, order.limit_price or 0)
             else:
                 return await self.us_sell(order.ticker, order.qty, order.limit_price or 0)
-        elif order.market == "BOND":
-            return await self.bond_buy(order.ticker, order.qty, order.limit_price or 0)
-        elif order.market == "FUTURES":
-            return await self.futures_buy(order.ticker, order.qty, order.limit_price or 0)
+        elif order.market in ("BOND", "FUTURES"):
+            # 채권·선물은 시장가 개념이 없어 유효 지정가가 필수다. price=0 전송은 거부 유발이므로
+            # 단가 없이는 주문을 보내지 않는다(원칙: 결손을 주문가능 조건으로 오인 금지).
+            if not order.limit_price or order.limit_price <= 0:
+                return f"[주문 거부] {order.market} 주문은 지정가(limit_price)가 필수입니다 — 단가 미지정, 미전송"
+            if order.market == "BOND":
+                return await self.bond_buy(order.ticker, order.qty, order.limit_price)
+            return await self.futures_buy(order.ticker, order.qty, order.limit_price)
         return f"[에러] 미지원 시장: {order.market}"
 
     # ═══════════════════ CSV 누적 ═══════════════════

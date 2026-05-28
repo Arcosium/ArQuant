@@ -9,18 +9,18 @@ from infra.ops_support_worker import _build_system_prompt
 
 
 def test_prompt_directs_systematic_param_review():
-    p = _build_system_prompt("ops_support", non_admin=True)
+    p = _build_system_prompt("ops_support", param_tuning=True)
     assert "param_overrides" in p
     assert "하나씩" in p, "각 튜닝 파라미터를 하나씩 점검하라는 지시가 있어야 한다"
 
 
 def test_prompt_lists_tunable_keys():
-    p = _build_system_prompt("ops_support", non_admin=True)
+    p = _build_system_prompt("ops_support", param_tuning=True)
     assert "TAKE_PROFIT_PCT" in p and "STOP_LOSS_PCT" in p
 
 
 def test_prompt_drops_dead_source_edit_framing():
-    p = _build_system_prompt("ops_support", non_admin=True)
+    p = _build_system_prompt("ops_support", param_tuning=True)
     # 본문의 소스 자가수정/재시작 framing 은 제거돼야 한다 (혼선 유발 → "이상 없음")
     assert "서버를 재시작" not in p
     assert "ALLOWED_EDITS" not in p

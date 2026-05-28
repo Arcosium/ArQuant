@@ -3,7 +3,7 @@
 가장 중요한 불변식: **컴파일 실패 시 디스크가 변경 전과 비트 단위로 동일**.
 이게 깨지면 깨진 코드가 남아 다음 supervise.sh 재기동에서 전체 다운된다.
 """
-import infra.ops_support_worker as w
+import infra.ops_guards as w
 from infra import notifier
 
 

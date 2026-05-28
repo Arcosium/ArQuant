@@ -1,36 +1,28 @@
 """
-Arquant — 운용지원실장 Worker (사장 지시 2026-05-14)
+Arquant — 운용지원실장 Worker (사장 지시 2026-05-14, 자가수정 폐지 2026-05-20)
 
 This is a *separate* Python process. main_swarm.py spawns it after each cycle
 via subprocess.Popen. The worker:
 
-  1. Reads the latest cycle from data/cycles.db.
-  2. Asks the LLM what code changes would improve strategy or fix observed bugs.
-  3. Applies those changes (subject to hard guards — see FORBIDDEN_* below).
-  4. If anything changed, restarts the server via start_server.sh.
+  1. Reads this actor's recent cycles from data/cycles.db (uid-scoped).
+  2. Asks the LLM to review the cycle and propose strategy *parameter* tuning.
+  3. Applies the proposed param_overrides — **profile-scoped only** — and records
+     any source-level suggestions as read-only proposals (never applied).
 
 WHY a separate process?
-  - main_swarm.py has already loaded its modules. Editing them in-process is
-    racy (Python's import system caches bytecode). A separate process means
-    edits land on disk cleanly, and the next server start picks them up fresh.
-  - The worker CANNOT modify its own running code — by the time we run, the
-    interpreter has already loaded this file; later edits only affect future
-    runs. The FORBIDDEN_FILES guard makes self-edits explicit anyway.
   - Worker crashes don't crash the trading loop.
+  - The worker runs heavy LLM analysis off the hot path of the swarm.
+
+CODE SELF-EDIT IS RETIRED (사장 지시 2026-05-20): the worker no longer edits source
+or restarts the server. The hard-guard machinery (apply_changes/FORBIDDEN_*/ALLOWED_EDITS)
+is preserved for regression tests only in infra/ops_guards.py and is never called here.
 
 USAGE:
   python3.11 infra/ops_support_worker.py --cycle-id <int>   # post-cycle hook
   python3.11 infra/ops_support_worker.py --manual "사장 지시" # @운용지원실장 멘션 경로
-
-HARD GUARDS (LLM cannot override):
-  - infra/ops_support_worker.py — self-edits forbidden
-  - .env, data/kis_token.json, data/cycles.db — never touched
-  - config.py KIS credentials — regex-protected
-  - infra/kis_broker.py order-execution methods — regex-protected
-  - main_swarm.py core-loop methods — regex-protected
 """
 from __future__ import annotations
-import sys, os, re, json, asyncio, argparse, subprocess, logging
+import sys, re, json, asyncio, argparse, logging
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Any
@@ -47,24 +39,6 @@ KST = timezone(timedelta(hours=9))
 LOG_DIR = PROJECT_ROOT / "data"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 WORKER_LOG = LOG_DIR / "ops_support.log"
-SELF_REL = Path(__file__).resolve().relative_to(PROJECT_ROOT).as_posix()  # 'infra/ops_support_worker.py'
-
-# 사장 피드백 2026-05-18: 백업 파일(*.bak.*)을 원본 옆이 아니라 backup/ 폴더에 모은다.
-# 원본 디렉터리 구조를 그대로 미러링해 서로 다른 폴더의 동명 파일 충돌을 방지한다.
-BACKUP_ROOT = PROJECT_ROOT / "backup"
-
-def _backup_path(target: Path) -> Path:
-    """target 의 백업 경로를 backup/<원본 상대경로>.bak.<타임스탬프> 로 생성."""
-    rel = Path(target).resolve().relative_to(PROJECT_ROOT)
-    bdir = BACKUP_ROOT / rel.parent
-    bdir.mkdir(parents=True, exist_ok=True)
-    return bdir / f"{rel.name}.bak.{datetime.now(KST).strftime('%Y%m%d_%H%M%S')}"
-
-def _list_backups(target: Path) -> List[Path]:
-    """target 의 기존 백업들을 오래된→최신 순으로 반환 (backup/ 폴더 기준)."""
-    rel = Path(target).resolve().relative_to(PROJECT_ROOT)
-    bdir = BACKUP_ROOT / rel.parent
-    return sorted(bdir.glob(rel.name + ".bak.*")) if bdir.exists() else []
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,71 +46,31 @@ logging.basicConfig(
     handlers=[logging.FileHandler(WORKER_LOG, encoding="utf-8"), logging.StreamHandler()])
 logger = logging.getLogger("OPS")
 
-# ─── Safety guards (LLM CANNOT override) ──────────────────────────────────
-# Files the worker MUST NEVER write to, under any circumstance.
-FORBIDDEN_FILES = {
-    SELF_REL,                          # self — the running worker
-    ".env",
-    ".gitignore",
-    "data/kis_token.json",
-    "data/cycles.db",
-    "data/equity_curve.json",
-    "data/strategy_history.json",
-    "claude_response.json",
-    "start_server.sh",
-    "stop_server.sh",
-    "supervise.sh",
-}
-
-# Regex patterns the worker MUST NEVER modify, even if the file is otherwise editable.
-# Format: (relative_path, compiled_regex). If any FORBIDDEN_PATTERN matches the
-# `search` string OR the `replace` string, the change is rejected.
-FORBIDDEN_PATTERNS = [
-    # config.py: KIS API credentials & account number
-    ("config.py", re.compile(r"KIS_APP_KEY|KIS_APP_SECRET|KIS_ACCOUNT_NO")),
-    # infra/kis_broker.py: order execution methods (must not be tampered with)
-    ("infra/kis_broker.py", re.compile(r"\b(place_order|kr_buy|kr_sell|us_buy|us_sell|bond_buy|futures_buy)\b")),
-    # main_swarm.py: core trading loop methods (the heart of the system)
-    ("main_swarm.py", re.compile(r"\b(_run_analysis_cycle|_build_orders|start_continuous)\b")),
-    # cycle_store: persistence layer — schema changes need a migration plan
-    ("infra/cycle_store.py", re.compile(r"CREATE TABLE|INSERT INTO cycles")),
-]
-
-# Files the worker IS allowed to edit (whitelist). Anything outside this list is rejected.
-ALLOWED_EDITS = {
-    "tools/news_monitor.py", "tools/market_data.py", "tools/quant_indicators.py",
-    "tools/coresight_rag.py", "tools/dart_disclosure.py", "tools/global_search.py",
-    "tools/naver_search.py",
-    "agents/specialists.py", "agents/guardrails.py", "agents/base_agent.py",
-    "infra/kis_broker.py",        # selectively — order methods are regex-protected
-    "main_swarm.py",              # selectively — core loop methods are regex-protected
-    "config.py",                  # selectively — credentials are regex-protected
-    "server/app.py",
-    "server/static/index.html",
-}
-
-# ─── Change-size guards (사장 피드백 2026-05-18) ──────────────────────────
-# LLM 이 작은 search 앵커로 파일 전체를 갈아엎는 것을 막는다. 운용지원실장의
-# 변경은 '국소 조정' 이어야 한다 — 대수술은 사람 손으로.
-MAX_CHANGE_BYTES = 24_000          # 단일 change 의 replace/content 최대 바이트
-MAX_NET_NEW_LINES = 400            # modify 1건이 늘릴 수 있는 순 라인 수 상한
+# 코드 자가수정 안전 가드(apply_changes/FORBIDDEN_*/ALLOWED_EDITS 등)는 사장 지시 2026-05-20
+# 으로 폐지되어 infra/ops_guards.py 에 회귀 테스트용으로만 격리 보존됨 (실행 경로 미호출).
 
 # ─── LLM client (minimal — direct OpenRouter, no BaseAgent dependency) ───
 import aiohttp
 from config import (OPENROUTER_API_KEY, OPENROUTER_BASE_URL, MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS)
 
-# 사장 지시 2026-05-14: 운용지원실장 산하 팀장(investment/operations/finance)도
-# 운용지원실장과 동일한 LLM 모델·토큰 한도를 공유한다.
-# role은 오직 _build_system_prompt 안의 페르소나 문구만 바꾸고, 모델은 단일로 고정.
+# ─── Tunable limits (매직넘버 상수화) ─────────────────────────────────────
+LLM_TIMEOUT_SEC = 300              # OpenRouter 호출 타임아웃
+LLM_TEMPERATURE = 0.2
+RECENT_EVENT_SCAN = 200            # fetch_cycle_context: 훑을 최근 이벤트 수
+RECENT_EVENT_KEEP = 20             # 그 중 보관할 error/skip 이벤트 수
+MAX_REPORT_CHARS = 2500            # 사이클 리포트 필드 절단 길이
+MAX_ERROR_MSG_CHARS = 700          # error 이벤트 메시지 절단
+MAX_SKIP_MSG_CHARS = 200           # skip 이벤트 메시지 절단
+MAX_RATIONALE_CHARS = 500          # 대시보드 메시지에 표시할 rationale 절단
+TRACEBACK_TAIL_LINES = 8           # error traceback 표시 줄 수
+MAX_PROPOSED_SHOWN = 5             # 개선 제안 표시 개수
+
 OPS_MODEL = MODEL_ASSIGNMENTS.get("ops_support", "openrouter/pareto-code")
 OPS_MAX_TOKENS = AGENT_MAX_TOKENS.get("ops_support", 4096)
 
-# 사장 지시 2026-05-14: 운용지원실장 산하 팀장 분담.
-# 동일한 보안 가드(FORBIDDEN_PATTERNS/ALLOWED_EDITS)를 공유하되, 시스템 프롬프트의 역할 페르소나만 바꾼다.
-# 키 = main_swarm._classify_ops_role()이 반환하는 코드, 값 = (한글 디스플레이명, 포커스 설명)
 # 사장 지시 2026-05-20: 산하 팀장(investment/operations/finance) 및 코드 자가수정 기능 제거.
-# 운용지원실장 단일 역할만 남기며, 소스 코드는 절대 수정하지 않고 프로필 한정 전략 파라미터
-# (param_overrides) 조정안만 제시한다.
+# 운용지원실장 단일 역할만 남으며, 소스 코드는 절대 수정하지 않고 프로필 한정 전략 파라미터
+# (param_overrides) 조정안만 제시한다. role 인자는 _build_system_prompt 페르소나 문구만 바꾼다.
 ROLE_PERSONAS = {
     "ops_support": ("운용지원실장",
         "**진단·프로필 튜닝 제안자** — 직전 사이클·주간 실제 데이터를 분석해 *무엇이 "
@@ -145,40 +79,6 @@ ROLE_PERSONAS = {
         "바꿀 수 있는 '적용 가능 전략' 파라미터에 한정됩니다(계정마다 프로필 분리). 데이터 부족·출력 깨짐 "
         "버그를 최우선으로 진단하고, 그 외 개선점은 '제안'으로 기록합니다."),
 }
-
-# 사장 피드백 2026-05-18: 운용지원실장(진단)·팀장(코딩) 책임 분리.
-# Phase A — 운용지원실장이 사이클 데이터를 보고 스스로 진단해 아래 JSON 하나로만 답한다.
-_DIAGNOSE_SYSTEM_PROMPT = """당신은 ArQuant **운용지원실장** (별도 프로세스). 매 사이클 종료 후 호출되어
-직전 사이클을 점검하고 **무엇이·어디(파일/영역)가 문제이고 무엇이 정상 동작인지(수용 기준)** 진단합니다.
-당신은 코드를 직접 쓰지 않으며 *어떻게* 고칠지(코드·search/replace)도 지시하지 않습니다 —
-대신 ① 고칠 게 없으면 산하 팀장을 부르지 않고 실장 선에서 종료하거나, ② 고칠 게 있으면 담당 팀장 1명에게
-**문제 정의와 기대 동작**을 위임합니다. 구현(HOW)은 그 팀장이 첨부된 실제 파일을 보고 직접 설계합니다.
-
-## 진단 우선순위 (이런 버그를 먼저 잡으십시오)
-1. **데이터 부족 버그** — 계량분석팀장이 "데이터 부족"을 반복, 일봉/수급/DART/시세가 비어 분석 불능.
-2. **출력 깨짐 버그** — 에이전트가 분석 대신 JSON·코드·tool-call을 출력, 머리말 중복, 표/마크다운 깨짐, 빈 응답.
-3. 명백한 로직 결함·예외·체결/접수 혼동 등 사이클 데이터에 증거가 있는 문제.
-※ 검증 어려운 큰 리팩토링·취향성 개선은 위임하지 마십시오(보수적). 증거 없는 추측 금지.
-
-## 담당 팀장 (delegate 시 sub_role 택1)
-- investment: 전략·매매 정책·후보/사이징·익절/손절·퀀트 임계값·뉴스 분류
-- operations: server/app.py·대시보드 UI(index.html)·cycle_store/weekly_review/news_classifier_log·로깅
-- finance:    예산·리스크 한도·P&L/equity·환율·평가액·표시 단위
-
-## 응답 형식 — 아래 JSON **한 블록만** (다른 텍스트 금지)
-고칠 게 없을 때:
-```json
-{"action":"none","summary":"이번 사이클 점검 결과 — 즉시 고칠 버그 없음","rationale":"무엇을 확인했고 왜 손볼 게 없는지 1~3줄"}
-```
-고칠 게 있을 때:
-```json
-{"action":"delegate","sub_role":"investment",
- "summary":"한 줄 요약(무슨 버그를 누구에게 위임)",
- "rationale":"사이클 데이터의 어떤 신호가 근거인지",
- "directive":"담당 팀장에게 내리는 **문제 정의**: 파일/영역 + 무엇이·왜 잘못됐는지 + 고쳐졌다고 볼 기준(기대 동작). 구체 코드·search/replace 문자열은 절대 쓰지 말 것 — 구현(HOW)은 팀장이 첨부된 실제 파일을 보고 직접 설계한다."}
-```
-directive는 팀장이 '무엇을·왜' 고치는지 명확히 이해할 만큼 구체적이되, 구현 방법(코드/문자열)은 지정하지 마십시오 — 그것은 팀장의 몫입니다."""
-
 
 _OPS_SYSTEM_PROMPT_BODY = """## 임무 (사장 지시 2026-05-22 — 파라미터 점검 전용)
 당신이 시스템을 개선할 수 있는 **유일한 수단은 이 프로필의 전략 튜닝 파라미터(param_overrides) 조정**입니다.
@@ -206,9 +106,10 @@ _OPS_SYSTEM_PROMPT_BODY = """## 임무 (사장 지시 2026-05-22 — 파라미�
 """
 
 
-def _non_admin_addendum() -> str:
-    """비관리자 프로필에서 실행될 때 시스템 프롬프트에 덧붙이는 강제 규칙.
-    공유 소스(.py)는 전 유저 공통이라 비관리자가 못 바꾼다 — 대신 프로필 한정
+def _param_tuning_addendum() -> str:
+    """시스템 프롬프트에 덧붙이는 param-only 강제 규칙 (사장 지시 2026-05-20: 코드
+    자가수정 폐지 후 ADMIN·일반 구분 없이 모든 실행이 이 모드를 탄다).
+    공유 소스(.py)는 전 유저 공통이라 못 바꾼다 — 대신 프로필 한정
     튜닝 파라미터(param_overrides)로만 의도를 표현하게 한다."""
     try:
         import config
@@ -254,9 +155,9 @@ def _non_admin_addendum() -> str:
     )
 
 
-def _build_system_prompt(role: str, non_admin: bool = False) -> str:
+def _build_system_prompt(role: str, param_tuning: bool = False) -> str:
     """역할별 페르소나 헤더 + 공통 본문. f-string 충돌 회피 위해 헤더만 동적 구성.
-    non_admin=True 면 소스 불가침·param_overrides 강제 규칙을 덧붙인다."""
+    param_tuning=True 면 소스 불가침·param_overrides 강제 규칙을 덧붙인다."""
     display, focus = ROLE_PERSONAS.get(role, ROLE_PERSONAS["ops_support"])
     header = (
         f"당신은 ArQuant **{display}** (별도 프로세스 실행). "
@@ -266,13 +167,25 @@ def _build_system_prompt(role: str, non_admin: bool = False) -> str:
         f"단, 본인 전문 영역 변경에 우선 집중하세요.)\n\n"
     )
     body = header + _OPS_SYSTEM_PROMPT_BODY
-    if non_admin:
-        body += _non_admin_addendum()
+    if param_tuning:
+        body += _param_tuning_addendum()
     return body
 
 
+def _extract_json_block(reply: str) -> Optional[Dict[str, Any]]:
+    """LLM 응답에서 JSON 객체 한 블록을 추출·파싱. ```json 펜스 우선, 없으면 bare {…}.
+    미발견/파싱실패면 None (호출부가 폴백 처리)."""
+    m = re.search(r"```json\s*(\{.+?\})\s*```", reply, re.S) or re.search(r"(\{.+\})", reply, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
 async def llm_propose(prompt: str, role: str = "ops_support",
-                      non_admin: bool = False) -> Dict[str, Any]:
+                      param_tuning: bool = False) -> Dict[str, Any]:
     """Send `prompt` to the ops_support model. Returns parsed change-plan dict, or {} on failure."""
     if not OPENROUTER_API_KEY:
         logger.error("OPENROUTER_API_KEY 없음 — LLM 호출 불가")
@@ -280,16 +193,16 @@ async def llm_propose(prompt: str, role: str = "ops_support",
     payload = {
         "model": OPS_MODEL,
         "messages": [
-            {"role": "system", "content": _build_system_prompt(role, non_admin=non_admin)},
+            {"role": "system", "content": _build_system_prompt(role, param_tuning=param_tuning)},
             {"role": "user", "content": prompt},
         ],
         "max_tokens": OPS_MAX_TOKENS,
-        "temperature": 0.2,
+        "temperature": LLM_TEMPERATURE,
     }
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
                "HTTP-Referer": "https://arquant.ai-ve.uk", "X-Title": "ArQuant-OpsSupport-Worker"}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=LLM_TIMEOUT_SEC)) as s:
             async with s.post(f"{OPENROUTER_BASE_URL}/chat/completions", json=payload, headers=headers) as r:
                 if r.status != 200:
                     txt = await r.text()
@@ -304,123 +217,11 @@ async def llm_propose(prompt: str, role: str = "ops_support",
         record_error("ops_support.llm_propose", e, context=f"role={role}, prompt_len={len(prompt)}")
         return {}
 
-    # Find the JSON block — accept ``` fenced or bare
-    m = re.search(r"```json\s*(\{.+?\})\s*```", reply, re.S)
-    if not m:
-        m = re.search(r"(\{.+\})", reply, re.S)
-    if not m:
-        logger.warning(f"LLM 응답에서 JSON 미발견 — 변경 없음으로 처리. 응답 일부: {reply[:400]}")
+    parsed = _extract_json_block(reply)
+    if parsed is None:
+        logger.warning(f"LLM 응답에서 JSON 미발견/파싱실패 — 변경 없음으로 처리. 응답 일부: {reply[:400]}")
         return {"summary": "JSON 응답 파싱 실패", "rationale": reply[:600], "changes": [], "restart": False}
-    try:
-        return json.loads(m.group(1))
-    except json.JSONDecodeError as e:
-        logger.warning(f"JSON 파싱 실패: {e}. 응답 일부: {reply[:400]}")
-        return {"summary": "JSON 파싱 실패", "rationale": str(e), "changes": [], "restart": False}
-
-
-async def llm_diagnose(prompt: str) -> Dict[str, Any]:
-    """Phase A — 운용지원실장 진단 전용 호출. _DIAGNOSE_SYSTEM_PROMPT 사용,
-    {"action": "none"|"delegate", ...} 한 블록을 파싱해 반환. 실패 시 안전하게 'none'."""
-    if not OPENROUTER_API_KEY:
-        logger.error("OPENROUTER_API_KEY 없음 — 진단 불가")
-        return {"action": "none", "summary": "진단 불가 (API 키 없음)", "rationale": "OPENROUTER_API_KEY 미설정"}
-    payload = {
-        "model": OPS_MODEL,
-        "messages": [
-            {"role": "system", "content": _DIAGNOSE_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": OPS_MAX_TOKENS,
-        "temperature": 0.2,
-    }
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
-               "HTTP-Referer": "https://arquant.ai-ve.uk", "X-Title": "ArQuant-OpsSupport-Diagnose"}
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as s:
-            async with s.post(f"{OPENROUTER_BASE_URL}/chat/completions", json=payload, headers=headers) as r:
-                if r.status != 200:
-                    txt = await r.text()
-                    logger.error(f"진단 LLM HTTP {r.status}: {txt[:300]}")
-                    record_error("ops_support.llm_diagnose", context=f"HTTP {r.status}: {txt[:200]}")
-                    return {"action": "none", "summary": "진단 미완 (LLM HTTP 오류)", "rationale": f"HTTP {r.status}"}
-                d = await r.json()
-        reply = d.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
-    except Exception as e:
-        # 사장 지시 2026-05-19: 빈 메시지 예외도 진단 가능하도록 타입+repr+tb 기록.
-        _detail = f"{type(e).__name__}: {e!r}"
-        logger.error(f"진단 LLM 예외: {_detail}", exc_info=True)
-        record_error("ops_support.llm_diagnose", e, context=f"prompt_len={len(prompt)}")
-        return {"action": "none", "summary": "진단 미완 (LLM 호출 예외)", "rationale": _detail}
-    m = re.search(r"```json\s*(\{.+?\})\s*```", reply, re.S) or re.search(r"(\{.+\})", reply, re.S)
-    if not m:
-        logger.warning(f"진단 JSON 미발견 — none 처리. 일부: {reply[:300]}")
-        return {"action": "none", "summary": "진단 결과 해석 실패 — 이번엔 변경 없음",
-                "rationale": reply[:400]}
-    try:
-        plan = json.loads(m.group(1))
-    except json.JSONDecodeError as e:
-        logger.warning(f"진단 JSON 파싱 실패: {e}")
-        return {"action": "none", "summary": "진단 JSON 파싱 실패 — 이번엔 변경 없음", "rationale": str(e)}
-    if plan.get("action") not in ("none", "delegate"):
-        plan["action"] = "none"
-    return plan
-
-
-def _spawn_subordinate(sub_role: str, directive: str, cycle_id: Optional[int],
-                       actor_uid: Optional[int]) -> bool:
-    """운용지원실장 → 담당 팀장 코딩 위임. 같은 워커를 자식 프로세스로 재실행한다
-    (--delegated 1 + --manual <directive>). ADMIN 게이트는 부모(_spawn_ops_support_worker)에서
-    이미 통과했으므로 --actor-admin 1 을 그대로 전달한다."""
-    cmd = ["python3.11", str(Path(__file__).resolve()),
-           "--role", sub_role, "--manual", directive, "--delegated", "1",
-           "--actor-admin", "1"]
-    if cycle_id is not None:
-        cmd += ["--cycle-id", str(int(cycle_id))]
-    if actor_uid is not None:
-        cmd += ["--actor-user", str(int(actor_uid))]
-    try:
-        log_path = PROJECT_ROOT / "data" / "ops_support.spawn.log"
-        f = open(log_path, "a", encoding="utf-8", buffering=1)
-        f.write(f"\n=== {datetime.now(KST):%Y-%m-%d %H:%M:%S} 운용지원실장→{sub_role} 위임 "
-                f"(cycle_id={cycle_id}) ===\n지시: {directive[:300]}\n")
-        subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT,
-                         start_new_session=True, cwd=str(PROJECT_ROOT))
-        logger.info(f"팀장 워커 위임 spawn: role={sub_role}, cycle_id={cycle_id}")
-        return True
-    except Exception as e:
-        logger.error(f"팀장 워커 위임 spawn 실패: {e}")
-        return False
-
-
-# ─── Editable codebase snapshot (passed to the LLM as context) ───────────
-# Files capped at this size each to keep total prompt under model limits.
-_FILE_MAX_CHARS = 60_000
-_INDEX_HTML_MAX_CHARS = 25_000  # HTML is dense and less likely to need edits — smaller cap
-
-
-def gather_editable_files() -> str:
-    """Read every file in ALLOWED_EDITS and return one big string with section markers.
-    Each file is wrapped in '===== <relpath> =====' / '===== /<relpath> =====' for the LLM
-    to anchor on. Oversized files are truncated with a clear marker so the LLM doesn't
-    write search strings into the truncated portion (which would never match)."""
-    parts: List[str] = []
-    total = 0
-    for rel in sorted(ALLOWED_EDITS):
-        fp = PROJECT_ROOT / rel
-        if not fp.exists():
-            continue
-        try:
-            content = fp.read_text(encoding="utf-8")
-        except Exception as e:
-            parts.append(f"\n===== {rel} (read failed: {e}) =====\n")
-            continue
-        cap = _INDEX_HTML_MAX_CHARS if rel.endswith(".html") else _FILE_MAX_CHARS
-        if len(content) > cap:
-            content = content[:cap] + f"\n... [TRUNCATED at {cap} chars — 이 아래 영역은 search 대상 금지]"
-        parts.append(f"\n===== {rel} =====\n{content}\n===== /{rel} =====\n")
-        total += len(content)
-    parts.insert(0, f"[총 {total:,} chars / {len(ALLOWED_EDITS)} 파일 — 화이트리스트 외 파일은 절대 수정 거부됨]\n")
-    return "\n".join(parts)
+    return parsed
 
 
 # ─── Cycle data fetch (read-only) ─────────────────────────────────────────
@@ -454,13 +255,13 @@ def fetch_cycle_context(cycle_id: Optional[int], uid: Optional[int] = None) -> D
     recent_events: List[Dict] = []
     try:
         import main_swarm
-        evs = main_swarm.get_recent_events(limit=200, uid=uid)
+        evs = main_swarm.get_recent_events(limit=RECENT_EVENT_SCAN, uid=uid)
         if isinstance(evs, list):
             for e in evs:
                 t = e.get("type", "")
                 if t in ("error", "execution_skipped", "trade_failed"):
                     recent_events.append(e)
-            recent_events = recent_events[-20:]
+            recent_events = recent_events[-RECENT_EVENT_KEEP:]
     except Exception as e:
         logger.warning(f"events 로드 실패(uid={uid}): {e}")
     return {"target_cycle": target, "recent_cycles": cycles, "recent_errors_skips": recent_events}
@@ -516,7 +317,7 @@ def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
         for fld in ("macro_report", "quant_report", "news_report", "final_report", "risk_report", "error"):
             v = tgt.get(fld)
             if v:
-                parts.append(f"\n[{fld}]\n{str(v)[:2500]}")
+                parts.append(f"\n[{fld}]\n{str(v)[:MAX_REPORT_CHARS]}")
 
     if ctx.get("recent_cycles") and len(ctx["recent_cycles"]) > 1:
         parts.append("\n[지난 5개 사이클 요약 (감점 추세 확인용)]")
@@ -530,13 +331,13 @@ def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
         for e in ctx["recent_errors_skips"]:
             # 사장 지시 2026-05-19: type=error 는 진단용이므로 상세히(메시지+트레이스백) 노출.
             if e.get("type") == "error":
-                _msg = str(e.get("message", ""))[:700]
+                _msg = str(e.get("message", ""))[:MAX_ERROR_MSG_CHARS]
                 parts.append(f"- {e.get('ts')} error[{e.get('component','?')}]: {_msg}")
                 _tb = ((e.get("detail") or {}).get("traceback") or "").strip()
                 if _tb:
-                    parts.append("  ↳ traceback(tail):\n    " + "\n    ".join(_tb.splitlines()[-8:]))
+                    parts.append("  ↳ traceback(tail):\n    " + "\n    ".join(_tb.splitlines()[-TRACEBACK_TAIL_LINES:]))
             else:
-                parts.append(f"- {e.get('ts')} {e.get('type')}: {str(e.get('message',''))[:200]}")
+                parts.append(f"- {e.get('ts')} {e.get('type')}: {str(e.get('message',''))[:MAX_SKIP_MSG_CHARS]}")
 
     parts.append(
         "\n[과제] 위 사이클 결과를 검토하여, **이 프로필의 전략 튜닝 파라미터(param_overrides)** 를 점검·조정하십시오. "
@@ -550,194 +351,30 @@ def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
     return "\n".join(parts)
 
 
-# ─── Change application ──────────────────────────────────────────────────
-# 사장 지시 2026-05-20: 코드 자가수정 기능 제거(RETIRED). 아래 apply_changes()/
-# restart_server() 와 위임용 llm_diagnose()/_spawn_subordinate() 는 run() 에서 더 이상
-# 호출되지 않는다(소스 편집·서버 재시작·팀장 위임 전면 비활성). 정의는 가드 단위 테스트
-# (test_ops_worker_guards.py) 보존 및 향후 복구 가능성을 위해 남겨두되, 실행 경로에서 분리됨.
-def _violates_pattern(rel_path: str, payload: str) -> Optional[str]:
-    """Return the failing pattern description if `payload` violates any FORBIDDEN_PATTERN for `rel_path`."""
-    for fpath, rx in FORBIDDEN_PATTERNS:
-        if rel_path == fpath and rx.search(payload or ""):
-            return f"{fpath} 보호 패턴 매칭: {rx.pattern}"
-    return None
-
-
-def apply_changes(plan: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply each change with hard-guard checks. Returns
-    {applied, rejected, compile_errors, rolled_back}. Never raises.
-
-    안전 불변식 (사장 피드백 2026-05-18): 최종 컴파일 검증이 실패하면 이
-    함수가 만든 모든 변경을 **백업에서 비트 단위로 원복**한다 — 깨진 코드를
-    디스크에 남겨 다음 supervise.sh 재기동에서 전체 다운되던 문제를 차단.
-    """
-    applied: List[str] = []
-    rejected: List[str] = []
-    # 롤백 원장: (target, backup_path|None, created_bool) — 적용 순서대로.
-    ledger: List[tuple] = []
-    for ch in (plan.get("changes") or []):
-        rel = (ch.get("file") or "").strip().lstrip("/").replace("\\", "/")
-        action = (ch.get("action") or "modify").strip().lower()
-        desc = ch.get("description") or ch.get("summary") or action
-
-        # ── Guard 1: forbidden files (self, secrets, dbs, scripts) ──
-        if rel in FORBIDDEN_FILES:
-            rejected.append(f"❌ {rel}: 보호 파일 — 절대 수정 불가 ({desc})")
-            continue
-        # ── Guard 2: whitelist ──
-        if rel not in ALLOWED_EDITS:
-            rejected.append(f"❌ {rel}: 화이트리스트 외 — 수정 거부 ({desc})")
-            continue
-        # ── Guard 3: path containment (no traversal) ──
-        try:
-            target = (PROJECT_ROOT / rel).resolve()
-            target.relative_to(PROJECT_ROOT)
-        except Exception:
-            rejected.append(f"❌ {rel}: 프로젝트 루트 밖 경로 — 거부")
-            continue
-
-        search = ch.get("search") or ""
-        replace = ch.get("replace") or ch.get("content") or ""
-
-        # ── Guard 4: forbidden patterns in either search OR replace ──
-        bad = _violates_pattern(rel, search) or _violates_pattern(rel, replace)
-        if bad:
-            rejected.append(f"❌ {rel}: 보호 패턴 위반 — {bad}")
-            continue
-
-        # ── Guard 5: change-size cap (작은 앵커로 파일 전체 갈아엎기 차단) ──
-        payload = replace if action in ("append", "create") else replace
-        if len(payload.encode("utf-8")) > MAX_CHANGE_BYTES:
-            rejected.append(f"❌ {rel}: 변경 크기 {len(payload.encode('utf-8'))}B > "
-                            f"한도 {MAX_CHANGE_BYTES}B — 국소 변경만 허용 ({desc})")
-            continue
-        if action == "modify":
-            net_new = replace.count("\n") - search.count("\n")
-            if net_new > MAX_NET_NEW_LINES:
-                rejected.append(f"❌ {rel}: 순증 라인 {net_new} > 한도 "
-                                f"{MAX_NET_NEW_LINES} — 대규모 재작성 거부 ({desc})")
-                continue
-
-        try:
-            if action == "modify":
-                if not search:
-                    rejected.append(f"❌ {rel}: modify에 search 비어있음")
-                    continue
-                content = target.read_text(encoding="utf-8")
-                cnt = content.count(search)
-                if cnt == 0:
-                    rejected.append(f"❌ {rel}: search 문자열 미발견 ({desc})")
-                    continue
-                if cnt > 1:
-                    rejected.append(f"❌ {rel}: search가 {cnt}회 등장 — 모호함 (정확히 1회여야 함)")
-                    continue
-                # backup — backup/ 폴더에 원본 디렉터리 구조를 미러링하여 저장
-                backup = _backup_path(target)
-                backup.write_text(content, encoding="utf-8")
-                target.write_text(content.replace(search, replace, 1), encoding="utf-8")
-                ledger.append((target, backup, False))
-                applied.append(f"✅ {rel}: modify ({desc}) [백업 {backup.relative_to(PROJECT_ROOT)}]")
-            elif action == "append":
-                if not replace:
-                    rejected.append(f"❌ {rel}: append에 추가 내용 비어있음")
-                    continue
-                # 사장 피드백 2026-05-18: append 도 백업 — 롤백 가능하도록.
-                _existed = target.exists()
-                before = target.read_text(encoding="utf-8") if _existed else ""
-                backup = _backup_path(target) if _existed else None
-                if backup is not None:
-                    backup.write_text(before, encoding="utf-8")
-                with target.open("a", encoding="utf-8") as f:
-                    f.write("\n" + replace)
-                ledger.append((target, backup, not _existed))
-                _bk = f" [백업 {backup.relative_to(PROJECT_ROOT)}]" if backup else " [신규파일]"
-                applied.append(f"✅ {rel}: append ({desc}){_bk}")
-            elif action == "create":
-                if target.exists():
-                    rejected.append(f"❌ {rel}: 이미 존재 — create 거부 (modify로 바꾸세요)")
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(replace or "", encoding="utf-8")
-                ledger.append((target, None, True))
-                applied.append(f"✅ {rel}: create ({desc})")
-            else:
-                rejected.append(f"❌ {rel}: 알 수 없는 action={action}")
-        except Exception as e:
-            rejected.append(f"❌ {rel}: 적용 예외 — {e}")
-
-    # ── Final compile check on any modified .py file ──
-    import py_compile
-    bad_compile = []
-    for entry in applied:
-        m = re.match(r"^✅ (\S+):", entry)
-        if not m: continue
-        rel = m.group(1)
-        if rel.endswith(".py"):
-            try:
-                py_compile.compile(str(PROJECT_ROOT / rel), doraise=True)
-            except py_compile.PyCompileError as e:
-                bad_compile.append(f"⚠ {rel}: 구문 오류 — {e}")
-
-    # ── 컴파일 실패 시 전면 롤백 (안전 불변식) ──
-    rolled_back: List[str] = []
-    if bad_compile:
-        for target, backup, created in reversed(ledger):
-            try:
-                rel = target.relative_to(PROJECT_ROOT)
-                if created:
-                    if target.exists():
-                        target.unlink()
-                    rolled_back.append(f"↩ {rel}: 신규 파일 삭제")
-                elif backup is not None and backup.exists():
-                    target.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
-                    rolled_back.append(f"↩ {rel}: 백업에서 원복")
-                else:
-                    rolled_back.append(f"⚠ {rel}: 백업 없음 — 원복 불가(수동 확인 필요)")
-            except Exception as e:  # 롤백 실패도 절대 raise 안 함
-                rolled_back.append(f"⚠ {target}: 롤백 예외 — {e}")
-        rejected.append(
-            f"🛑 컴파일 실패 {len(bad_compile)}건 → 변경 {len(ledger)}건 전면 롤백 "
-            f"(디스크 원복 완료, 서버 재시작 안 함)")
-        try:
-            from infra import notifier
-            notifier.alert("CRITICAL", "운용지원실장 자가수정 롤백",
-                           "; ".join(bad_compile)[:1500],
-                           dedup_key="ops_self_edit_rollback")
-        except Exception:
-            pass
-        applied = []  # 효과적으로 적용된 변경 없음 → 호출부의 재시작 조건 미충족
-
-    return {"applied": applied, "rejected": rejected,
-            "compile_errors": bad_compile, "rolled_back": rolled_back}
-
-
-# ─── Server restart trigger ───────────────────────────────────────────────
-def restart_server() -> str:
-    """Spawn start_server.sh detached so this worker can exit cleanly while the server bounces.
-    Server reboots auto-resume the watch loop if RESUME_ON_BOOT marker exists (see main_swarm)."""
-    try:
-        # leave a marker so the new server knows to auto-start its watch loop
-        marker = PROJECT_ROOT / "data" / ".resume_on_boot"
-        marker.write_text(datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
-        subprocess.Popen(
-            ["bash", "-c", f"sleep 2 && bash {PROJECT_ROOT}/start_server.sh >> /tmp/arquant_restart.log 2>&1"],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return "🔄 서버 재시작 예약됨 (2초 후) + RESUME_ON_BOOT 마커 설정"
-    except Exception as e:
-        return f"⚠ 서버 재시작 실패: {e}"
-
-
 # ─── Main ─────────────────────────────────────────────────────────────────
-def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
-                      started: str, trigger: str, cycle_id: Optional[int]) -> None:
+def _gate_overrides_by_data(raw_overrides: Dict[str, Any], has_cycle_data: bool):
+    """실제 사이클 데이터가 없으면 param_overrides 를 거부한다(LLM 날조 방지).
+    데이터 없는 manual 지시에서 LLM 이 가짜 거래를 지어내 파라미터를 바꾸는 것을 코드로 차단.
+    반환: (적용 후보 overrides, 거부사유). has_cycle_data=False 면 ({}, 사유)."""
+    if not has_cycle_data:
+        return {}, ("실제 직전 사이클 데이터가 없어 파라미터 변경을 보류합니다 — "
+                    "근거 데이터 없이는 조정하지 않습니다(추측·날조 방지).")
+    return (raw_overrides or {}), ""
+
+
+def _handle_param_tuning(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
+                         started: str, trigger: str, cycle_id: Optional[int],
+                         has_cycle_data: bool = True) -> None:
     """운용지원 단일 경로(사장 지시 2026-05-20): 소스 코드·서버 절대 불가침.
     param_overrides 만 프로필 한정으로 반영하고, changes 는 '제안'으로만 기록한다.
-    ADMIN·일반 유저 모두 동일하게 이 경로를 탄다(코드 자가수정 제거)."""
+    ADMIN·일반 유저 모두 동일하게 이 경로를 탄다(코드 자가수정 제거).
+    has_cycle_data=False(실데이터 없음) 면 param_overrides 적용을 코드로 거부한다."""
     display = ROLE_PERSONAS.get(role, ROLE_PERSONAS["ops_support"])[0]
     summary = plan.get("summary") or "변경 사항 없음"
     rationale = plan.get("rationale", "") or ""
-    raw_ov = plan.get("param_overrides") or {}
+    raw_ov, _gate_reason = _gate_overrides_by_data(plan.get("param_overrides") or {}, has_cycle_data)
+    if _gate_reason:
+        rationale = (f"{_gate_reason} " + rationale).strip()
     # 소스 변경 제안은 사람이 읽을 설명으로만 보존 (적용 안 함)
     proposed = []
     for ch in (plan.get("changes") or []):
@@ -765,15 +402,30 @@ def _handle_non_admin(plan: Dict[str, Any], actor_uid: Optional[int], role: str,
 
     msg_lines = [f"🛠 [OPS#{cycle_id or 'manual'}] {display}: {head}"]
     if rationale and not ("변경 없음" in summary and not applied_ov and not proposed):
-        msg_lines.append(f"근거: {rationale[:500]}")
+        msg_lines.append(f"근거: {rationale[:MAX_RATIONALE_CHARS]}")
     for k, v in applied_ov.items():
         msg_lines.append(f"  • {k} = {v}")
     if proposed:
         msg_lines.append("개선 제안(참고용):")
-        for s in proposed[:5]:
+        for s in proposed[:MAX_PROPOSED_SHOWN]:
             msg_lines.append(f"  • {s}")
     message = "\n".join(msg_lines)
-    logger.info(f"--- 비관리자 요약 ---\n{message}\n----------")
+    logger.info(f"--- 운용지원 요약 ---\n{message}\n----------")
+
+    # 구조화된 전역 이력 — ops_history.json (사장 지시 2026-05-14).
+    # /api/ops_history 엔드포인트와 "@운용지원실장 수정한 코드 보여줘" 질의가 이 전역 이력을
+    # 읽는다. 코드 자가수정 폐지 후에도 파라미터 튜닝/제안 이력은 계속 누적돼야 한다.
+    try:
+        from infra import ops_history
+        ops_history.append_run({
+            "role": role, "role_display": display, "trigger": trigger, "cycle_id": cycle_id,
+            "summary": summary, "rationale": rationale or "",
+            "applied": [f"{k} = {v}" for k, v in applied_ov.items()],
+            "rejected": [], "compile_errors": [],
+            "proposed": proposed, "restarted": False,
+        })
+    except Exception as e:
+        logger.warning(f"ops_history append 실패: {e}")
 
     if actor_uid is not None:
         try:
@@ -815,11 +467,9 @@ async def run(cycle_id: Optional[int], manual: Optional[str], role: str = "ops_s
                 f"manual={'있음' if manual else '없음'}, delegated={delegated}, "
                 f"actor_uid={actor_uid}, admin={actor_admin}) ===")
 
-    # 사장 지시 2026-05-20: 코드 자가수정·서버 재시작 기능 제거. 운용지원실장은 ADMIN·일반
-    # 유저 구분 없이 ① 진단 + ② 프로필 한정 파라미터(param_overrides) 조정 + ③ 소스 변경
-    # '제안' 기록만 수행한다. apply_changes()/restart_server() 미호출(코드 자가수정 차단),
-    # 산하 팀장(investment/operations/finance) 위임 경로도 제거. 조정 범위는
-    # '적용 가능 전략·전략 커스터마이즈' 수준의 프로필 파라미터에 한정된다(사람마다 프로필 분리).
+    # 사장 지시 2026-05-20: 코드 자가수정·서버 재시작·팀장 위임 폐지. 운용지원실장은 ADMIN·일반
+    # 구분 없이 ① 진단 + ② 프로필 한정 파라미터(param_overrides) 조정 + ③ 소스 변경 '제안'
+    # 기록만 수행한다. 조정 범위는 '적용 가능 전략' 수준의 프로필 파라미터에 한정된다(프로필 분리).
 
     # trigger 분류 — 주간 리뷰 키워드 감지
     trigger = "weekly" if (manual and "주간 피드백 루프" in manual) else ("manual" if manual else "cycle")
@@ -828,87 +478,19 @@ async def run(cycle_id: Optional[int], manual: Optional[str], role: str = "ops_s
     if not ctx.get("target_cycle") and not manual:
         logger.info("분석할 사이클 데이터 없음 — 종료")
         return
+    # 실데이터 유무 — manual 지시라도 직전 사이클/최근 사이클 데이터가 없으면 파라미터 변경을 거부한다
+    # (LLM 이 가짜 거래를 지어내 조정을 정당화하는 것을 코드로 차단).
+    has_cycle_data = bool(ctx.get("target_cycle")) or bool(ctx.get("recent_cycles"))
 
     prompt = build_prompt(ctx, manual, delegated=False)
     logger.info(f"LLM 프롬프트 길이: {len(prompt)} chars")
-    # non_admin=True: LLM 에게 '프로필 한정 param_overrides 만, 소스 변경은 제안으로만 기록,
-    # 서버 재시작 없음'을 지시한다. 코드 자가수정(apply_changes)·재시작·팀장 위임 경로는 제거됨.
-    plan = await llm_propose(prompt, role="ops_support", non_admin=True)
+    # param_tuning=True: LLM 에게 '프로필 한정 param_overrides 만, 소스 변경은 제안으로만 기록,
+    # 서버 재시작 없음'을 지시한다. 코드 자가수정·재시작·팀장 위임 경로는 폐지됨(ops_guards 격리).
+    plan = await llm_propose(prompt, role="ops_support", param_tuning=True)
 
     # 진단 + 프로필 한정 파라미터(param_overrides) 조정 + 소스 변경 '제안' 기록만 수행.
-    _handle_non_admin(plan, actor_uid, "ops_support", started, trigger, cycle_id)
-
-
-def _write_summary(started: str, summary: str, rationale: str, applied: List[str], rejected: List[str], restart: Optional[str],
-                   trigger: str = "cycle", cycle_id: Optional[int] = None, compile_errors: Optional[List[str]] = None,
-                   role: str = "ops_support"):
-    """Persist a per-run summary to data/ops_support.log AND append to claude_response.json
-    so the dashboard shows what the worker did. 추가로 사장 지시 2026-05-14: ops_history.json에
-    구조화된 이력도 누적해 "@운용지원실장 수정한 코드 보여줘" 질의에 즉답 가능."""
-    try:
-        display = ROLE_PERSONAS.get(role, ROLE_PERSONAS["ops_support"])[0]
-        # 사장 피드백 2026-05-15 (4차): spawn 메시지와 시각적으로 묶기 위해 동일 마커 prefix.
-        _marker = f"OPS#{cycle_id}" if cycle_id else "OPS#manual"
-        # 결과 분류 — 사장이 한눈에 파악할 수 있도록 첫 줄에 핵심 결과만.
-        # 사장 피드백 2026-05-16: 결과를 정직하게 — 원인 모르면 '고쳤다/변경없음'으로 단정하지 말 것.
-        _parse_failed = ("파싱 실패" in summary or "JSON" in summary)
-        if applied:
-            _headline = f"✅ {len(applied)}건 코드 수정 완료" + (" + 서버 재시작" if restart and "재시작" in str(restart) else "")
-        elif rejected:
-            _headline = f"⛔ 변경 제안 {len(rejected)}건 모두 거부 (보호 패턴 등)"
-        elif _parse_failed:
-            _headline = "⚠️ 분석 미완 — LLM 응답을 해석하지 못해 이번엔 아무것도 변경하지 않았습니다 (원인 불명, 강제 수정 안 함)"
-        elif "변경 없음" in summary or "변경 사항 없음" in summary:
-            _headline = "ℹ️ 변경 없음 — 점검 결과 손볼 곳 없음"
-        else:
-            _headline = summary
-        msg_lines = [f"🛠 [{_marker}] {display}: {_headline}"]
-        _no_change = (not applied and not rejected and
-                      ("변경 없음" in summary or "변경 사항 없음" in summary))
-        if rationale and _parse_failed:
-            # 파싱 실패의 rationale은 JSON 에러 문자열일 뿐 '수정 근거'가 아니다 — 진단으로만.
-            msg_lines.append(f"진단(참고): {str(rationale)[:200]} — 다음 사이클에 다시 시도합니다.")
-        elif rationale and not _no_change:
-            # '변경 없음'이면 한 줄로 끝낸다 (사장 피드백 2026-05-16: 고칠 게 없으면 그것만).
-            msg_lines.append(f"근거: {rationale[:600]}")
-        if applied: msg_lines.extend(applied)
-        if rejected: msg_lines.extend(rejected)
-        if restart: msg_lines.append(restart)
-        message = "\n".join(msg_lines)
-        logger.info(f"--- 요약 ---\n{message}\n----------")
-
-        # 구조화된 이력 — ops_history.json
-        try:
-            from infra import ops_history
-            ops_history.append_run({
-                "role": role,
-                "role_display": display,
-                "trigger": trigger,
-                "cycle_id": cycle_id,
-                "summary": summary,
-                "rationale": rationale or "",
-                "applied": applied or [],
-                "rejected": rejected or [],
-                "compile_errors": compile_errors or [],
-                "restarted": bool(restart and "재시작" in restart),
-            })
-        except Exception as _e:
-            logger.warning(f"ops_history append 실패: {_e}")
-
-        # append to claude_response.json (best effort)
-        evs_path = PROJECT_ROOT / "claude_response.json"
-        try:
-            data = json.loads(evs_path.read_text(encoding="utf-8")) if evs_path.exists() else []
-            if not isinstance(data, list): data = []
-            data.append({"ts": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
-                         "source": "system_event", "type": "agent_msg",
-                         "agent": display, "message": message})
-            if len(data) > 4000: data = data[-4000:]
-            evs_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.warning(f"claude_response.json append 실패: {e}")
-    except Exception as e:
-        logger.warning(f"_write_summary 예외: {e}")
+    _handle_param_tuning(plan, actor_uid, "ops_support", started, trigger, cycle_id,
+                         has_cycle_data=has_cycle_data)
 
 
 def main():

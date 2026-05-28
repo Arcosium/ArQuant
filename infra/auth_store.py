@@ -629,10 +629,11 @@ def list_members() -> List[Dict[str, Any]]:
     init()
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
-            "SELECT id, username, kis_base_url, created_at, last_login_at, "
+            "SELECT id, username, label, kis_base_url, created_at, last_login_at, "
             "is_admin FROM users ORDER BY created_at ASC").fetchall()
     return [{
         "id": int(r["id"]), "username": r["username"],
+        "label": (r["label"] if "label" in r.keys() else "") or "",
         "created_at": r["created_at"], "last_login_at": r["last_login_at"],
         "is_admin": bool(r["is_admin"]),
         "is_mock": _is_mock_url(r["kis_base_url"]),

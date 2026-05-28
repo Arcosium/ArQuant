@@ -45,6 +45,7 @@ MODEL_ASSIGNMENTS = {
     # policy_filter 폐지(사장 피드백 2026-05-18) — 역할 risk_guard 통합
     "post_manager": "deepseek/deepseek-v4-pro",     # 사장 지시 2026-05-24 — 매도 타이밍 결정자, kimi-k2.6에서 deepseek-v4-pro로 교체(안정성). ADMIN 오버라이드가 비더라도 이 기본값으로 적용
     "ops_support": "deepseek/deepseek-v4-pro",  # 사장 피드백 2026-05-15 — DeepSeek V4 Pro로 변경 (운용지원실장은 분류·조정만; 실제 코딩은 산하 팀장 워커가 수행)
+    "fund_planner": "deepseek/deepseek-v4-flash",   # 사장 지시 2026-05-28 — 매수 직후 thesis 4줄(목표가/손절가/계획 보유/사유) 구조적 출력. flash로 충분.
 }
 
 # ─── Risk Management Constants ──────────────────────────────────────────────
@@ -71,6 +72,7 @@ AGENT_MAX_TOKENS = {
     # policy_filter 폐지(2026-05-18)
     "post_manager":      12000,   # deepseek-v4-pro(2026-05-24 교체) — chief_orchestrator와 동일 모델·동일 토큰 한도
     "ops_support":        8000,   # 코드 변경 JSON + 근거 설명 (사장 지시 2026-05-14 — 토큰 한도 상향)
+    "fund_planner":       1200,   # 사장 지시 2026-05-28 — 4줄(목표가/손절가/계획 보유/사유) 정형 출력 + 한 단락 보강
 }
 ENABLE_PROMPT_CACHE = True            # Anthropic prompt caching via OpenRouter cache_control
 AGENT_HISTORY_TURNS = 3               # trailing history messages to resend (was 10)

@@ -16,6 +16,8 @@ from infra.user_context import REGISTRY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("APP")
+# KIS 실전 OpenAPI 기본 URL — 등록/검증 기본값. 한 곳에서 관리해 불일치를 막는다.
+DEFAULT_KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 app = FastAPI(title="ArQuant v1.0", version="1.0.0")
 # 계정 프로필 디렉토리 루트. 모듈 상수로 둬서 테스트가 격리(monkeypatch)할 수 있게 한다.
 # (과거 엔드포인트가 실경로를 직접 계산해 테스트가 실데이터 profiles/<uid> 를 삭제하던 버그 방지)
@@ -77,7 +79,7 @@ async def app_auth(request: Request, call_next):
 
 # ─── 자격증명 검증 (등록 시 — HYFE가 WQB/Gemini를 검증하던 것과 동치) ──────────
 async def _validate_kis(app_key: str, app_secret: str, base_url: str) -> tuple[bool, str]:
-    base_url = (base_url or "https://openapi.koreainvestment.com:9443").rstrip("/")
+    base_url = (base_url or DEFAULT_KIS_BASE_URL).rstrip("/")
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
             async with s.post(f"{base_url}/oauth2/tokenP",
@@ -152,6 +154,21 @@ async def _stop_uid(uid: int) -> None:
     if ctx.task and not ctx.task.done():
         ctx.task.cancel()
     ctx.task = None
+
+
+async def _decommission_uid(uid: int) -> None:
+    """유저 삭제/탈퇴 시 실행 주체를 완전히 종료한다 — 매매 루프 정지 → 컨텍스트 제거 →
+    프로필·데이터 디렉터리 정리. 루프를 '먼저' 멈춰야, rmtree 후 살아있는 루프가
+    profiles/<uid> 를 재생성(고아 부활)하거나 삭제된 유저 명의로 실주문을 내는 것을 막는다."""
+    import shutil
+    from infra import user_paths
+    await _stop_uid(uid)
+    try:
+        REGISTRY.drop(uid)
+    except Exception:
+        pass
+    shutil.rmtree(_PROFILES_DIR / str(uid), ignore_errors=True)
+    shutil.rmtree(user_paths.user_dir(uid), ignore_errors=True)
 
 # 사장 지시 2026-05-21: 모바일 푸시 알림 4종 ↔ 프로필 알림설정 키 매핑.
 # 모바일(네이티브 WsManager) 연결은 이 4종 이벤트만, 그것도 프로필 설정이 ON 인 것만 받는다.
@@ -238,7 +255,7 @@ class RegisterReq(BaseModel):
     kis_app_key: str
     kis_app_secret: str
     kis_account_no: str
-    kis_base_url: str = "https://openapi.koreainvestment.com:9443"
+    kis_base_url: str = DEFAULT_KIS_BASE_URL
     dart_key: str = ""              # 선택 — 없으면 공시 분석 생략
     label: str = ""
     remember: bool = True
@@ -507,9 +524,8 @@ async def profile_delete_account(req: DeleteAccountReq, request: Request):
         raise HTTPException(400, "ADMIN 계정은 탈퇴할 수 없습니다(단독 ADMIN 보호).")
     # Audit BEFORE deletion (need creds["username"])
     auth_store.audit("delete_account", username=creds["username"], ip=ip, outcome="ok", detail="")
-    import shutil
+    await _decommission_uid(uid)   # 루프 정지 → 컨텍스트 제거 → profiles/·data/ 정리 (고아 부활·잔존 거래 방지)
     auth_store.delete_user(uid)
-    shutil.rmtree(_PROFILES_DIR / str(uid), ignore_errors=True)
     resp = JSONResponse(content={"ok": True})
     resp.delete_cookie(auth_store.SESSION_COOKIE, path="/",
                        secure=_COOKIE_SECURE, httponly=True, samesite="lax")
@@ -539,9 +555,8 @@ async def admin_member_delete(req: AdminDeleteReq, request: Request):
         auth_store.audit("admin_delete_member", username=(req.username or "").strip(),
                          ip=_client_ip(request), outcome="fail", detail="admin_protected")
         raise HTTPException(400, "ADMIN 계정은 삭제할 수 없습니다(단독 ADMIN 보호).")
+    await _decommission_uid(target["id"])   # 루프 정지 → 컨텍스트 제거 → profiles/·data/ 정리
     auth_store.delete_user(target["id"])
-    import shutil
-    shutil.rmtree(_PROFILES_DIR / str(target["id"]), ignore_errors=True)
     auth_store.audit("admin_delete_member", username=target["username"],
                      ip=_client_ip(request), outcome="ok", detail=f"uid={target['id']}")
     return {"ok": True}
@@ -738,7 +753,7 @@ async def notif_settings_set(request: Request, req: dict):
     return {"ok": True, "settings": st}
 
 
-# ── Coresight 수신함 — ADMIN(hh09080) 전용 (Implementation.md §3.3) ───────────
+# ── Coresight 수신함 — ADMIN 전용 (Implementation.md §3.3) ───────────
 # 비관리자 → 403. 이 경로는 _PUBLIC_PATHS 에 포함되지 않는다 (인증 미들웨어 통과 필요).
 # GET /api/coresight/pending   — 미처리 Coresight 제안 목록
 # POST /api/coresight/approve  — 명시 승인 → standing_directive 추가 (자동 체결 금지)
@@ -809,9 +824,12 @@ async def admin_config_get(request: Request):
         "quant_analyst": "계량분석팀장 (정량평가)",
         "news_analyst": "뉴스분석팀장 (감성·이벤트)",
         "news_curator": "뉴스 크롤러 (헤드라인 선별)",
+        "news_classifier": "뉴스 분류기 (시장 매핑)",
+        "macro_researcher": "매크로 리서치 (Tavily 검색)",
         "trader": "트레이딩팀장 (주문·보고)",
         "risk_guard": "리스크관리실장 (DART 재심)",
         "post_manager": "사후관리실장 (매도 판단)",
+        "fund_planner": "펀드기획팀장 (진입 thesis)",
         "ops_support": "운용지원실장 (진단·조정)",
     }
     return {"model_overrides": cfg["model_overrides"],
@@ -882,17 +900,11 @@ async def admin_feedback_reply(req: _FeedbackReplyReq, request: Request):
     return {"ok": True, "item": e}
 
 
-@app.get("/api/admin/members")
-async def admin_members(request: Request):
-    _require_admin(request)
-    return {"members": auth_store.list_users()}
-
-
 @app.post("/api/admin/member")
 async def admin_member_set(request: Request, req: _AdminMemberReq):
     _require_admin(request)
     ok = auth_store.set_admin(req.user_id, req.is_admin)
-    return {"ok": ok, "members": auth_store.list_users()}
+    return {"ok": ok, "members": auth_store.list_members()}
 
 
 @app.get("/api/coresight/pending")
@@ -967,11 +979,15 @@ async def balance(request: Request):
         # (모바일 위젯·열린 탭이 /api/balance 를 장외에도 폴링하면 equity_curve 에 장외 포인트가
         #  쌓여 수익률 KPI 가 장외에도 갱신됐다. 주말 밤 US 시간대 오인 방지 위해 요일·휴장까지 본다.)
         if is_market_session_now():
-            try: record_equity(ctx.swarm.equity_path, snap["buying_power"], "poll")
-            except Exception: pass
+            try:
+                record_equity(ctx.swarm.equity_path, snap["buying_power"], "poll")
+            except Exception as e:
+                logger.warning(f"[balance] equity 기록 실패(uid={uid}): {e}")
         return {"buying_power": snap["buying_power"], "holdings": snap["holdings"],
                 "holdings_stale": snap.get("holdings_stale", False)}
-    except Exception:
+    except Exception as e:
+        # KIS 잔고 글리치/조회실패를 조용히 0으로 표시하면 자산곡선이 튄다(알려진 함정) — 로깅으로 표면화.
+        logger.warning(f"[balance] 조회 실패(uid={uid}) — buying_power 0 폴백: {e}")
         return {"buying_power": {"cash":0.0,"total_eval":0.0,"pnl_ratio":0.0,"ok":False}, "holdings": []}
 
 @app.get("/api/equity")
@@ -984,14 +1000,33 @@ async def equity(request: Request, limit: int = 500, view: str = "realtime"):
     ep = REGISTRY.get_or_create(_uid_or_403(request)).swarm.equity_path
     return {"series": get_equity_series(ep, limit, v), "view": v}
 
+async def _attach_current_fallback(base: dict, broker) -> dict:
+    """사장 지시 2026-05-28: equity_curve 가 비어도 '실계좌 총평가' 는 KIS 직조회로 폴백 표시.
+    base 가 이미 current 를 가지고 있으면(곡선 있음) 건드리지 않는다.
+    broker 호출 실패·0/음수는 fail-soft (current 박지 않음)."""
+    if base.get("current") is not None:
+        return base
+    try:
+        snap = await broker.portfolio_holdings()
+        bp = (snap or {}).get("buying_power") or {}
+        cur = float(bp.get("total_eval") or 0.0)
+        if cur > 0:
+            base["current"] = cur
+    except Exception:
+        pass    # fail-soft
+    return base
+
+
 @app.get("/api/performance")
 async def performance(request: Request):
     """수익률 탭 KPI 카드 — 누적·오늘·주·월 수익(원/%), MDD, 승률, 평균 보유일.
-    Phase 2: 요청 유저의 equity_curve 기준."""
+    Phase 2: 요청 유저의 equity_curve 기준.
+    사장 지시 2026-05-28: 곡선 비어도 현재 총평가는 broker 폴백으로 항상 표시."""
     from main_swarm import performance_kpis
     uid = _uid_or_403(request)
-    ep = REGISTRY.get_or_create(uid).swarm.equity_path
-    return performance_kpis(ep, uid=uid)
+    ctx = REGISTRY.get_or_create(uid)
+    base = performance_kpis(ctx.swarm.equity_path, uid=uid)
+    return await _attach_current_fallback(base, ctx.broker)
 
 @app.get("/api/benchmark")
 async def benchmark(request: Request, view: str = "daily"):

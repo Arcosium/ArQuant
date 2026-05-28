@@ -29,3 +29,7 @@ def cost_rollup_path(uid: int) -> Path:
 
 def running_marker(uid: int) -> Path:
     return user_dir(uid) / ".running"
+
+
+def position_thesis_path(uid: int) -> Path:
+    return user_dir(uid) / "position_thesis.json"

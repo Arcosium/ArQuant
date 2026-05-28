@@ -70,6 +70,31 @@ data/news_history.json
 data/directive_tombstones.json
 
 # ============================================================================
+# ADMIN/유저 런타임 설정 (사장 지시 2026-05-28)
+#   git 추적되면 자동 백업 도구의 git reset 이 매 재시작 시 초깃값으로 되돌려,
+#   사장님이 UI에서 변경한 모델 오버라이드·뉴스 크롤 주기·알림 설정 등이 회귀했다.
+#   디스크에는 영속, git 추적만 해제.
+# ============================================================================
+data/admin_config.json
+data/api_cost_mode.json
+data/notif_settings.json
+data/ops_feedback.json
+data/ops_history.json
+data/api_cost_rollup.json
+data/usdkrw_fx.json
+data/strategy_history.json
+data/news_classifier.db
+data/auth_audit.log
+data/weekly_review.log
+data/ops_support.log
+data/ops_support.spawn.log
+# Per-uid 런타임 디렉토리 — equity_curve, trade_log, .running, token, thesis 등 모두 런타임 상태
+data/[0-9]*/
+# Per-uid 리셋 백업
+data/_reset_backup/
+data/_migration_backup_*/
+
+# ============================================================================
 # 로그 / 임시
 # ============================================================================
 *.log

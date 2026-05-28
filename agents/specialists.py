@@ -3,6 +3,10 @@ NPS Swarm v1.0 - Specialist Agents
 Overseas Equity Department: Quant Analyst, News Analyst, Trader
 Each agent has a carefully crafted system prompt and bound tools.
 """
+import re as _re
+from datetime import datetime as _datetime
+from typing import Any, Dict, List
+
 from agents.base_agent import BaseAgent
 
 
@@ -294,6 +298,132 @@ def create_post_manager(injection=None) -> BaseAgent:
 - analyze_stock_technical: 보유 종목 기술적 분석"""
         + _coresight_tool_line("과거 매도 판단 기록 조회", injection),
     )
+
+
+def create_fund_planner(injection=None) -> BaseAgent:
+    """펀드기획팀장(Fund Planner) — 사후관리실장 산하의 진입 thesis 설정·상기 역할.
+
+    사장 지시 2026-05-28 (우선순위 3 단독 적용):
+      - **매수 직후**: 종목별로 목표가/손절가/계획 보유기간/진입 사유를 4줄 정형으로 제시.
+      - **사후관리실장 매도 판단 직전**: 보유 종목별 저장된 thesis 를 상기시켜 무계획 단타를 막는다.
+
+    Plan 출력은 정형 4줄이므로 deterministic regex 로 파싱(=> parse_fund_plan)."""
+    return BaseAgent(
+        name="펀드기획팀장",
+        role="fund_planner",
+        model_key="fund_planner",
+        injection=injection,
+        system_prompt="""당신은 ArQuant v1.0의 '펀드기획팀장(Fund Planner)'입니다.
+사후관리실장 산하 — 진입 시점에 thesis 를 박아두고, 매도 판단 직전 상기시켜 무계획 단타 매매를 막는 역할을 합니다.
+
+## plan 모드 (매수 체결 직후 호출됨)
+입력: 종목, 체결가, 매수 사유(운용전략실장 권고), 계량팀 리포트 요약, 뉴스 요약.
+
+응답은 반드시 다음 4줄 (다른 부연 없이):
+  목표가: <숫자>
+  손절가: <숫자>
+  계획 보유기간: <시간>h
+  진입 사유 요약: <한 줄, 100자 이내>
+
+원칙:
+- 목표가는 체결가 대비 +3~+10%. 계량팀이 시사한 저항·목표를 우선 반영.
+- 손절가는 체결가 대비 -3~-7%. 단기 변동성·지지선 고려.
+- 계획 보유기간은 진입 성격에 따라 24h(데이트레이드성)~168h(스윙). 매크로·계량 모두 보강 시 더 길게.
+- 모든 가격 값은 숫자만 (단위·구두점 없이; 콤마는 허용).
+- KR 종목은 원, US 종목은 달러.
+
+## remind 모드
+사후관리실장 매도 판단 직전, 보유 종목별로 저장된 thesis 를 그대로 상기시킵니다 (별도 LLM 호출 없이 코드가 포맷).""",
+    )
+
+
+# ── 펀드기획팀장 출력 파서 + 리마인더 포맷터 ────────────────────────────────────
+# plan 출력은 정형이므로 deterministic regex.  remind 는 LLM 호출 없이 stored thesis 만 포맷(비용 절감 + 안정).
+
+_FUND_PLAN_PATTERNS = {
+    "target_price":        _re.compile(r"목표가\s*[:：]\s*([0-9.,]+)"),
+    "stop_price":          _re.compile(r"손절가\s*[:：]\s*([0-9.,]+)"),
+    "planned_hold_hours":  _re.compile(r"계획\s*보유(?:기간)?\s*[:：]\s*([0-9.]+)\s*h", _re.IGNORECASE),
+    "entry_reason":        _re.compile(r"진입\s*사유\s*요약\s*[:：]\s*(.+)"),
+}
+
+
+def parse_fund_plan(text: str) -> Dict[str, Any]:
+    """펀드기획팀장 plan 응답 → 구조화. 필드 누락 시 None(호출부가 폴백)."""
+    out: Dict[str, Any] = {"target_price": None, "stop_price": None,
+                           "planned_hold_hours": None, "entry_reason": ""}
+    for line in (text or "").splitlines():
+        for field, pat in _FUND_PLAN_PATTERNS.items():
+            m = pat.search(line)
+            if not m:
+                continue
+            raw = m.group(1).strip()
+            if field == "entry_reason":
+                out[field] = raw[:200]
+            elif field == "planned_hold_hours":
+                try:
+                    out[field] = float(raw)
+                except ValueError:
+                    pass
+            else:
+                try:
+                    out[field] = float(raw.replace(",", ""))
+                except ValueError:
+                    pass
+            break
+    return out
+
+
+def _hours_between(ts_a: str, ts_b: str) -> float:
+    """KST ISO 문자열('YYYY-MM-DD HH:MM:SS' 또는 '...:SS+09:00') 사이 시간(시간 단위)."""
+    fmts = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
+    def _p(s: str):
+        s = (s or "").split("+")[0].strip()
+        for f in fmts:
+            try:
+                return _datetime.strptime(s, f)
+            except ValueError:
+                continue
+        return None
+    a, b = _p(ts_a), _p(ts_b)
+    if not a or not b:
+        return 0.0
+    return (b - a).total_seconds() / 3600.0
+
+
+def format_thesis_reminder(theses: Dict[str, Dict[str, Any]],
+                            holdings: List[Dict[str, Any]],
+                            now_iso: str) -> str:
+    """저장된 thesis 를 사후관리실장 프롬프트에 주입할 텍스트로 변환.
+    매칭 thesis 가 없으면 빈 문자열 (호출부가 그냥 안 넣음)."""
+    if not theses or not holdings:
+        return ""
+    lines: List[str] = ["📌 펀드기획팀장 — 진입 thesis 상기 (매수 시점에 박아둔 계획. 이를 토대로 매도 판단):"]
+    for h in holdings:
+        code = str(h.get("code", "")).strip()
+        if code not in theses:
+            continue
+        t = theses[code]
+        name = h.get("name") or code
+        entry_p = float(t.get("entry_price") or 0.0)
+        target = float(t.get("target_price") or 0.0)
+        stop = float(t.get("stop_price") or 0.0)
+        hold_h = float(t.get("planned_hold_hours") or 0.0)
+        reason = (t.get("entry_reason") or "").strip()
+        entry_ts = t.get("entry_ts") or ""
+        cur_price = float(h.get("cur_price") or 0.0)
+        hours_held = _hours_between(entry_ts, now_iso) if entry_ts else 0.0
+        over_hold = (hold_h > 0 and hours_held > hold_h)
+        target_reached = (target > 0 and cur_price >= target)
+        stop_hit = (stop > 0 and cur_price > 0 and cur_price <= stop)
+        bits = [f"- {name}({code}): {entry_ts} 매수 @{entry_p:,.0f}",
+                f"목표 {target:,.0f}{' ✅도달' if target_reached else ''}",
+                f"손절 {stop:,.0f}{' ❗터치' if stop_hit else ''}",
+                f"계획 보유 {hold_h:.0f}h, 현재 보유 {hours_held:.1f}h{' (초과)' if over_hold else ''}"]
+        lines.append(" | ".join(bits))
+        if reason:
+            lines.append(f"    진입 사유: {reason}")
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def create_ops_support(injection=None) -> BaseAgent:

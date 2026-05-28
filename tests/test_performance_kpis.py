@@ -22,34 +22,26 @@ def test_empty_equity_returns_no_data():
     assert k["has_trades"] is False
 
 
-def test_cumulative_and_mdd():
-    # 100만 → 90만(낙폭) → 110만
+def test_equity_current_and_mdd():
+    # 100만 → 90만(낙폭) → 110만. 평가곡선 기반 current·MDD 는 유지(자산가치 추이/낙폭).
+    # 누적 수익률(cumulative)은 이제 체결 실현손익 기반이라, 거래가 없으면 0.
     raw = [_pt(18, "10:00", 1_000_000), _pt(19, "10:00", 900_000), _pt(20, "10:00", 1_100_000)]
     now = datetime(2026, 5, 20, 15, 0, tzinfo=KST)
     k = ms.performance_kpis(raw_equity=raw, trades=[], now=now)
     assert k["has_equity"] is True
     assert k["current"] == 1_100_000
-    assert k["cumulative_pnl"] == 100_000
-    assert k["cumulative_pct"] == pytest.approx(10.0, abs=1e-6)
-    # 최저점 90만이 직전 고점 100만 대비 -10% → MDD -10%
+    # 최저점 90만이 직전 고점 100만 대비 -10% → MDD -10% (평가곡선 기준)
     assert k["mdd_pct"] == pytest.approx(-10.0, abs=1e-6)
+    # 체결 없음 → 실현 수익률 0 (잔고곡선 +10% 와 분리)
+    assert k["cumulative_pnl"] == pytest.approx(0.0, abs=1e-6)
 
 
-def test_today_pnl_uses_prev_day_close_as_base():
-    # 어제 마감 100만, 오늘 105만 → 오늘 +5만(+5%)
-    raw = [_pt(19, "14:00", 1_000_000), _pt(20, "10:00", 1_050_000)]
-    now = datetime(2026, 5, 20, 11, 0, tzinfo=KST)
-    k = ms.performance_kpis(raw_equity=raw, trades=[], now=now)
-    assert k["today_pnl"] == pytest.approx(50_000, abs=1e-6)
-    assert k["today_pct"] == pytest.approx(5.0, abs=1e-6)
-
-
-def test_external_flow_excluded_from_pnl():
-    # total 100만 → 200만 이지만 100만은 입금(external_flow_cum) → 보정값은 100만으로 변동 없음
+def test_external_flow_excluded_from_equity_current():
+    # total 100만 → 200만 이지만 100만은 입금(external_flow_cum) → 평가곡선 보정 current 는 100만.
     raw = [_pt(19, "10:00", 1_000_000, ext=0.0), _pt(20, "10:00", 2_000_000, ext=1_000_000)]
     now = datetime(2026, 5, 20, 12, 0, tzinfo=KST)
     k = ms.performance_kpis(raw_equity=raw, trades=[], now=now)
-    assert k["cumulative_pnl"] == pytest.approx(0.0, abs=1e-6)
+    assert k["current"] == pytest.approx(1_000_000, abs=1e-6)
 
 
 def test_win_rate_and_hold_days_from_trades():

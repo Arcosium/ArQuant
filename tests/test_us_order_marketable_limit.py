@@ -188,12 +188,23 @@ def test_us_buy_success_is_not_flagged_as_failure(monkeypatch):
     assert _accepted(res), f"정상(rt_cd=0)은 accepted 여야: {res!r}"
 
 
-def test_us_buy_explicit_limit_price_is_honored(monkeypatch):
-    """명시 지정가가 오면 그대로 사용(시세 폴백 불필요)."""
-    b, fake = _broker_with_fakes(monkeypatch, last_price=999.0)
+def test_us_buy_explicit_marketable_limit_is_honored(monkeypatch):
+    """명시 지정가가 체결가능(매수: 시세 이상)이면 그대로 사용. (사장 결정 2026-05-28)"""
+    b, fake = _broker_with_fakes(monkeypatch, last_price=27.00)
 
     asyncio.run(b.us_buy("UUP", 3, price=27.12))
 
     body = fake.posted[-1]["json"]
     assert float(body["OVRS_ORD_UNPR"]) == pytest.approx(27.12, abs=0.01)
     assert body["ORD_QTY"] == "3"
+
+
+def test_us_buy_explicit_nonmarketable_limit_is_clamped(monkeypatch):
+    """명시 매수 지정가가 시세 아래(미체결)면 체결가능 가격으로 클램프해 전송한다 —
+    실계좌 US 미체결 누적 해소(2026-05-28 로그 리뷰: SOFI $15.50 vs 시세 16.13 류)."""
+    b, fake = _broker_with_fakes(monkeypatch, last_price=16.13)
+
+    asyncio.run(b.us_buy("UUP", 1, price=15.50))
+
+    body = fake.posted[-1]["json"]
+    assert float(body["OVRS_ORD_UNPR"]) >= 16.13, "시세 아래 매수 지정가는 체결가능 가격으로 올려야 한다"
