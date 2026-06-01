@@ -419,7 +419,10 @@ async def llm_classify_articles(articles: List[Dict], model: str = "alibaba/tong
     if not OPENROUTER_API_KEY:
         return {}
     try:
-        model = MODEL_ASSIGNMENTS.get("news_classifier", model) or model
+        # 사장 지시 2026-05-30: ADMIN 모델 오버라이드 우선 — 그동안 config 만 읽어 오버라이드를
+        # 무시했다(BaseAgent 와 통일). 오버라이드 없으면 config news_classifier → 기존 기본값 폴백.
+        from infra import admin_config
+        model = admin_config.resolve_model("news_classifier", model) or model
         max_tokens = AGENT_MAX_TOKENS.get("news_classifier", max_tokens) or max_tokens
     except Exception:
         pass

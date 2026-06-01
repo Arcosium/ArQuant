@@ -32,6 +32,23 @@ def get_model_override(model_key: str) -> str:
     return str((_read().get("model_overrides") or {}).get(model_key) or "").strip()
 
 
+def resolve_model(model_key: str, default: str = "") -> str:
+    """이 model_key 의 실제 사용 모델 — ADMIN 오버라이드 우선, 없으면 config 기본값, 그것도 없으면 default.
+    사장 지시 2026-05-30: 매크로 리서치(deep_research)·뉴스 분류기(llm_classify_articles)는
+    BaseAgent 가 아니라 tool 함수라 그동안 config.MODEL_ASSIGNMENTS 만 읽어 ADMIN 모델 오버라이드를
+    '무시'했다(사장이 모델을 바꿔도 재시작 후 늘 config 기본값으로 보임). BaseAgent(base_agent.py)와
+    동일한 우선순위를 이 헬퍼로 통일해 두 tool 에도 오버라이드가 먹히게 한다."""
+    ov = get_model_override(model_key)
+    if ov:
+        return ov
+    try:
+        from config import MODEL_ASSIGNMENTS
+        cfg = str(MODEL_ASSIGNMENTS.get(model_key) or "").strip()
+    except Exception:
+        cfg = ""
+    return cfg or default
+
+
 def news_crawl_interval(default_sec: int) -> int:
     """뉴스 크롤 주기(초). 0/미설정이면 config 기본값을 그대로 쓴다."""
     try:

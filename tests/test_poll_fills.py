@@ -120,3 +120,86 @@ def test_baseline_prevents_false_positive(_fast_and_silent):
 
     assert o._trades_executed == 0, "보유 변동이 없으면(미체결) 카운트되면 안 된다"
     assert [e for e in _fast_and_silent if e.get("type") == "trade_executed"] == []
+
+
+# ── KR/US 비대칭 버그 수정 (2026-05-29): US 비동기 체결도 thesis 기록 ──────────────
+# 기존엔 thesis 가 동기 실행부 `if filled:` 에서만 기록돼 US(폴링 확정)는 영원히 누락됐다.
+# → 펀드기획팀장이 매도 직전 상기시킬 thesis 가 0건 → 사후관리실장 무계획 단타 차단 실패.
+# 수정: 폴링 확정 경로에서도 매수 체결 시 _record_buy_thesis 를 호출한다.
+
+def test_poll_buy_fill_records_thesis(_fast_and_silent):
+    """US 비동기 매수가 폴링에서 체결 확인되면 펀드기획팀장 thesis 가 기록돼야 한다."""
+    broker = _FakeBroker(kr_after=[],
+                         us_after=[{"code": "XOM", "qty": 3, "avg_price": 100.0, "cur_price": 101.0}])
+    o = _orch(broker, trades_executed=0)
+    recorded = {}
+
+    async def _fake_record(rec, cyc):
+        recorded["rec"] = rec
+
+    o._record_buy_thesis = _fake_record
+    cyc = type("C", (), {"quant_report": "q", "news_report": "n", "order_obj": {}})()
+    pending = [{"ticker": "XOM", "side": "buy", "qty": 3}]
+
+    asyncio.run(o._poll_fills_until_confirmed(pending, baseline_holdings=[], cyc=cyc))
+
+    assert recorded.get("rec"), "폴링 체결 확인 시 _record_buy_thesis 가 호출돼야 한다"
+    assert recorded["rec"]["ticker"] == "XOM"
+    assert recorded["rec"]["side"] == "buy" and recorded["rec"]["ok"] is True
+
+
+def test_poll_sell_fill_does_not_record_thesis(_fast_and_silent):
+    """매도 체결은 thesis 를 기록하지 않는다 (thesis 는 진입 시점에만)."""
+    broker = _FakeBroker(kr_after=[], us_after=[])  # 3주 → 0주: 매도 체결
+    o = _orch(broker, trades_executed=0)
+    called = {"n": 0}
+
+    async def _fake_record(rec, cyc):
+        called["n"] += 1
+
+    o._record_buy_thesis = _fake_record
+    cyc = type("C", (), {"quant_report": "", "news_report": "", "order_obj": {}})()
+    pending = [{"ticker": "XOM", "side": "sell", "qty": 3}]
+    baseline = [{"code": "XOM", "qty": 3, "avg_price": 100.0, "cur_price": 101.0}]
+
+    asyncio.run(o._poll_fills_until_confirmed(pending, baseline_holdings=baseline, cyc=cyc))
+
+    assert called["n"] == 0, "매도 체결에는 thesis 기록을 호출하면 안 된다"
+
+
+def test_poll_without_cyc_still_works(_fast_and_silent):
+    """cyc 미전달(기존 호출부 호환): thesis 기록은 생략하되 체결 카운트는 정상."""
+    broker = _FakeBroker(kr_after=[], us_after=[{"code": "XOM", "qty": 3}])
+    o = _orch(broker, trades_executed=0)
+    pending = [{"ticker": "XOM", "side": "buy", "qty": 3}]
+
+    asyncio.run(o._poll_fills_until_confirmed(pending, baseline_holdings=[]))
+
+    assert o._trades_executed == 1
+
+
+def test_record_buy_thesis_skips_if_already_exists(monkeypatch):
+    """중복가드: 이미 thesis 가 있으면 LLM 호출도 재기록도 하지 않는다
+    (동기/폴링 양 경로가 같은 종목을 중복 기록하지 않게)."""
+    import infra.position_thesis as pt
+    o = object.__new__(ArquantOrchestrator)
+    o.uid = 1
+    called = {"think": 0}
+
+    class _FP:
+        async def think(self, p):
+            called["think"] += 1
+            return "목표가: 110\n손절가: 95\n계획 보유기간: 48h\n진입 사유 요약: x"
+
+    o.fund_planner = _FP()
+    monkeypatch.setattr(pt, "get", lambda uid, code: {"entry_ts": "기존"})  # 이미 존재
+    recorded = []
+    monkeypatch.setattr(pt, "record", lambda uid, code, th: recorded.append(code))
+    rec = {"ticker": "XOM", "side": "buy", "ok": True,
+           "fill_price": 100.0, "fill_currency": "USD", "avg_cost": 100.0}
+    cyc = type("C", (), {"quant_report": "", "news_report": "", "order_obj": {}})()
+
+    asyncio.run(o._record_buy_thesis(rec, cyc))
+
+    assert called["think"] == 0, "이미 thesis 있으면 LLM 호출 skip"
+    assert recorded == [], "이미 thesis 있으면 재기록 skip"

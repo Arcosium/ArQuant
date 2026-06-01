@@ -119,6 +119,10 @@ TRIM_OVER_RATIO       = True          # if a holding's notional exceeds CONSERVA
 ALLOW_DAY_TRADING     = True
 # 0.5일 미만 회피가 켜졌을 때(ALLOW_DAY_TRADING=False) 적용되는 최소 보유일.
 MIN_HOLDING_DAYS_FOR_SELL = 0.5
+# 사장 지시 2026-05-29: 펀드기획실장 거부권 — 진입 thesis(목표·손절·계획 보유기간) 대비
+# 계획기간 미경과 + 소폭이익 + 손절·목표 미해당인 매도결정을 '보유'로 결정론적 보류(무계획 단타 차단).
+# 손절·손실·목표도달·계획기간 경과 매도는 비차단. ALLOW_DAY_TRADING=True 면 거부권 비활성(결합).
+THESIS_VETO_ENABLED   = True
 
 # When no target is affordable with available cash, look for a cheaper liquid name in whatever
 # market is tradeable right now (KR session → KRX volume rank; US session → the shortlist below).
@@ -153,7 +157,7 @@ STRATEGY_TUNABLE_KEYS = [
     "CONSERVATIVE_MDD", "CONSERVATIVE_STOCK_RATIO",
     "MAX_TRADES_PER_CYCLE", "MAX_ORDER_QTY",
     "ENABLE_SELL_REBALANCE", "TAKE_PROFIT_PCT", "STOP_LOSS_PCT", "TRIM_OVER_RATIO",
-    "ALLOW_DAY_TRADING", "MIN_HOLDING_DAYS_FOR_SELL",
+    "ALLOW_DAY_TRADING", "MIN_HOLDING_DAYS_FOR_SELL", "THESIS_VETO_ENABLED",
     "ENABLE_CHEAP_FALLBACK", "ALLOW_US_STOCKS", "ALLOW_DERIVATIVES",
 ]
 
@@ -207,6 +211,10 @@ STRATEGY_KEY_META = {
     "MIN_HOLDING_DAYS_FOR_SELL":  {"label": "최소 보유일 (데이트레이딩 OFF일 때만)", "type": "pct_raw", "unit": "일",
                                    "help": "데이트레이딩 비허용 시 이 일수 미만 보유 종목은 매도 회피 (사후관리실장)",
                                    "min": 0, "max": 30, "step": 0.5, "group": "매도 규칙"},
+    "THESIS_VETO_ENABLED":        {"label": "펀드기획실장 거부권 (무계획 단타 차단)", "type": "bool",
+                                   "help": "진입 thesis 대비 계획기간 미경과·소폭이익·손절목표 미해당 매도결정을 '보유'로 보류. "
+                                           "데이트레이딩 허용 시 자동 비활성. 손절·손실·목표·계획기간 경과 매도는 비차단",
+                                   "group": "매도 규칙"},
     "ENABLE_CHEAP_FALLBACK":      {"label": "최종 종목 매수 불가 시 저가 대체 종목 매수", "type": "bool",
                                    "help": "OFF 권장 — 후보 모두 예산 초과 시 거래량 상위 저가주를 대신 매수",
                                    "group": "기타"},
@@ -223,31 +231,31 @@ STRATEGY_PRESETS = {
         "PER_ORDER_BUDGET_RATIO": 0.03, "PER_ORDER_BUDGET_OVERSHOOT": 1.05, "MAX_CYCLE_BUDGET_RATIO": 0.10, "MIN_CASH_BUFFER": 1.20,
         "CONSERVATIVE_MDD": 0.025, "CONSERVATIVE_STOCK_RATIO": 0.07, "MAX_TRADES_PER_CYCLE": 1, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 6.0, "STOP_LOSS_PCT": 3.5, "TRIM_OVER_RATIO": True,
-        "ALLOW_DAY_TRADING": False, "MIN_HOLDING_DAYS_FOR_SELL": 1.0,
+        "ALLOW_DAY_TRADING": False, "MIN_HOLDING_DAYS_FOR_SELL": 1.0, "THESIS_VETO_ENABLED": True,
         "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": False, "ALLOW_DERIVATIVES": False},
     "conservative": {"label": "보수형 — 작게, 손절 빠르게, 사이클 드물게",
         "PER_ORDER_BUDGET_RATIO": 0.05, "PER_ORDER_BUDGET_OVERSHOOT": 1.10, "MAX_CYCLE_BUDGET_RATIO": 0.15, "MIN_CASH_BUFFER": 1.15,
         "CONSERVATIVE_MDD": 0.04, "CONSERVATIVE_STOCK_RATIO": 0.10, "MAX_TRADES_PER_CYCLE": 1, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 8.0, "STOP_LOSS_PCT": 5.0, "TRIM_OVER_RATIO": True,
-        "ALLOW_DAY_TRADING": False, "MIN_HOLDING_DAYS_FOR_SELL": 0.5,
+        "ALLOW_DAY_TRADING": False, "MIN_HOLDING_DAYS_FOR_SELL": 0.5, "THESIS_VETO_ENABLED": True,
         "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": False, "ALLOW_DERIVATIVES": False},
     "balanced": {"label": "균형형 — 기본값 (권장)",
         "PER_ORDER_BUDGET_RATIO": 0.10, "PER_ORDER_BUDGET_OVERSHOOT": 1.20, "MAX_CYCLE_BUDGET_RATIO": 0.25, "MIN_CASH_BUFFER": 1.10,
         "CONSERVATIVE_MDD": 0.05, "CONSERVATIVE_STOCK_RATIO": 0.15, "MAX_TRADES_PER_CYCLE": 2, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 12.0, "STOP_LOSS_PCT": 5.0, "TRIM_OVER_RATIO": True,
-        "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.5,
+        "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.5, "THESIS_VETO_ENABLED": True,
         "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False},
     "aggressive": {"label": "공격형 — 크게, 길게 보유, 사이클 잦게",
         "PER_ORDER_BUDGET_RATIO": 0.20, "PER_ORDER_BUDGET_OVERSHOOT": 1.30, "MAX_CYCLE_BUDGET_RATIO": 0.40, "MIN_CASH_BUFFER": 1.05,
         "CONSERVATIVE_MDD": 0.08, "CONSERVATIVE_STOCK_RATIO": 0.25, "MAX_TRADES_PER_CYCLE": 3, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 18.0, "STOP_LOSS_PCT": 10.0, "TRIM_OVER_RATIO": False,
-        "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.0,
+        "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.0, "THESIS_VETO_ENABLED": True,
         "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False},
     "ultra_aggressive": {"label": "초공격형 — 최대 베팅·고위험 고리워드",
         "PER_ORDER_BUDGET_RATIO": 0.35, "PER_ORDER_BUDGET_OVERSHOOT": 1.50, "MAX_CYCLE_BUDGET_RATIO": 0.70, "MIN_CASH_BUFFER": 1.02,
         "CONSERVATIVE_MDD": 0.15, "CONSERVATIVE_STOCK_RATIO": 0.40, "MAX_TRADES_PER_CYCLE": 5, "MAX_ORDER_QTY": 0,
         "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 30.0, "STOP_LOSS_PCT": 15.0, "TRIM_OVER_RATIO": False,
-        "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.0,
+        "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.0, "THESIS_VETO_ENABLED": True,
         "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False},
 }
 DEFAULT_STRATEGY = "balanced"

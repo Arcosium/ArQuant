@@ -301,20 +301,23 @@ def create_post_manager(injection=None) -> BaseAgent:
 
 
 def create_fund_planner(injection=None) -> BaseAgent:
-    """펀드기획팀장(Fund Planner) — 사후관리실장 산하의 진입 thesis 설정·상기 역할.
+    """펀드기획실장(Fund Planner) — 진입 thesis 설정·거부권 보유 (사장 승진 2026-05-29).
 
-    사장 지시 2026-05-28 (우선순위 3 단독 적용):
+    사장 지시 2026-05-28 (우선순위 3 단독 적용) + 2026-05-29 실장 승격:
       - **매수 직후**: 종목별로 목표가/손절가/계획 보유기간/진입 사유를 4줄 정형으로 제시.
       - **사후관리실장 매도 판단 직전**: 보유 종목별 저장된 thesis 를 상기시켜 무계획 단타를 막는다.
+      - **거부권(2026-05-29)**: 계획기간 미경과·소폭이익·손절목표 미해당 매도결정을 결정론적으로
+        '보유'로 보류(=> apply_thesis_veto). 손절·손실·목표·계획기간 경과 매도는 비차단.
 
     Plan 출력은 정형 4줄이므로 deterministic regex 로 파싱(=> parse_fund_plan)."""
     return BaseAgent(
-        name="펀드기획팀장",
+        name="펀드기획실장",
         role="fund_planner",
         model_key="fund_planner",
         injection=injection,
-        system_prompt="""당신은 ArQuant v1.0의 '펀드기획팀장(Fund Planner)'입니다.
-사후관리실장 산하 — 진입 시점에 thesis 를 박아두고, 매도 판단 직전 상기시켜 무계획 단타 매매를 막는 역할을 합니다.
+        system_prompt="""당신은 ArQuant v1.0의 '펀드기획실장(Fund Planner)'입니다.
+진입 시점에 thesis 를 박아두고, 매도 판단 직전 상기시켜 무계획 단타 매매를 막습니다.
+계획기간 미경과·소폭이익·손절목표 미해당 매도는 거부권으로 '보유' 보류할 수 있습니다(사장 승진 2026-05-29).
 
 ## plan 모드 (매수 체결 직후 호출됨)
 입력: 종목, 체결가, 매수 사유(운용전략실장 권고), 계량팀 리포트 요약, 뉴스 요약.
@@ -398,7 +401,7 @@ def format_thesis_reminder(theses: Dict[str, Dict[str, Any]],
     매칭 thesis 가 없으면 빈 문자열 (호출부가 그냥 안 넣음)."""
     if not theses or not holdings:
         return ""
-    lines: List[str] = ["📌 펀드기획팀장 — 진입 thesis 상기 (매수 시점에 박아둔 계획. 이를 토대로 매도 판단):"]
+    lines: List[str] = ["📌 펀드기획실장 — 진입 thesis 상기 (매수 시점에 박아둔 계획. 이를 토대로 매도 판단):"]
     for h in holdings:
         code = str(h.get("code", "")).strip()
         if code not in theses:
@@ -424,6 +427,60 @@ def format_thesis_reminder(theses: Dict[str, Dict[str, Any]],
         if reason:
             lines.append(f"    진입 사유: {reason}")
     return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def apply_thesis_veto(theses: Dict[str, Dict[str, Any]],
+                       holdings: List[Dict[str, Any]],
+                       sell_directives: Dict[str, str],
+                       now_iso: str,
+                       *, enabled: bool = True,
+                       allow_day_trading: bool = False):
+    """펀드기획실장 거부권 — 사후관리실장 매도결정을 결정론적으로 검증한다.
+
+    계획 보유기간 미경과 + 소폭이익 + 손절·목표 미해당인 매도결정을 '보유'로 오버라이드해
+    무계획 단타를 차단한다. 손절(손실)·목표도달·계획기간 경과 매도는 그대로 둔다
+    (손실 가두기 방지 / 정상 청산 보장). 매수 반려와 동급의 '의사결정 오버라이드'이며,
+    조용한 주문 누락이 아니라 반환된 메시지로 투명하게 공개한다.
+
+    Returns (new_directives, [veto_msg, ...]). 거부권 없으면 messages 는 빈 리스트."""
+    if not enabled or allow_day_trading or not theses or not sell_directives:
+        return dict(sell_directives or {}), []
+    holdings_by_code = {str(h.get("code", "")).strip(): h for h in (holdings or [])}
+    out = dict(sell_directives)
+    vetoes: List[str] = []
+    for code, directive in sell_directives.items():
+        c = str(code).strip()
+        if directive == "보유":
+            continue
+        t = theses.get(c)
+        h = holdings_by_code.get(c)
+        if not t or not h:
+            continue
+        cur = float(h.get("cur_price") or 0.0)
+        entry = float(t.get("entry_price") or 0.0)
+        if cur <= 0 or entry <= 0:
+            continue  # 평가 불가 → PM 결정 존중
+        target = float(t.get("target_price") or 0.0)
+        stop = float(t.get("stop_price") or 0.0)
+        hold_h = float(t.get("planned_hold_hours") or 0.0)
+        entry_ts = t.get("entry_ts") or ""
+        hours_held = _hours_between(entry_ts, now_iso) if entry_ts else 0.0
+        if stop > 0 and cur <= stop:
+            continue  # 손절 터치 → 매도 허용
+        if target > 0 and cur >= target:
+            continue  # 목표 도달 → 매도 허용
+        if hold_h > 0 and hours_held >= hold_h:
+            continue  # 계획 보유기간 경과 → 매도 허용
+        if cur <= entry:
+            continue  # 손실 종목 → 손절성 매도이므로 비차단
+        # 계획기간 미경과 + 소폭이익 + 손절·목표 미해당 → 거부권 발동
+        name = h.get("name") or c
+        out[c] = "보유"
+        vetoes.append(
+            f"📛 펀드기획실장 거부권 발동 — {name}({c}) 매도결정 '{directive}' → '보유'로 보류. "
+            f"계획 보유 {hold_h:.0f}h 중 {hours_held:.1f}h 경과, 현재가 {cur:,.2f}는 "
+            f"목표 {target:,.2f}·손절 {stop:,.2f} 미해당. 계획 없는 소폭이익 단타로 판단.")
+    return out, vetoes
 
 
 def create_ops_support(injection=None) -> BaseAgent:

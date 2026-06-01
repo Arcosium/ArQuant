@@ -528,16 +528,40 @@ class KISBroker:
                 "holdings": holdings, "ok": bool(d.get("ok")), "ts": now}
         # Keep last-good holdings if this read succeeded structurally but came back empty while
         # total_eval clearly implies positions exist (transient KIS quirk) — avoids UI flicker.
-        if cached and not holdings and total > cash + self._HOLDINGS_GLITCH_MIN_GAP and cached.get("holdings"):
-            snap["holdings"] = cached["holdings"]
+        # 직전 정상 보유목록: in-memory 우선, 없으면(재시작 콜드스타트) 디스크 캐시로 폴백(사장 제보 2026-05-29).
+        _prev_h = (cached.get("holdings") if cached else None)
+        _prev_total = float((cached.get("buying_power") or {}).get("total_eval") or 0.0) if cached else 0.0
+        if not _prev_h:
+            _dh, _dt, _dts = self._get_holdings_cache()
+            if _dh and (now - _dts) < self._HOLDINGS_CACHE_TTL:
+                _prev_h = _dh
+                if _prev_total <= 0:
+                    _prev_total = _dt
+        if snap["ok"] and not holdings and total > cash + self._HOLDINGS_GLITCH_MIN_GAP and _prev_h:
+            snap["holdings"] = _prev_h
             snap["holdings_stale"] = True
             # 사장 지시 2026-05-21: KIS가 보유목록을 빈 채 주면서 nass_amt(총평가)를 부풀려
             # 반환하는 글리치 폴(보유=0인데 총평가−예수금이 큼) → 자산곡선·주문 사이징이 튄다.
-            # 보유목록뿐 아니라 총평가도 직전 정상 스냅샷 값으로 유지해 안정화한다.
-            prev_total = float((cached.get("buying_power") or {}).get("total_eval") or 0.0)
-            if prev_total > 0:
-                snap["buying_power"]["total_eval"] = prev_total
+            # 보유목록뿐 아니라 총평가도 직전 정상 값으로 유지해 안정화한다.
+            if _prev_total > 0:
+                snap["buying_power"]["total_eval"] = _prev_total
                 snap["buying_power"]["total_stale"] = True
+        elif not snap["ok"] and _prev_h:
+            # 조회 실패(rt_cd≠0/예외, 모의서버 토큰 rate-limit 등): 빈 결과로 다운스트림
+            # (사이클 사전 게이트·사후관리실장 매도 평가)을 오염시키지 말고 직전 정상 보유목록·총평가·
+            # 예수금을 유지한다(stale). 매수는 guardrails 가 ok=False 를 보고 여전히 보수적으로 반려하므로
+            # 이 carry-forward 는 사이클 진행·매도 평가만 살리고 오발주를 만들지 않는다. (사장 제보 2026-05-29)
+            snap["holdings"] = _prev_h
+            snap["holdings_stale"] = True
+            if _prev_total > 0:
+                snap["buying_power"]["total_eval"] = _prev_total
+                snap["buying_power"]["total_stale"] = True
+            _prev_cash = float((cached.get("buying_power") or {}).get("cash") or 0.0) if cached else 0.0
+            if _prev_cash <= 0:
+                _prev_cash = self._get_settled_cash_cache()
+            if _prev_cash > 0:
+                snap["buying_power"]["cash"] = _prev_cash
+                snap["buying_power"]["cash_stale"] = True
         # 결제예수금 글리치 방어 (cash 가 0 으로 resolve = D+2/D+1 모두 0 + last-good 캐시도 없음):
         # 평소엔 kr_net_valuation 의 D+2 carry-forward(disk 영속)가 막지만, 콜드스타트/깊은 글리치로
         # settled 가 0 이 되면 cash·total 이 함께 무너진다(2026-05-14 cash=0 버그, 2026-05-22 결제 과도기).
@@ -554,6 +578,12 @@ class KISBroker:
                 snap["buying_power"]["total_stale"] = True
             logger.warning(f"[잔고스냅샷] 결제예수금=0 글리치 — 직전 정상값 유지 "
                            f"(cash={prev_cash:,.0f}, total={prev_total:,.0f})")
+        # 보유목록 디스크 영속(재시작 갭 방어, 사장 제보 2026-05-29): 정상(보유 있음) 읽기면 last-good 저장,
+        # 진짜 평탄(빈 보유 + 총평가≈예수금)이면 무효화(유령 보유 방지). 글리치(빈 보유 + 총평가≫예수금)면 캐시 유지.
+        if holdings:
+            self._set_holdings_cache(holdings, total, now)
+        elif snap["ok"] and total <= cash + self._HOLDINGS_GLITCH_MIN_GAP:
+            self._clear_holdings_cache()
         self._acct_snap = snap
         return snap
 
@@ -688,7 +718,7 @@ class KISBroker:
                     return await r.json()
             d = await self._authed_json(_do)
             if d.get("rt_cd") != "0":
-                return {"ok": False, "krw_value": 0.0, "exrt": 0.0}
+                return {"ok": False, "krw_value": 0.0, "stock_value": 0.0, "exrt": 0.0}
             o3 = d.get("output3") or {}
             # 사장 지시 2026-05-28: 외화평가총액 = frcr_evlu_tota (USD 예수금 포함, 원화환산).
             # 이전엔 evlu_amt_smtl_amt(해외 '주식만' 평가합계)를 더해 USD 예수금 484불(~727K)이 빠져
@@ -697,12 +727,15 @@ class KISBroker:
             if krw_value <= 0:
                 # 스키마 변동·모의계좌·USD 미보유 → 이전 필드로 폴백
                 krw_value = self._num(o3.get("evlu_amt_smtl_amt"))
+            # 사장 지시 2026-05-30: 주식분(예수금 제외) 평가액 — 권위 조회 실패 시 라이브 가격으로
+            # 주식분만 재계산하고 예수금분(총액−주식분)은 캐시값을 보존하기 위함(자산곡선 동결 방지).
+            stock_value = self._num(o3.get("evlu_amt_smtl_amt"))
             o2 = d.get("output2") or []
             exrt = self._num(o2[0].get("frst_bltn_exrt")) if o2 else 0.0
-            return {"ok": True, "krw_value": krw_value, "exrt": exrt}
+            return {"ok": True, "krw_value": krw_value, "stock_value": stock_value, "exrt": exrt}
         except Exception as e:
             logger.warning(f"[해외원화평가] CTRP6504R 실패: {e}")
-            return {"ok": False, "krw_value": 0.0, "exrt": 0.0}
+            return {"ok": False, "krw_value": 0.0, "stock_value": 0.0, "exrt": 0.0}
 
     # 사장 지시 2026-05-21: 해외 원화평가 캐시 — KIS 해외잔고 조회가 간헐 실패하면 US 평가가
     # 통째로 빠져 통합 총평가가 ~16% 급락(자산곡선 -16% 글리치)한다. 마지막 정상값을 디스크에
@@ -716,25 +749,39 @@ class KISBroker:
         return self._token_path.parent / "overseas_krw_cache.json"
 
     def _get_overseas_cache(self):
+        """(총평가_krw, ts). 부수적으로 주식분(_overseas_stock_krw)·기준환율(_overseas_exrt)도
+        인스턴스에 적재한다 — present-balance 실패 시 예수금 보존 폴백(portfolio_holdings)에서 쓴다."""
         c = getattr(self, "_overseas_krw_cache", None)
         if c is not None:
             return c
+        self._overseas_stock_krw = 0.0
+        self._overseas_exrt = 0.0
         try:
             p = self._overseas_cache_path()
             if p.exists():
                 d = json.loads(p.read_text(encoding="utf-8"))
                 self._overseas_krw_cache = (float(d.get("krw") or 0.0), float(d.get("ts") or 0.0))
+                self._overseas_stock_krw = float(d.get("stock") or 0.0)
+                self._overseas_exrt = float(d.get("exrt") or 0.0)
                 return self._overseas_krw_cache
         except Exception:
             pass
         self._overseas_krw_cache = (0.0, 0.0)
         return self._overseas_krw_cache
 
-    def _set_overseas_cache(self, krw: float, ts: float) -> None:
+    def _set_overseas_cache(self, krw: float, ts: float, stock: Optional[float] = None,
+                            exrt: Optional[float] = None) -> None:
         self._overseas_krw_cache = (float(krw), float(ts))
+        if stock is not None:
+            self._overseas_stock_krw = float(stock)
+        if exrt is not None and exrt > 0:
+            self._overseas_exrt = float(exrt)
         try:
             self._overseas_cache_path().write_text(
-                json.dumps({"krw": float(krw), "ts": float(ts)}, ensure_ascii=False), encoding="utf-8")
+                json.dumps({"krw": float(krw), "ts": float(ts),
+                            "stock": float(getattr(self, "_overseas_stock_krw", 0.0) or 0.0),
+                            "exrt": float(getattr(self, "_overseas_exrt", 0.0) or 0.0)},
+                           ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
 
@@ -762,6 +809,51 @@ class KISBroker:
         try:
             self._settled_cash_path().write_text(
                 json.dumps({"d2": float(d2)}, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    # 사장 제보 2026-05-29: 보유목록 last-good 디스크 영속 — KIS가 보유목록을 빈 채 주는 글리치가
+    # 서버 재시작 직후(in-memory 스냅샷 소실=콜드스타트) 나면 기존 가드(in-memory cached 의존)가
+    # 못 막아 '보유 종목 없음'이 떴다(모의계좌 대한항공 사라짐 현상). settled_cash·overseas_krw 와
+    # 동형으로 디스크에 영속해 재시작 갭을 메운다. 정상 매도로 평탄해지면 즉시 무효화(유령 보유 방지). per-uid.
+    _HOLDINGS_CACHE_TTL = 86400.0  # 24h — 재시작·글리치 보강용. 진짜 매도는 즉시 무효화되므로 무관.
+
+    def _holdings_cache_path(self) -> Path:
+        return self._token_path.parent / "holdings_cache.json"
+
+    def _get_holdings_cache(self):
+        """(holdings:list, total:float, ts:float). 미존재/실패 시 ([],0,0)."""
+        c = getattr(self, "_holdings_cache", None)
+        if c is not None:
+            return c
+        try:
+            p = self._holdings_cache_path()
+            if p.exists():
+                d = json.loads(p.read_text(encoding="utf-8"))
+                self._holdings_cache = (list(d.get("holdings") or []),
+                                        float(d.get("total") or 0.0), float(d.get("ts") or 0.0))
+                return self._holdings_cache
+        except Exception:
+            pass
+        self._holdings_cache = ([], 0.0, 0.0)
+        return self._holdings_cache
+
+    def _set_holdings_cache(self, holdings, total: float, ts: float) -> None:
+        hl = list(holdings or [])
+        self._holdings_cache = (hl, float(total or 0.0), float(ts or 0.0))
+        try:
+            self._holdings_cache_path().write_text(
+                json.dumps({"holdings": hl, "total": float(total or 0.0), "ts": float(ts or 0.0)},
+                           ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _clear_holdings_cache(self) -> None:
+        self._holdings_cache = ([], 0.0, 0.0)
+        try:
+            p = self._holdings_cache_path()
+            if p.exists():
+                p.unlink()
         except Exception:
             pass
 
@@ -812,7 +904,7 @@ class KISBroker:
         krw = None
         if pk["ok"] and pk["krw_value"] > 0:
             krw = pk["krw_value"]                         # 조회 성공 + 평가 있음 = 권위값
-            self._set_overseas_cache(krw, _now)
+            self._set_overseas_cache(krw, _now, stock=pk.get("stock_value"), exrt=pk.get("exrt"))
             if pk["exrt"] > 0:
                 bp["fx_rate"] = pk["exrt"]
                 # 사장 지시 2026-05-22: 5분 폴러가 매번 호출하는 이 경로의 KIS 기준환율을
@@ -831,7 +923,24 @@ class KISBroker:
             # 조회 실패(ok=False) 또는 모순(보유목록엔 US인데 평가 0) → 최근 캐시로 보강(곡선 안정)
             _ck, _ct = self._get_overseas_cache()
             if _ck > 0 and (_now - _ct) < self._OVERSEAS_CACHE_TTL:
-                krw = _ck
+                # 사장 지시 2026-05-30: stale 캐시값으로 '동결'하면 US 세션 내내 자산곡선이 안 움직인다.
+                # 보유종목 라이브 현재가로 '주식분'을 재계산하고 캐시에 보존된 'USD 예수금분'(총액−주식분)을
+                # 더한다 — 예수금 정확도(2026-05-28 수정)는 지키면서 곡선이 라이브로 움직인다.
+                # 라이브 주식분/환율/캐시 주식분 중 하나라도 없으면 기존처럼 캐시 총액을 그대로 쓴다(안전).
+                _exrt = float(getattr(self, "_overseas_exrt", 0.0) or 0.0)
+                if _exrt <= 0:
+                    try:
+                        from tools.market_data import get_usdkrw
+                        _exrt = float(get_usdkrw(0.0) or 0.0)
+                    except Exception:
+                        _exrt = 0.0
+                _live_stock = sum(self._num(h.get("qty")) * self._num(h.get("cur_price"))
+                                  for h in holdings if h.get("ccy") == "USD") * _exrt
+                _cached_stock = float(getattr(self, "_overseas_stock_krw", 0.0) or 0.0)
+                if _live_stock > 0 and _exrt > 0 and _cached_stock > 0:
+                    krw = _live_stock + max(0.0, _ck - _cached_stock)
+                else:
+                    krw = _ck
                 bp["overseas_krw_stale"] = True
         if krw and krw > 0:
             bp["total_eval"] = self._num(bp.get("total_eval")) + krw

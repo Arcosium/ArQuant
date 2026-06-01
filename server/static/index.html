@@ -339,7 +339,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <div id="pf_notifmsg" style="font-size:11px;color:#7a869c;margin-top:4px"></div>
     </div></div>
     <div class="pf-sec pf-acc collapsed"><div class="pf-head" onclick="pfToggle(this);pfLoadFeedback()"><b>피드백/버그 제보 <span id="pf_fb_badge" style="display:none;background:#ef4444;color:#fff;font-size:10px;border-radius:8px;padding:0 6px;margin-left:4px"></span></b><span class="pf-caret">▼</span></div><div class="pf-body">
-      <div style="font-size:11px;color:#9fb0c9;margin-bottom:6px">버그·건의사항을 보내면 사장님이 확인 후 답글을 답니다.</div>
+      <div style="font-size:11px;color:#9fb0c9;margin-bottom:6px">버그·건의사항을 보내면 ADMIN이 확인 후 답글을 답니다.</div>
       <select id="pf_fb_type" style="width:100%;box-sizing:border-box;padding:8px;border-radius:7px;border:1px solid #2a3344;background:#0e131d;color:#e8edf6;font-family:inherit;font-size:12px;margin:4px 0">
         <option value="bug">🐞 버그 제보</option>
         <option value="feature">✨ 기능 요청</option>
@@ -795,7 +795,7 @@ const agents=[
   {name:"트레이딩팀장",role:"주문 실행·결과 보고",color:"#ef4444",level:1},
   {name:"리스크관리실장",role:"리스크 게이트·DART 재심",color:"#8b5cf6",level:0},
   {name:"사후관리실장",role:"보유 종목 매도 판단",color:"#f43f5e",level:0},
-  {name:"펀드기획팀장",role:"진입 thesis 설정·매도 직전 상기",color:"#ec4899",level:1},
+  {name:"펀드기획실장",role:"진입 thesis 설정·거부권(무계획 단타 차단)",color:"#ec4899",level:0},
   {name:"운용지원실장",role:"진단·프로필 전략 조정",color:"#14b8a6",level:0},
 ];
 const al=document.getElementById('agentList');
@@ -1287,7 +1287,7 @@ async function pfLoadFeedback(){
     const ts=document.createElement('div');ts.style.cssText='font-size:10px;color:#7a869c;margin-top:4px';ts.textContent=it.ts;card.appendChild(ts);
     if(it.reply){
       const rep=document.createElement('div');rep.style.cssText='margin-top:6px;border-left:2px solid #6366f1;padding:4px 8px;background:#141b27;border-radius:0 6px 6px 0';
-      const rl=document.createElement('div');rl.style.cssText='font-size:10px;color:#a5b4fc;font-weight:600';rl.textContent='💬 사장님 답글';
+      const rl=document.createElement('div');rl.style.cssText='font-size:10px;color:#a5b4fc;font-weight:600';rl.textContent='💬 ADMIN 답글';
       const rb=document.createElement('div');rb.style.cssText='font-size:11px;color:#e8edf6;white-space:pre-wrap;margin-top:2px';rb.textContent=it.reply;
       rep.appendChild(rl);rep.appendChild(rb);card.appendChild(rep);
     }

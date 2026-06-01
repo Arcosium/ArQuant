@@ -92,13 +92,15 @@ class MainActivity : ComponentActivity() {
     private fun AuthedApp(onLogout: () -> Unit) {
         // 사장 지시 2026-05-21: 인증되면 WsRelayService(foreground service)를 기동해 앱이
         // 백그라운드여도 WebSocket 연결을 유지 → 체결/장마감 등 푸시 알림이 계속 도착한다.
-        // 로그아웃으로 이 화면이 사라지면 onDispose 에서 서비스를 멈춰 연결을 정리한다.
-        // (회전 등은 manifest configChanges 로 Activity 가 재생성되지 않아 churn 없음)
+        // 버그수정 2026-05-29(사장 제보 — 앱 미실행 시 알림 누락): 예전엔 onDispose 에서 서비스를
+        // 멈췄는데, 컴포저블은 로그아웃뿐 아니라 앱 백그라운드/Activity 재생성/프로세스 회수 시에도
+        // 컴포지션을 떠나므로 서비스가 같이 죽어 알림이 끊겼다. 이제 서비스를 UI 생명주기와 분리하고
+        // (onDispose 에서 멈추지 않음 — 백그라운드/종료에도 알림 유지), 종료는 '로그아웃'에서만 명시적으로 한다.
         val svcCtx = androidx.compose.ui.platform.LocalContext.current
         androidx.compose.runtime.DisposableEffect(Unit) {
             val intent = android.content.Intent(svcCtx, com.arquant.mobile.service.WsRelayService::class.java)
             androidx.core.content.ContextCompat.startForegroundService(svcCtx, intent)
-            onDispose { svcCtx.stopService(intent) }
+            onDispose { /* 서비스는 UI 와 분리 — 알림 지속. 종료는 onLoggedOut 에서만. */ }
         }
         // DashViewModel 은 화면 렌더에 쓰지 않지만, 생성 시 WsManager.connect() 가
         // 호출되어 WebSocket 기반 네이티브 푸시 알림(TradeNotifier)이 계속 동작한다.
@@ -117,7 +119,11 @@ class MainActivity : ComponentActivity() {
             initialToken = tokenManager.get(),
             cookieName = "arquant_session",
             onTokenSynced = { tokenManager.save(it) },
-            onLoggedOut = onLogout,
+            onLoggedOut = {
+                // 로그아웃 시에만 백그라운드 알림 서비스를 명시적으로 종료(WsManager.disconnect).
+                svcCtx.stopService(android.content.Intent(svcCtx, com.arquant.mobile.service.WsRelayService::class.java))
+                onLogout()
+            },
         )
     }
 }

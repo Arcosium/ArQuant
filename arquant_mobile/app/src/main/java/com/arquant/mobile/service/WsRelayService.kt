@@ -8,6 +8,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.arquant.mobile.MainActivity
 import com.arquant.mobile.network.WsManager
 import dagger.hilt.android.AndroidEntryPoint
@@ -59,6 +60,19 @@ class WsRelayService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         wsManager.connect()   // 재기동 시에도 연결 보장 (idempotent)
         return START_STICKY    // 프로세스가 회수돼도 OS 가 서비스를 재시작 시도
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // 버그수정 2026-05-29(사장 제보): 최근앱에서 앱을 스와이프하면 기본 동작으로 task 의
+        // foreground service 가 함께 종료돼 알림이 끊겼다. 포그라운드 알림이 아직 살아있는 이
+        // 시점엔 self-restart 가 허용되므로 서비스를 즉시 재기동해 백그라운드 알림을 유지한다.
+        // (로그아웃 종료는 stopService→onDestroy 경로이므로 여기로 오지 않는다.)
+        try {
+            ContextCompat.startForegroundService(
+                applicationContext, Intent(applicationContext, WsRelayService::class.java))
+        } catch (_: Exception) {
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {

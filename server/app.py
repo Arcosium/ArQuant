@@ -829,7 +829,7 @@ async def admin_config_get(request: Request):
         "trader": "트레이딩팀장 (주문·보고)",
         "risk_guard": "리스크관리실장 (DART 재심)",
         "post_manager": "사후관리실장 (매도 판단)",
-        "fund_planner": "펀드기획팀장 (진입 thesis)",
+        "fund_planner": "펀드기획실장 (진입 thesis·거부권)",
         "ops_support": "운용지원실장 (진단·조정)",
     }
     return {"model_overrides": cfg["model_overrides"],

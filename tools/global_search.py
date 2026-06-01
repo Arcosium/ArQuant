@@ -43,8 +43,10 @@ async def deep_research(query: str, max_tokens: int = 3000, model: Optional[str]
         logger.error("OPENROUTER_API_KEY 없음 — deep_research 호출 불가")
         return ""
     if model is None:
-        model = MODEL_ASSIGNMENTS.get("macro_researcher",
-                                       "alibaba/tongyi-deepresearch-30b-a3b")
+        # 사장 지시 2026-05-30: ADMIN 모델 오버라이드 우선 — 그동안 config 만 읽어 오버라이드를
+        # 무시했다(BaseAgent 와 통일). 오버라이드 없으면 config macro_researcher → tongyi 폴백.
+        from infra import admin_config
+        model = admin_config.resolve_model("macro_researcher", "alibaba/tongyi-deepresearch-30b-a3b")
     # AGENT_MAX_TOKENS 우선
     cfg_tok = AGENT_MAX_TOKENS.get("macro_researcher", max_tokens) or max_tokens
     max_tokens = max(int(max_tokens), int(cfg_tok))
