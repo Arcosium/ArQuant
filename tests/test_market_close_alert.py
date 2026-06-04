@@ -93,13 +93,20 @@ def test_kr_close_alert_suppressed_on_weekend(cap, monkeypatch):
 
 
 def test_kr_close_alert_suppressed_on_holiday(cap, monkeypatch):
+    # 사장 지시 2026-06-03: 하드코딩 휴장일 목록 폐지 → 휴장은 거래량 검증으로 확정한 캐시
+    # (_VERIFIED_CLOSED)로만 판정한다. 평일이라도 당일 거래가 없었던 것으로 확정되면 마감 알림 금지.
     o = _orch()
-    # 2026-05-25 부처님오신날 (월요일·KR 휴장일)
-    monkeypatch.setattr(main_swarm, "_now_kst", lambda: datetime(2026, 5, 25, 15, 30, tzinfo=KST))
+    # 2026-06-03 지방선거 임시공휴일 (수요일·평일이지만 휴장) — 옛 하드코딩 목록엔 없던 날.
+    monkeypatch.setattr(main_swarm, "_now_kst", lambda: datetime(2026, 6, 3, 15, 30, tzinfo=KST))
     monkeypatch.setattr(main_swarm, "performance_kpis",
                         lambda *a, **k: {"today_pct": 1.0, "today_pnl": 1, "cumulative_pct": 1.0, "cumulative_pnl": 1})
-    asyncio.run(o._maybe_market_close_alert("KR_TRADING", "KR_CLOSE_REVIEW"))
-    assert [e for e in cap if e.get("type") == "market_close"] == [], "공휴일엔 한국 장 마감 알림이 나가면 안 된다"
+    main_swarm._VERIFIED_TRADED.clear(); main_swarm._VERIFIED_CLOSED.clear()
+    main_swarm._VERIFIED_CLOSED.add("KR:2026-06-03")  # 개장 후 당일 봉 없음 → 휴장 확정됨
+    try:
+        asyncio.run(o._maybe_market_close_alert("KR_TRADING", "KR_CLOSE_REVIEW"))
+        assert [e for e in cap if e.get("type") == "market_close"] == [], "휴장 확정일엔 한국 장 마감 알림이 나가면 안 된다"
+    finally:
+        main_swarm._VERIFIED_CLOSED.clear()
 
 
 def test_us_close_alert_sent_for_friday_session(cap, monkeypatch):

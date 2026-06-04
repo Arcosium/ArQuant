@@ -40,6 +40,16 @@ def _orch(broker):
     return o
 
 
+@pytest.fixture(autouse=True)
+def _clear_verified_cache():
+    # 실데이터 검증 결과는 프로세스 전역 캐시 — 테스트 간 누수 방지를 위해 매 테스트 초기화.
+    main_swarm._VERIFIED_TRADED.clear()
+    main_swarm._VERIFIED_CLOSED.clear()
+    yield
+    main_swarm._VERIFIED_TRADED.clear()
+    main_swarm._VERIFIED_CLOSED.clear()
+
+
 @pytest.fixture
 def at(monkeypatch):
     def _set(dt):
@@ -87,34 +97,57 @@ def test_kr_closed_when_today_bar_missing(at):
     at(datetime(2026, 5, 21, 9, 10))
     b = _FakeBroker(kr_rows=[_row("2026-05-19"), _row(PREV)])  # 최신이 어제
     closed, why = asyncio.run(_orch(b)._market_closed_today("KR_TRADING"))
-    assert closed and "실거래 확인" in why
+    assert closed and "거래량 없음" in why
 
 
-# ── 실확인 '개장'은 하드코딩 휴장일보다 우선 (거짓 휴장 → 거래 누락 방지) ──
-def test_real_open_overrides_hardcoded_holiday(at, monkeypatch):
+# ── 하드코딩 휴장일 목록 폐지: 거래량(당일 봉) 검증만이 휴장 판정 권위 ──────
+def test_today_bar_means_open_no_hardcoded_list(at):
+    # 하드코딩 휴장일 목록이 더는 없으므로, 당일 봉만 있으면 개장으로 진행한다.
     at(datetime(2026, 5, 21, 9, 10))
-    monkeypatch.setattr(main_swarm, "KR_MARKET_HOLIDAYS", {WEEKDAY})  # 목록상 휴장
-    b = _FakeBroker(kr_rows=[_row(WEEKDAY)])  # 그러나 실데이터는 거래중
+    assert not hasattr(main_swarm, "KR_MARKET_HOLIDAYS")  # 목록 자체가 제거됨
+    b = _FakeBroker(kr_rows=[_row(WEEKDAY)])
     closed, why = asyncio.run(_orch(b)._market_closed_today("KR_TRADING"))
-    assert closed is False  # 실확인이 우선
+    assert closed is False
 
 
-# ── 실확인 불가 → 하드코딩 폴백 ─────────────────────────────────────────────
-def test_inconclusive_falls_back_to_holiday_list(at, monkeypatch):
+# ── 실확인 불가(시기상조/일시적 실패) → 폴백 없이 '진행' (거짓 휴장 누락 방지) ──
+def test_inconclusive_proceeds_without_hardcoded_fallback(at):
     at(datetime(2026, 5, 21, 9, 10))
-    monkeypatch.setattr(main_swarm, "KR_MARKET_HOLIDAYS", {WEEKDAY})
-    b = _FakeBroker(raise_kr=True)  # 실시세 확인 실패
+    b = _FakeBroker(raise_kr=True)  # 실시세 확인 실패 → None
     assert asyncio.run(_orch(b)._verify_market_open("KR_TRADING")) is None
     closed, why = asyncio.run(_orch(b)._market_closed_today("KR_TRADING"))
-    assert closed and "KR 휴장일" in why  # 폴백 발동
+    assert closed is False  # 확인불가는 진행 (다음 사이클 재확인)
 
 
-def test_inconclusive_normal_weekday_proceeds(at, monkeypatch):
+def test_inconclusive_normal_weekday_proceeds(at):
     at(datetime(2026, 5, 21, 9, 10))
-    monkeypatch.setattr(main_swarm, "KR_MARKET_HOLIDAYS", set())  # 휴장일 아님
     b = _FakeBroker(raise_kr=True)
     closed, why = asyncio.run(_orch(b)._market_closed_today("KR_TRADING"))
-    assert closed is False  # 폴백도 '평일 거래일' → 진행
+    assert closed is False
+
+
+# ── 거래량 검증으로 휴장 확정 시: 동기 게이트(is_market_session_now)도 휴장 처리 ──
+def test_verified_closed_marks_session_now_closed(at):
+    at(datetime(2026, 5, 21, 9, 10))  # 평일 09:10
+    # 검증 전 평일 기본은 '개장'
+    assert main_swarm.is_market_session_now(datetime(2026, 5, 21, 9, 10)) is True
+    b = _FakeBroker(kr_rows=[_row(PREV)])  # 당일 봉 없음 → 휴장 확정
+    closed, _ = asyncio.run(_orch(b)._market_closed_today("KR_TRADING"))
+    assert closed is True
+    # 휴장 확정 후엔 동기 게이트도 그날을 휴장으로 본다(평가금액 기록·표시 차단).
+    assert main_swarm.is_market_session_now(datetime(2026, 5, 21, 9, 10)) is False
+    # 다른 날(평일)은 영향 없음.
+    assert main_swarm.is_market_session_now(datetime(2026, 5, 22, 9, 10)) is True
+
+
+# ── 개장으로 재확인되면 휴장 캐시를 덮어쓴다(데이터 지연 자기 교정) ─────────
+def test_open_overrides_prior_closed(at):
+    at(datetime(2026, 5, 21, 9, 10))
+    main_swarm._VERIFIED_CLOSED.add("KR:2026-05-21")  # 직전에 '봉 없음'으로 휴장 캐시됨
+    assert main_swarm.is_market_session_now(datetime(2026, 5, 21, 9, 10)) is False
+    b = _FakeBroker(kr_rows=[_row(WEEKDAY)])  # 이후 당일 봉 등장 → 개장
+    assert asyncio.run(_orch(b)._verify_market_open("KR_TRADING")) is True
+    assert main_swarm.is_market_session_now(datetime(2026, 5, 21, 9, 10)) is True
 
 
 # ── 시기상조(개장 5분 전): 실확인 보류 ──────────────────────────────────────
@@ -125,10 +158,13 @@ def test_before_open_plus_5_is_inconclusive(at):
     assert b.kr_calls == 0  # 시기상조면 KIS 호출조차 안 함
 
 
-def test_kr_pre_market_is_inconclusive(at):
-    at(datetime(2026, 5, 21, 8, 55))  # 프리마켓 — 당일 봉 아직 없음
-    b = _FakeBroker(kr_rows=[_row(PREV)])
-    assert asyncio.run(_orch(b)._verify_market_open("KR_PRE_MARKET")) is None
+# ── 프리장 폐지: 09:00 이전은 OFF_HOURS, 09:00부터 KR_TRADING (사장 지시 2026-06-03) ──
+def test_pre_market_session_removed(at):
+    at(datetime(2026, 5, 21, 8, 55))  # 옛 프리장 시간대
+    assert main_swarm.get_current_session() == "OFF_HOURS"
+    assert not hasattr(main_swarm, "is_pre_market")
+    at(datetime(2026, 5, 21, 9, 0))   # 정규장 개장 = 분석 시작
+    assert main_swarm.get_current_session() == "KR_TRADING"
 
 
 # ── US 야간 세션: 당일 봉 있으면 개장 ───────────────────────────────────────

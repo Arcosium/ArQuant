@@ -10,6 +10,20 @@ from typing import Any, Dict, List
 from agents.base_agent import BaseAgent
 
 
+# ── 대화 흐름 규칙 (사장 지시 2026-06-03) ────────────────────────────────────
+# 사이클 로그는 한 번의 '팀 회의'처럼 읽혀야 한다. 각 팀장이 같은 사실(지수·환율·유가 등)을
+# 처음부터 다시 나열하면 대화가 누적되지 않고 8명이 같은 대본을 따로 낭독하는 인상을 준다.
+# 그래서 모든 팀장은 (1) 발언 첫 줄에 직전 팀장 발언을 받아 잇는 '인계 한 줄'로 시작하고,
+# (2) 앞서 나온 사실은 재서술하지 말고 짧게 참조만 한 뒤 자기 관점·판단만 새로 더한다.
+# (3) 수치가 꼭 필요하면 새로 적지 말고 '검증된 글로벌 지수' 스냅샷 값을 그대로(가공 없이) 인용한다.
+_FLOW_RULE_BLOCK = """
+
+## 대화 흐름 규칙 (사장 지시 2026-06-03 — 이건 이어지는 팀 회의입니다)
+- 발언 첫 문장은 **직전 팀장의 발언을 한 줄로 받아 잇는 인계 코멘트**로 시작하십시오 (예: "뉴스분석팀장이 짚은 ~를 보면…", "계량분석팀장 점수 기준…").
+- 앞 팀장이 이미 말한 **사실(지수·환율·유가·뉴스 내용 등)은 처음부터 다시 나열하지 말고** "앞서 ~가 지적한 …"으로 짧게 참조만 한 뒤, **당신의 관점·판단만** 새로 더하십시오.
+- 수치를 다시 적지 마십시오. 꼭 필요하면 '검증된 글로벌 지수' 스냅샷 값을 **그대로(반올림·가공 없이)** 인용해 팀 간 숫자가 어긋나지 않게 하십시오."""
+
+
 # ── Coresight 도구 노출 게이트 (Implementation.md §3.2) ───────────────────────
 # Coresight RAG 는 Admin(hh09080) 전용 지식원이다.
 # 비관리자 세션에서는 도구 자체를 프롬프트에서 제거해 존재를 비공개로 한다.
@@ -77,7 +91,8 @@ def create_macro_analyst(injection=None) -> BaseAgent:
 - `tools.global_search.deep_research`: 매 매크로 분석 직전 자동 종합 리서치 (위 컨텍스트 주입됨, 가격 X)
 - `tools.news_monitor`: 네이버 금융 증권 속보 (10분 주기 크롤, KR/US/BOTH 자동 분류 — alibaba)
 - `tools.dart_disclosure`: KR 공시 + 직전연도 요약재무"""
-        + _coresight_tool_line("과거 전략 기록", injection),
+        + _coresight_tool_line("과거 전략 기록", injection)
+        + _FLOW_RULE_BLOCK,
     )
 
 
@@ -145,9 +160,11 @@ def create_quant_analyst(injection=None) -> BaseAgent:
 - 평가: 호재·악재 균형
 
 ▶ 결론
-- 매수 적합도 점수: 0~10. **반드시 다음 고정 가중치로만 산정**(종목마다 다른 가중치 사용 금지 — 변경 금지):
-  추세·모멘텀 30% + 평균회귀·과열 20% + 변동성·리스크 15% + 수급·거래량 20% + 뉴스·이벤트 15%.
-  각 섹션을 0~10으로 평가한 뒤 이 고정 가중치로 가중평균해 최종 점수를 내십시오 — 운용전략실장이 종목 간 점수를 직접 비교하므로 산식이 통일돼야 합니다.
+- 매수 적합도 점수: 0~10. **점수 산정 주체는 두 가지 모드입니다(메시지를 보고 판별)**:
+  ① 메시지에 `⚙️ 시스템 결정론 점수(확정 …) = N/10` 이 있으면 — **그 점수는 시스템(파이썬)이 확정한 값입니다. 절대 바꾸지 마십시오.**
+     당신은 그 점수가 왜 합당한지·핵심 리스크를 한국어 줄글로 **해설만** 하고, 마지막 줄 `퀀트점수: 코드=N` 에 그 값을 **그대로** 적으십시오.
+  ② 그 표기가 없으면(구 모드) — 각 섹션(추세·평균회귀·변동성·수급·뉴스)을 0~10으로 평가해 가중평균(추세30/평균회귀20/변동성15/수급20/뉴스15)으로 산정하십시오.
+  메시지에 '매수 필터'(변동성 상한·RSI 과매수·ADX·외국인 순매수·이격 등)가 있으면 해당 조건 위배 종목의 리스크를 해설에 명시하십시오.
 - 핵심 리스크 1~2개
 - 보유 종목이면 매도/보유 추천 한 줄
 
@@ -213,7 +230,8 @@ def create_news_analyst(injection=None) -> BaseAgent:
 
 ## 사용 가능 도구
 - naver_realtime_search: 네이버 실시간 뉴스 스크래핑"""
-        + _coresight_tool_line("과거 뉴스 분석 기록 조회", injection),
+        + _coresight_tool_line("과거 뉴스 분석 기록 조회", injection)
+        + _FLOW_RULE_BLOCK,
     )
 
 
@@ -296,7 +314,8 @@ def create_post_manager(injection=None) -> BaseAgent:
 
 ## 사용 가능 도구
 - analyze_stock_technical: 보유 종목 기술적 분석"""
-        + _coresight_tool_line("과거 매도 판단 기록 조회", injection),
+        + _coresight_tool_line("과거 매도 판단 기록 조회", injection)
+        + _FLOW_RULE_BLOCK,
     )
 
 
@@ -401,7 +420,7 @@ def format_thesis_reminder(theses: Dict[str, Dict[str, Any]],
     매칭 thesis 가 없으면 빈 문자열 (호출부가 그냥 안 넣음)."""
     if not theses or not holdings:
         return ""
-    lines: List[str] = ["📌 펀드기획실장 — 진입 thesis 상기 (매수 시점에 박아둔 계획. 이를 토대로 매도 판단):"]
+    lines: List[str] = ["📌 펀드기획실장: 사후관리실장님, 매도 판단 들어가기 전에 — 보유 종목 매수 때 세워둔 계획을 다시 짚어드립니다. 목표·손절·계획 보유기간을 보고 무계획 단타가 되지 않게 참고해 주세요."]
     for h in holdings:
         code = str(h.get("code", "")).strip()
         if code not in theses:
@@ -434,17 +453,22 @@ def apply_thesis_veto(theses: Dict[str, Dict[str, Any]],
                        sell_directives: Dict[str, str],
                        now_iso: str,
                        *, enabled: bool = True,
-                       allow_day_trading: bool = False):
+                       noise_band_pct: float = 0.03):
     """펀드기획실장 거부권 — 사후관리실장 매도결정을 결정론적으로 검증한다.
 
-    계획 보유기간 미경과 + 소폭이익 + 손절·목표 미해당인 매도결정을 '보유'로 오버라이드해
-    무계획 단타를 차단한다. 손절(손실)·목표도달·계획기간 경과 매도는 그대로 둔다
-    (손실 가두기 방지 / 정상 청산 보장). 매수 반려와 동급의 '의사결정 오버라이드'이며,
-    조용한 주문 누락이 아니라 반환된 메시지로 투명하게 공개한다.
+    계획 보유기간 미경과 + 손익이 '노이즈 밴드(±noise_band_pct)' 이내 + 손절·목표 미해당인
+    매도결정을 '보유'로 오버라이드해 무계획 단타(churn)를 차단한다. 소폭이익뿐 아니라
+    소폭손실(-band 이내)도 차단한다 — 오늘(2026-06-04) 036800 -1.5% / 230240 -0.6% 처럼
+    계획이 채 펼쳐지기 전 미세 손익에 즉시 청산하는 패턴이 정확히 이 밴드에 걸린다.
+
+    비차단(매도 허용): 손절 터치 / 목표 도달 / 계획기간 경과 / 진짜 손실(진입가×(1-band) 밖).
+    사장 지시 2026-06-04: ALLOW_DAY_TRADING 여부와 무관하게 발동한다(THESIS_VETO_ENABLED 로만 on/off).
+    매수 반려와 동급의 '의사결정 오버라이드'이며, 조용한 주문 누락이 아니라 메시지로 투명 공개한다.
 
     Returns (new_directives, [veto_msg, ...]). 거부권 없으면 messages 는 빈 리스트."""
-    if not enabled or allow_day_trading or not theses or not sell_directives:
+    if not enabled or not theses or not sell_directives:
         return dict(sell_directives or {}), []
+    band = abs(float(noise_band_pct or 0.0))
     holdings_by_code = {str(h.get("code", "")).strip(): h for h in (holdings or [])}
     out = dict(sell_directives)
     vetoes: List[str] = []
@@ -471,15 +495,16 @@ def apply_thesis_veto(theses: Dict[str, Dict[str, Any]],
             continue  # 목표 도달 → 매도 허용
         if hold_h > 0 and hours_held >= hold_h:
             continue  # 계획 보유기간 경과 → 매도 허용
-        if cur <= entry:
-            continue  # 손실 종목 → 손절성 매도이므로 비차단
-        # 계획기간 미경과 + 소폭이익 + 손절·목표 미해당 → 거부권 발동
+        if cur < entry * (1.0 - band):
+            continue  # 진짜 손실(노이즈밴드 밖) → 손절성 매도이므로 비차단
+        # 계획기간 미경과 + 손익이 ±band 노이즈밴드 이내 + 손절·목표 미해당 → 거부권 발동
         name = h.get("name") or c
+        pnl_pct = (cur / entry - 1.0) * 100.0
         out[c] = "보유"
         vetoes.append(
             f"📛 펀드기획실장 거부권 발동 — {name}({c}) 매도결정 '{directive}' → '보유'로 보류. "
-            f"계획 보유 {hold_h:.0f}h 중 {hours_held:.1f}h 경과, 현재가 {cur:,.2f}는 "
-            f"목표 {target:,.2f}·손절 {stop:,.2f} 미해당. 계획 없는 소폭이익 단타로 판단.")
+            f"계획 보유 {hold_h:.0f}h 중 {hours_held:.1f}h 경과, 현재가 {cur:,.2f}({pnl_pct:+.1f}%)는 "
+            f"목표 {target:,.2f}·손절 {stop:,.2f} 미해당 + 노이즈밴드(±{band*100:.0f}%) 이내. 계획 없는 단타로 판단.")
     return out, vetoes
 
 

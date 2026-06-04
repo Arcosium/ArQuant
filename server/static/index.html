@@ -441,7 +441,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
         <div class="kpi"><div class="kl">최대낙폭 (MDD)</div><div class="kv" id="kMdd">-</div><div class="ks">고점 대비</div></div>
         <div class="kpi"><div class="kl">승률</div><div class="kv" id="kWin">-</div><div class="ks" id="kWinSub"></div></div>
         <div class="kpi"><div class="kl">평균 보유일</div><div class="kv" id="kHold">-</div><div class="ks">매수→매도</div></div>
-        <div class="kpi"><div class="kl">현재 평가액</div><div class="kv" id="kCur">-</div><div class="ks">실계좌 총평가</div></div>
+        <div class="kpi" id="kpiCur"><div class="kl">현재 평가액</div><div class="kv" id="kCur">-</div><div class="ks">실계좌 총평가</div></div>
       </div>
       <div class="card grow"><div class="ch">
           <span class="ct">📈 평가금액 추이 (수익률)</span>
@@ -1170,6 +1170,7 @@ async function sendCeo(){const inp=document.getElementById('ceoInput');const msg
 
 let _isOffHours=false;
 let _isTrading=false;  // 장중(KR/US 정규장)일 때만 true — 수익률 실시간 갱신 게이트
+let _kisTotal=null;    // 실거래 KIS 통합총자산(display_total_asset) — 잔고폴링이 채우고 수익률 카드가 공유
 let _lastCostMode='h';
 async function refreshStatus(){try{const r=await fetch(API+'/api/status');const d=await r.json();
   _isOffHours=(d.session==='OFF_HOURS');
@@ -1475,7 +1476,10 @@ function renderKpis(k){
     const md=document.getElementById('kMdd');if(md){md.textContent=(k.mdd_pct==null?'-':k.mdd_pct.toFixed(2)+'%');md.className='kv'+(k.mdd_pct<0?' neg':'');}
   }
   // 사장 지시 2026-05-28: 자산곡선이 비어도(백업 도구 wipe 등) '현재 평가액' 은 항상 표시 — 서버가 broker 폴백 값을 박아준다.
-  const cu=document.getElementById('kCur');if(cu)cu.textContent=(k.current==null?'-':Math.round(k.current).toLocaleString()+'원');
+  // 사장 결정 2026-06-01: 실거래 '현재 평가액' = KIS 통합총자산(HTS 일치, 잔고폴링이 채운 _kisTotal 우선).
+  // 모의는 display_total_asset 이 없어 곡선식 current(해외평가 포함 총평가) 폴백. (모의도 잔고 표시)
+  const _cur=_kisTotal||k.current;
+  const cu=document.getElementById('kCur');if(cu)cu.textContent=(_cur==null?'-':Math.round(_cur).toLocaleString()+'원');
   const win=document.getElementById('kWin'),winSub=document.getElementById('kWinSub'),hold=document.getElementById('kHold');
   if(k.has_trades){
     if(win){win.textContent=k.win_rate_pct.toFixed(0)+'%';win.className='kv'+(k.win_rate_pct>=50?' pos':' neg');}
@@ -1786,7 +1790,16 @@ async function refreshBalance(force){
   const bp=d.buying_power||{};const ok=bp.ok;
   const _now=new Intl.DateTimeFormat('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date());
   const _ovKrw=bp.overseas_krw?` (해외 ${Math.round(bp.overseas_krw).toLocaleString()}원 포함)`:'';
-  document.getElementById('bpLine').textContent=(ok?`예수금 ${Math.round(bp.cash||0).toLocaleString()}원 · 총평가 ${Math.round(bp.total_eval||0).toLocaleString()}원${_ovKrw} · 평가손익 ${((bp.pnl_ratio||0)*100).toFixed(1)}%`:'잔고 조회 실패')+` · ${_now} KST 갱신`;
+  // 사장 결정 2026-06-01: 대시보드 '현재 총자산'은 KIS 통합총자산(display_total_asset, HTS 일치, 실거래만).
+  // 없으면(모의 등) 곡선식 total_eval 폴백. 모의도 잔고 표시(해외평가 ~379M 포함).
+  const _kis=(bp.display_total_asset&&bp.display_total_asset>0)?bp.display_total_asset:null;
+  _kisTotal = _kis;   // 수익률 탭 '현재 평가액' 카드와 공유(실거래만 값 존재)
+  const _totShown = _kis!=null ? _kis : (bp.total_eval||0);
+  const _totLbl = _kis!=null ? '총자산(KIS)' : '총평가';
+  const _bpText = ok
+      ? `예수금 ${Math.round(bp.cash||0).toLocaleString()}원 · ${_totLbl} ${Math.round(_totShown).toLocaleString()}원${_ovKrw} · 평가손익 ${((bp.pnl_ratio||0)*100).toFixed(1)}%`
+      : '잔고 조회 실패';
+  document.getElementById('bpLine').textContent=_bpText+` · ${_now} KST 갱신`;
   const box=document.getElementById('holdings');box.innerHTML='';
   const hs=d.holdings||[];
   if(!hs.length){const e=document.createElement('div');e.className='cm system';e.style.background='var(--s2)';e.textContent=ok?'보유 종목 없음':'잔고 조회 실패 (KIS 계좌/토큰 확인)';box.appendChild(e);return}

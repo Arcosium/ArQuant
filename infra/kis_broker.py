@@ -111,6 +111,12 @@ class KISBroker:
         self.is_mock = ("openapivts" in _bu) or (":29443" in _bu)
         self._token: Optional[str] = None; self._token_exp: float = 0
         self._session: Optional[aiohttp.ClientSession] = None
+        # 사장 지시 2026-06-01: 전역 호출간격 락 — 해외 거래소순회·페이징·5분폴러·멀티테넌트 동시호출이
+        # 겹쳐도 KIS 초당제한(EGW00201)에 안 걸리게 사전 직렬화한다(거부 후 백오프보다 안정적).
+        # 모의서버는 더 보수적으로(0.5s), 실전은 0.06s(≈15TPS) 간격.
+        self._rate_lock = asyncio.Lock()
+        self._last_call: float = 0.0
+        self._min_interval: float = 0.5 if self.is_mock else 0.06
 
     async def _s(self):
         if not self._session or self._session.closed:
@@ -196,9 +202,70 @@ class KISBroker:
         path 는 base_url 뒤에 붙는 절대경로. 반환: 파싱된 KIS JSON 전체."""
         async def _do(tok):
             s = await self._s()
+            await self._pace()
             async with s.get(f"{self.base_url}{path}", headers=self._h(tok, tr_id), params=params) as r:
                 return await r.json()
         return await self._authed_json(_do)
+
+    async def _pace(self) -> None:
+        """KIS 호출 사전 간격 보장(초당제한 회피). _min_interval 만큼 직전 호출과 벌린다.
+        모든 GET/페이징 진입점에서 호출. lock 으로 동시호출도 직렬화."""
+        async with self._rate_lock:
+            loop = asyncio.get_event_loop()
+            wait = self._min_interval - (loop.time() - self._last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call = loop.time()
+
+    async def _paged_get(self, path: str, tr_id: str, params: Dict[str, Any],
+                         fk_key: str = "CTX_AREA_FK100", nk_key: str = "CTX_AREA_NK100",
+                         out_keys=("output1",), max_depth: int = 10) -> Dict:
+        """KIS 연속조회(tr_cont) 표준 루프 + 부분성공 보존.
+        응답 헤더 tr_cont∈{F,M}이면 다음 요청에 헤더 tr_cont='N' + 직전 응답의 ctx_area_fk/nk 를 실어 재호출.
+        out_keys 의 list 출력은 누적, dict 출력(요약 output2/3)은 최신값으로 유지.
+        rt_cd≠0: 첫 페이지면 ok=False, 이후 페이지면 누적분을 ok=True·partial=True 로 보존(사장 지시 2026-06-01)."""
+        acc: Dict[str, Any] = {k: [] for k in out_keys}
+        last = {"rt_cd": None, "msg1": "", "msg_cd": ""}
+        p = dict(params)
+        tr_cont = ""
+        ok, partial, page = True, False, 0
+        while page < max_depth:
+            hdr: Dict[str, str] = {}
+
+            async def _do(tok, _p=dict(p), _trc=tr_cont, _hdr=hdr):
+                s = await self._s()
+                await self._pace()
+                headers = self._h(tok, tr_id)
+                if _trc:
+                    headers["tr_cont"] = _trc
+                async with s.get(f"{self.base_url}{path}", headers=headers, params=_p) as r:
+                    _hdr["tr_cont"] = r.headers.get("tr_cont", "") or ""
+                    return await r.json()
+
+            body = await self._authed_json(_do)
+            body = body if isinstance(body, dict) else {}
+            rc = str(body.get("rt_cd", ""))
+            last = {"rt_cd": rc, "msg1": body.get("msg1", ""), "msg_cd": body.get("msg_cd", "")}
+            if rc != "0":
+                if page == 0:
+                    ok = False
+                else:
+                    partial = True
+                break
+            for k in out_keys:
+                v = body.get(k)
+                if isinstance(v, list):
+                    acc[k].extend(v)
+                elif isinstance(v, dict):
+                    acc[k] = v   # 요약 객체 — 최신 페이지 값 유지
+            page += 1
+            if (hdr.get("tr_cont") or "") in ("F", "M"):
+                tr_cont = "N"
+                p[fk_key] = body.get(fk_key.lower(), "")
+                p[nk_key] = body.get(nk_key.lower(), "")
+            else:
+                break
+        return {**acc, "ok": ok, "partial": partial, **last}
 
     async def token(self, force: bool = False) -> str:
         now = time.time()
@@ -240,7 +307,9 @@ class KISBroker:
             return tr_id
         if tr_id in self._MOCK_TR_OVERRIDE:
             return self._MOCK_TR_OVERRIDE[tr_id]
-        return ("V" + tr_id[1:]) if tr_id[0] == "T" else tr_id
+        # KIS 표준(kis_auth): 모의 변환 대상은 첫 글자 T/J/C (시세성 FH… 등은 불변).
+        # 사장 지시 표준화 2026-06-01: 'T' 만 변환하던 것을 샘플과 일치시킴(CTRP→VTRP 등).
+        return ("V" + tr_id[1:]) if tr_id[0] in ("T", "J", "C") else tr_id
 
     def _h(self, tok, tr_id):
         return {"content-type":"application/json;charset=utf-8","authorization":f"Bearer {tok}",
@@ -530,7 +599,10 @@ class KISBroker:
         # total_eval clearly implies positions exist (transient KIS quirk) — avoids UI flicker.
         # 직전 정상 보유목록: in-memory 우선, 없으면(재시작 콜드스타트) 디스크 캐시로 폴백(사장 제보 2026-05-29).
         _prev_h = (cached.get("holdings") if cached else None)
-        _prev_total = float((cached.get("buying_power") or {}).get("total_eval") or 0.0) if cached else 0.0
+        # 글리치 carry-forward 기준은 KR 기준 총평가(total_eval_kr)다 — 아래에서 total_eval 에 해외분을
+        # 더하므로, _prev_total 이 해외 포함값을 집으면 글리치 복원 시 해외분이 이중 가산된다.
+        _prev_bp_c = (cached.get("buying_power") or {}) if cached else {}
+        _prev_total = float(_prev_bp_c.get("total_eval_kr") or _prev_bp_c.get("total_eval") or 0.0)
         if not _prev_h:
             _dh, _dt, _dts = self._get_holdings_cache()
             if _dh and (now - _dts) < self._HOLDINGS_CACHE_TTL:
@@ -569,7 +641,7 @@ class KISBroker:
         if cached and snap["ok"] and cash <= 0:
             _prev_bp = cached.get("buying_power") or {}
             prev_cash = float(_prev_bp.get("cash") or 0.0)
-            prev_total = float(_prev_bp.get("total_eval") or 0.0)
+            prev_total = float(_prev_bp.get("total_eval_kr") or _prev_bp.get("total_eval") or 0.0)
             if prev_cash > 0:
                 snap["buying_power"]["cash"] = prev_cash
                 snap["buying_power"]["cash_stale"] = True
@@ -584,6 +656,19 @@ class KISBroker:
             self._set_holdings_cache(holdings, total, now)
         elif snap["ok"] and total <= cash + self._HOLDINGS_GLITCH_MIN_GAP:
             self._clear_holdings_cache()
+        # 사장 지시 2026-06-03: 사이클/리스크/표시용 총평가는 KR(국내 유가증권 + D+2 예수금)에
+        # 해외 외화평가총액(frcr_evlu_tota 원화환산)을 합산한다. KR nass_amt만 쓰면 US 보유가 0으로
+        # 사라져 자산곡선이 매수 때마다 계단식 하락하고 pnl 이 0 에 고정된다.
+        #   - total_eval_kr: KR 기준(글리치 carry-forward·곡선 합산의 base). total_eval: KR+해외(헤드라인).
+        #   - 해외분은 portfolio_holdings 가 매 폴링마다 갱신·디스크 영속하는 캐시값을 쓴다(추가 호출 0).
+        #   - #2(0/동결 금지): 캐시는 실패 시 직전값을 보존하고, 실제 US 전량매도 때만 0으로 무효화되므로
+        #     '>0' 이면 항상 더한다(TTL 무시) — US 보유가 일시 조회실패로 사라지지 않게.
+        _kr_total = self._num(snap["buying_power"]["total_eval"])
+        snap["buying_power"]["total_eval_kr"] = _kr_total
+        _ov_krw, _ov_ts = self._get_overseas_cache()
+        if _ov_krw > 0:
+            snap["buying_power"]["total_eval"] = _kr_total + _ov_krw
+            snap["buying_power"]["overseas_krw"] = _ov_krw
         self._acct_snap = snap
         return snap
 
@@ -642,16 +727,16 @@ class KISBroker:
         해야 한다 — 이전엔 qty를 합산해 2주가 4주로 부풀던 버그. 실보유는 present-balance로 검증함."""
         seen: Dict[str, Dict] = {}
         try:
-            s = await self._s(); c, p = self._acnt()
+            c, p = self._acnt()
             for excd in ("NASD", "NYSE", "AMEX"):
                 try:
-                    async def _do(tk, _excd=excd):
-                        async with s.get(f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-balance",
-                            headers=self._h(tk,"TTTS3012R"),
-                            params={"CANO":c,"ACNT_PRDT_CD":p,"OVRS_EXCG_CD":_excd,"TR_CRCY_CD":"USD",
-                                    "CTX_AREA_FK200":"","CTX_AREA_NK200":""}) as r:
-                            return await r.json()
-                    d = await self._authed_json(_do)
+                    # 사장 지시 2026-06-01: 거래소별 연속조회(tr_cont 페이징) — 1페이지(~100건) 초과
+                    # 보유가 통째 누락되던 KR/US 비대칭 버그 수정(국내 _raw_balance 와 동형). 부분성공 보존.
+                    d = await self._paged_get(
+                        "/uapi/overseas-stock/v1/trading/inquire-balance", "TTTS3012R",
+                        {"CANO": c, "ACNT_PRDT_CD": p, "OVRS_EXCG_CD": excd, "TR_CRCY_CD": "USD",
+                         "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""},
+                        fk_key="CTX_AREA_FK200", nk_key="CTX_AREA_NK200", out_keys=("output1",))
                     for h in (d.get("output1") or []):
                         q = self._int(h.get("ovrs_cblc_qty"))
                         if q <= 0:
@@ -707,19 +792,20 @@ class KISBroker:
         """해외주식 원화환산 평가합계 + 기준환율 (CTRP6504R inquire-present-balance).
         사장 피드백 2026-05-20: 국내 inquire-balance 의 nass_amt(총평가)는 해외주식 평가를
         포함하지 않으므로, 통합 총평가 보정에 쓸 해외 원화평가합계를 별도 조회한다.
-        실패/모의투자 미지원 시 {ok:False}. (실전 전용 — 모의 base_url 이면 시도하되 실패 허용.)"""
+        실패/모의투자 미지원 시 {ok:False}. (실전 전용 — 모의 base_url 이면 시도하되 실패 허용.)
+        사장 지시 2026-06-01: NATN_CD '000'(전체국가)로 호출(미국 외 보유 누락 방지)하고, 같은 응답의
+        output3 통합총자산(tot_asst_amt)·총예수금·총평가손익, output2 외화예수금(frcr_dncl_amt_2)까지 파싱해
+        반환한다(추가 호출 0) — 통합총자산 교차검증·예수금 직접산출에 쓴다."""
         try:
-            s = await self._s(); c, p = self._acnt()
-            async def _do(tk):
-                async with s.get(f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-present-balance",
-                    headers=self._h(tk, "CTRP6504R"),
-                    params={"CANO":c,"ACNT_PRDT_CD":p,"WCRC_FRCR_DVSN_CD":"02","NATN_CD":"840",
-                            "TR_MKET_CD":"00","INQR_DVSN_CD":"00"}) as r:
-                    return await r.json()
-            d = await self._authed_json(_do)
-            if d.get("rt_cd") != "0":
+            c, p = self._acnt()
+            d = await self._get_json("/uapi/overseas-stock/v1/trading/inquire-present-balance", "CTRP6504R",
+                {"CANO": c, "ACNT_PRDT_CD": p, "WCRC_FRCR_DVSN_CD": "02", "NATN_CD": "000",
+                 "TR_MKET_CD": "00", "INQR_DVSN_CD": "00"})
+            if str(d.get("rt_cd", "")) != "0":
                 return {"ok": False, "krw_value": 0.0, "stock_value": 0.0, "exrt": 0.0}
             o3 = d.get("output3") or {}
+            if isinstance(o3, list):
+                o3 = o3[0] if o3 else {}
             # 사장 지시 2026-05-28: 외화평가총액 = frcr_evlu_tota (USD 예수금 포함, 원화환산).
             # 이전엔 evlu_amt_smtl_amt(해외 '주식만' 평가합계)를 더해 USD 예수금 484불(~727K)이 빠져
             # 우리 화면이 KIS 앱 총자산보다 ~737K 낮게 표시됐다(사장 보고 2026-05-28).
@@ -731,11 +817,116 @@ class KISBroker:
             # 주식분만 재계산하고 예수금분(총액−주식분)은 캐시값을 보존하기 위함(자산곡선 동결 방지).
             stock_value = self._num(o3.get("evlu_amt_smtl_amt"))
             o2 = d.get("output2") or []
+            if isinstance(o2, dict):
+                o2 = [o2]
             exrt = self._num(o2[0].get("frst_bltn_exrt")) if o2 else 0.0
-            return {"ok": True, "krw_value": krw_value, "stock_value": stock_value, "exrt": exrt}
+            # 사장 지시 2026-06-01: 외화예수금을 역산(총액−주식분) 대신 직접 필드로 — 시점차·환율차 누적오차 제거.
+            deposit_frcr = self._num(o2[0].get("frcr_dncl_amt_2")) if o2 else 0.0
+            deposit_krw = deposit_frcr * exrt if exrt > 0 else 0.0
+            return {"ok": True, "krw_value": krw_value, "stock_value": stock_value, "exrt": exrt,
+                    "tot_asst_amt": self._num(o3.get("tot_asst_amt")),
+                    "tot_dncl_amt": self._num(o3.get("tot_dncl_amt")),
+                    "tot_evlu_pfls_amt": self._num(o3.get("tot_evlu_pfls_amt")),
+                    "deposit_krw": deposit_krw}
         except Exception as e:
             logger.warning(f"[해외원화평가] CTRP6504R 실패: {e}")
             return {"ok": False, "krw_value": 0.0, "stock_value": 0.0, "exrt": 0.0}
+
+    # ═══════════════ 신규 권위조회 (사장 지시 2026-06-01, KIS 공식샘플 정독 반영) ═══════════════
+    # 잔고/주문 한도를 추정(D+2·환율 합성) 대신 KIS 권위 전용조회로. 실전 전용 TR(6548/6010/8494)은
+    # 모의 미지원이라 is_mock 이면 호출 자체를 skip(매 사이클 무용 호출·거부로그·TPS 소모 방지).
+    async def kr_psbl_order(self, code: str, unpr: float = 0.0) -> Dict:
+        """국내 매수가능 (TTTC8908R). ★ORD_DVSN='01'(시장가)로 호출해야 종목 증거금율이 반영된
+        nrcvb_buy_qty(미수없는 매수가능수량)를 준다(지정가 '00'은 미반영→과대). 실패 시 {ok:False,buy_qty:None}."""
+        c, p = self._acnt()
+        d = await self._get_json("/uapi/domestic-stock/v1/trading/inquire-psbl-order", "TTTC8908R",
+            {"CANO": c, "ACNT_PRDT_CD": p, "PDNO": code, "ORD_UNPR": str(int(unpr or 0)),
+             "ORD_DVSN": "01", "CMA_EVLU_AMT_ICLD_YN": "N", "OVRS_ICLD_YN": "N"})
+        if str(d.get("rt_cd", "")) != "0":
+            return {"ok": False, "buy_qty": None, "cash": 0.0, "msg1": d.get("msg1", "")}
+        o = d.get("output") or {}
+        return {"ok": True, "buy_qty": self._int(o.get("nrcvb_buy_qty")),
+                "cash": self._num(o.get("ord_psbl_cash"))}
+
+    async def kr_psbl_sell_qty(self, code: str) -> Optional[int]:
+        """국내 매도가능수량 (TTTC8408R). ord_psbl_qty. 빈값/실패 시 None(폴백은 호출부에서 hldg_qty —
+        주문 절대 드롭 금지)."""
+        c, p = self._acnt()
+        d = await self._get_json("/uapi/domestic-stock/v1/trading/inquire-psbl-sell", "TTTC8408R",
+            {"CANO": c, "ACNT_PRDT_CD": p, "PDNO": code})
+        if str(d.get("rt_cd", "")) != "0":
+            return None
+        o = d.get("output")
+        if isinstance(o, list):
+            o = o[0] if o else {}
+        v = (o or {}).get("ord_psbl_qty")
+        return self._int(v) if v not in (None, "") else None
+
+    async def us_buying_power(self, ticker: str, unpr: float, excg: Optional[str] = None) -> Dict:
+        """해외 매수가능 (TTTS3007R). USD 주문가능금액(ord_psbl_frcr_amt)·최대수량·환율을 직접 준다 —
+        KR 원화예수금을 환율로 나눈 합성 대신 사용(통화혼용·과대사이징 방지). 실패 시 {ok:False}."""
+        c, p = self._acnt()
+        d = await self._get_json("/uapi/overseas-stock/v1/trading/inquire-psamount", "TTTS3007R",
+            {"CANO": c, "ACNT_PRDT_CD": p, "OVRS_EXCG_CD": (excg or "NASD"),
+             "OVRS_ORD_UNPR": f"{float(unpr or 0):.4f}", "ITEM_CD": (ticker or "").upper()})
+        if str(d.get("rt_cd", "")) != "0":
+            return {"ok": False, "usd": 0.0, "qty": 0, "exrt": 0.0, "msg1": d.get("msg1", "")}
+        o = d.get("output") or {}
+        return {"ok": True, "usd": self._num(o.get("ord_psbl_frcr_amt")),
+                "qty": self._int(o.get("max_ord_psbl_qty")), "exrt": self._num(o.get("exrt"))}
+
+    async def kr_account_asset(self) -> Dict:
+        """투자계좌자산현황 (CTRP6548R) — KR+US 통합 총자산(tot_asst_amt). 대시보드 '현재 총자산' 표시 전용
+        (예수금이 D0 기반이라 자산곡선엔 쓰지 않는다 — 5/28 D0 금지). 모의 미지원 → skip."""
+        if self.is_mock:
+            return {"ok": False}
+        c, p = self._acnt()
+        d = await self._get_json("/uapi/domestic-stock/v1/trading/inquire-account-balance", "CTRP6548R",
+            {"CANO": c, "ACNT_PRDT_CD": p, "INQR_DVSN_1": "", "BSPR_BF_DT_APLY_YN": ""})
+        if str(d.get("rt_cd", "")) != "0":
+            return {"ok": False}
+        o = d.get("output2") or {}
+        if isinstance(o, list):
+            o = o[0] if o else {}
+        return {"ok": True, "tot_asst_amt": self._num(o.get("tot_asst_amt")),
+                "tot_dncl_amt": self._num(o.get("tot_dncl_amt"))}
+
+    async def _overseas_settled_krw(self) -> Dict:
+        """해외 결제기준잔고 (CTRP6010R) — 외화잔고 원화평가합계(frcr_cblc_wcrc_evlu_amt_smtl, 결제기준).
+        자산곡선 해외분을 국내 D+2와 같은 결제기준으로 맞춰 결제 과도기 출렁임을 줄인다. 모의 미지원 → skip."""
+        if self.is_mock:
+            return {"ok": False}
+        c, p = self._acnt()
+        bass = datetime.now(KST).strftime("%Y%m%d")
+        d = await self._get_json("/uapi/overseas-stock/v1/trading/inquire-paymt-stdr-balance", "CTRP6010R",
+            {"CANO": c, "ACNT_PRDT_CD": p, "BASS_DT": bass, "WCRC_FRCR_DVSN_CD": "01", "INQR_DVSN_CD": "00"})
+        if str(d.get("rt_cd", "")) != "0":
+            return {"ok": False}
+        o = d.get("output3") or {}
+        if isinstance(o, list):
+            o = o[0] if o else {}
+        return {"ok": True, "krw": self._num(o.get("frcr_cblc_wcrc_evlu_amt_smtl")),
+                "tot_asst_amt2": self._num(o.get("tot_asst_amt2"))}
+
+    async def kr_realized_pnl_audit(self) -> Dict:
+        """국내 실현손익(TTTC8494R, 비용반영 COST_ICLD_YN='Y') — 우리 체결기반 실현손익 KPI 교차검증용
+        (주문 무영향). 모의 미지원 가능 → skip. output1 의 rlzt_pfls 합산."""
+        if self.is_mock:
+            return {"ok": False}
+        c, p = self._acnt()
+        d = await self._get_json("/uapi/domestic-stock/v1/trading/inquire-balance-rlz-pl", "TTTC8494R",
+            {"CANO": c, "ACNT_PRDT_CD": p, "AFHR_FLPR_YN": "N", "OFL_YN": "",
+             "INQR_DVSN": "00", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N",
+             "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "00", "COST_ICLD_YN": "Y",
+             "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""})
+        if str(d.get("rt_cd", "")) != "0":
+            return {"ok": False}
+        # 라이브 검증 2026-06-01: 실현손익은 output2(요약) rlzt_pfls/rlzt_erng_rt 에 있다(output1 아님).
+        o2 = d.get("output2") or {}
+        if isinstance(o2, list):
+            o2 = o2[0] if o2 else {}
+        return {"ok": True, "realized": self._num(o2.get("rlzt_pfls")),
+                "realized_rt": self._num(o2.get("rlzt_erng_rt"))}
 
     # 사장 지시 2026-05-21: 해외 원화평가 캐시 — KIS 해외잔고 조회가 간헐 실패하면 US 평가가
     # 통째로 빠져 통합 총평가가 ~16% 급락(자산곡선 -16% 글리치)한다. 마지막 정상값을 디스크에
@@ -896,8 +1087,16 @@ class KISBroker:
         #    않는다. USD 보유가 있으면 present-balance(원화환산 평가합계)를 더해 총자산을 맞춘다.
         #    + 각 USD 종목에 원화환산 평가액(krw_value)을 부여(프론트 표시용). ──
         bp = dict(snap["buying_power"])
+        # 사장 지시 2026-06-03: snap.total_eval 은 이제 캐시 해외분을 포함(kr_account_snapshot)하므로,
+        # 곡선용 합산은 KR 기준(total_eval_kr)에서 다시 시작해 아래 fresh/결제기준 해외분만 더한다(이중계상 방지).
+        if bp.get("total_eval_kr") is not None:
+            bp["total_eval"] = self._num(bp["total_eval_kr"])
         _now = time.time()
         _us_in_holdings = any(h.get("ccy") == "USD" for h in holdings)
+        # 사장 결정 2026-06-01: 모의계정도 해외평가를 표시한다(_mock_tr 표준화로 VTRP6504R 이 읽혀
+        # frcr_evlu_tota≈379M 가 HTS 와 근접). 단 모의서버 기준환율(frst_bltn_exrt)이 비정상(221.9)일 수
+        # 있어, 아래에서 환율을 전역 FX 캐시에 먹일 땐 sanity 가드(>500)로 garbage 전파를 막는다.
+        # (총평가에 더하는 krw_value=frcr_evlu_tota 는 KIS 산출값이라 환율 오류와 무관.)
         # 항상 권위 조회(ok 플래그 보유)로 US 원화평가를 확인 — 실패/진짜없음/정상을 구분해
         # 곡선·총평가가 조회 실패로 ~16% 급락하지 않게 한다.
         pk = await self._overseas_present_krw()
@@ -905,7 +1104,9 @@ class KISBroker:
         if pk["ok"] and pk["krw_value"] > 0:
             krw = pk["krw_value"]                         # 조회 성공 + 평가 있음 = 권위값
             self._set_overseas_cache(krw, _now, stock=pk.get("stock_value"), exrt=pk.get("exrt"))
-            if pk["exrt"] > 0:
+            # 사장 지시 2026-06-01: 기준환율 sanity 가드 — 모의서버가 비정상 환율(221.9 등)을 주면
+            # 전역 FX 캐시(예산·리스크 환산)가 오염돼 실전 계정까지 망가진다. USD/KRW 는 역사적으로 500↑.
+            if pk["exrt"] > 500:
                 bp["fx_rate"] = pk["exrt"]
                 # 사장 지시 2026-05-22: 5분 폴러가 매번 호출하는 이 경로의 KIS 기준환율을
                 # 라이브 FX 캐시에 먹여, 예산·리스크 환산이 최신 환율을 쓰게 한다.
@@ -942,9 +1143,27 @@ class KISBroker:
                 else:
                     krw = _ck
                 bp["overseas_krw_stale"] = True
-        if krw and krw > 0:
-            bp["total_eval"] = self._num(bp.get("total_eval")) + krw
-            bp["overseas_krw"] = krw
+        # 사장 결정 2026-06-01: 자산곡선의 해외분은 '결제기준'(CTRP6010R)으로 — 국내 D+2와 같은 결제기준에
+        # 맞춰 결제 과도기 곡선 출렁임을 줄인다. 결제기준 조회 성공(실전)이면 그 값을, 실패(모의 등)면 위에서
+        # 구한 실시간 krw 로 폴백한다. (per-종목 krw_value 표시는 실시간 환율 유지 — '표시=실시간')
+        settled = await self._overseas_settled_krw()
+        curve_overseas = settled["krw"] if (settled.get("ok") and self._num(settled.get("krw")) > 0) else krw
+        if curve_overseas and curve_overseas > 0:
+            bp["total_eval"] = self._num(bp.get("total_eval")) + curve_overseas
+            bp["overseas_krw"] = curve_overseas
+            if settled.get("ok") and self._num(settled.get("krw")) > 0:
+                bp["overseas_settled"] = True
+        # 사장 결정 2026-06-01: 대시보드 '현재 총자산'은 KIS 통합총자산(CTRP6548R tot_asst_amt)으로 — HTS와
+        # 일치(실시간). 단 이 값은 예수금이 D0 기반이라 자산곡선(total_eval)엔 절대 반영하지 않는다(5/28 D0 금지).
+        # 곡선식 total_eval 과 괴리가 크면(>1%) 경고로 표면화 — 'US 평가 동결/날조' 조기탐지.
+        asset = await self.kr_account_asset()
+        if asset.get("ok") and self._num(asset.get("tot_asst_amt")) > 0:
+            _ta = self._num(asset["tot_asst_amt"])
+            bp["display_total_asset"] = _ta
+            _cv = self._num(bp.get("total_eval"))
+            if _cv > 0 and abs(_ta - _cv) / _cv > 0.01:
+                logger.warning(f"[총자산 검증] KIS통합 {_ta:,.0f}원 vs 곡선식 {_cv:,.0f}원 "
+                               f"({(_ta - _cv) / _cv * 100:+.1f}%) — 구성차(D0예수금/미결제 등) 확인")
         return {"buying_power": bp, "holdings": holdings,
                 "holdings_stale": snap.get("holdings_stale", False), "ok": snap.get("ok", False)}
 

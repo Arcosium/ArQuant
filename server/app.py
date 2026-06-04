@@ -210,11 +210,16 @@ class WS:
             except: dead.append(c)
         for d in dead: self.disconnect(d)
     async def send_to_uid(self, uid, msg):
-        """특정 유저의 연결에만 송신 (피드백 답글 알림)."""
+        """특정 유저의 연결에만 송신 (per-uid 사이클 이벤트·피드백 답글).
+        버그수정 2026-06-01: per-uid 송신도 _should_send 필터를 거쳐야 한다 — 안 그러면 cycle_complete
+        등 사이클 이벤트가 모바일 알림설정(예: '사이클 완료' OFF)을 우회해 계속 푸시됐다(웹은 전부 수신)."""
         dead=[]
         for c in self.conns:
-            if (self.meta.get(c) or {}).get("uid") == uid:
-                try: await c.send_json(msg)
+            m = self.meta.get(c) or {}
+            if m.get("uid") == uid:
+                try:
+                    if _should_send(m, msg):
+                        await c.send_json(msg)
                 except: dead.append(c)
         for d in dead: self.disconnect(d)
     async def send_to_admins(self, msg):
@@ -983,12 +988,16 @@ async def balance(request: Request):
                 record_equity(ctx.swarm.equity_path, snap["buying_power"], "poll")
             except Exception as e:
                 logger.warning(f"[balance] equity 기록 실패(uid={uid}): {e}")
+        # 사장 지시 2026-06-01: 모의계정은 KIS 모의서버가 해외평가를 미지원해 잔고(총평가)가 부정확하므로,
+        # 대시보드에서 '잔고'는 숨기고 '수익(실현손익)'만 표시한다 → 프론트가 is_mock 플래그로 분기.
         return {"buying_power": snap["buying_power"], "holdings": snap["holdings"],
-                "holdings_stale": snap.get("holdings_stale", False)}
+                "holdings_stale": snap.get("holdings_stale", False),
+                "is_mock": bool(getattr(ctx.broker, "is_mock", False))}
     except Exception as e:
         # KIS 잔고 글리치/조회실패를 조용히 0으로 표시하면 자산곡선이 튄다(알려진 함정) — 로깅으로 표면화.
         logger.warning(f"[balance] 조회 실패(uid={uid}) — buying_power 0 폴백: {e}")
-        return {"buying_power": {"cash":0.0,"total_eval":0.0,"pnl_ratio":0.0,"ok":False}, "holdings": []}
+        return {"buying_power": {"cash":0.0,"total_eval":0.0,"pnl_ratio":0.0,"ok":False}, "holdings": [],
+                "is_mock": bool(getattr(ctx.broker, "is_mock", False))}
 
 @app.get("/api/equity")
 async def equity(request: Request, limit: int = 500, view: str = "realtime"):
@@ -1026,7 +1035,46 @@ async def performance(request: Request):
     uid = _uid_or_403(request)
     ctx = REGISTRY.get_or_create(uid)
     base = performance_kpis(ctx.swarm.equity_path, uid=uid)
-    return await _attach_current_fallback(base, ctx.broker)
+    out = await _attach_current_fallback(base, ctx.broker)
+    # 사장 지시 2026-06-01: 모의계정은 '현재 평가액(잔고)' 숨기고 '누적 수익'만 표시 → 프론트 분기용 플래그.
+    out["is_mock"] = bool(getattr(ctx.broker, "is_mock", False))
+    return out
+
+def _scorecard_for_uid(uid: int):
+    """에이전트 성과 스코어카드 (사장 지시 2026-06-04 ④) — 예측신호(scorecard_store)·체결(trade_log)·
+    자산곡선·후속가격을 조인해 에이전트별 지표(IC·슬리피지·알파/베타)를 계산한다. 결손은 None/n 으로 표기."""
+    import runtime as _rt
+    from infra import scorecard_store, user_paths
+    from tools.agent_scorecard import compute_scorecard
+    from tools.market_data import forward_return_after
+    from main_swarm import get_equity_series
+    window = int(_rt.get("SCORECARD_WINDOW_DAYS", uid=uid) or 30)
+    signals = scorecard_store.list_signals(uid=uid, limit=5000)
+    try:
+        ep = REGISTRY.get_or_create(uid).swarm.equity_path
+        eq = get_equity_series(ep, limit=600, view="realtime")
+    except Exception:
+        eq = []
+    try:
+        import json as _json
+        tp = user_paths.trade_log_path(uid)
+        trades = _json.loads(tp.read_text(encoding="utf-8")) if tp.exists() else []
+    except Exception:
+        trades = []
+
+    def _price_lookup(code, ts):
+        try:
+            return forward_return_after(code, ts, window_days=window)
+        except Exception:
+            return None
+    return compute_scorecard(signals, trades, eq, bench=[], price_lookup=_price_lookup, window_days=window)
+
+
+@app.get("/api/scorecard")
+async def api_scorecard(request: Request):
+    """에이전트 성과 귀인 카드 — 요청 유저 기준(인증 필요)."""
+    return _scorecard_for_uid(_uid_or_403(request))
+
 
 @app.get("/api/benchmark")
 async def benchmark(request: Request, view: str = "daily"):

@@ -113,23 +113,11 @@ def _param_tuning_addendum() -> str:
     튜닝 파라미터(param_overrides)로만 의도를 표현하게 한다."""
     try:
         import config
-        keys = config.STRATEGY_TUNABLE_KEYS
-        meta = config.STRATEGY_KEY_META or {}
+        # 사장 지시 2026-06-04: 라벨만이 아니라 범위 + '효과(올리면/내리면)'까지 담은 카탈로그를
+        # 주입해 운용지원실장이 전략 지시를 파라미터로 충실히 번역하도록 한다(STRATEGY_KEY_META에서 동적 생성).
+        keylist = config.strategy_param_catalog_text()
     except Exception:
-        keys, meta = [], {}
-    lines = []
-    for k in keys:
-        m = meta.get(k, {})
-        if m.get("deprecated"):
-            continue
-        lbl = m.get("label", "")
-        rng = ""
-        if m.get("type") == "bool":
-            rng = "true/false"
-        elif "min" in m and "max" in m:
-            rng = f"{m['min']}~{m['max']} {m.get('unit','')}".strip()
-        lines.append(f"  - {k}: {lbl} ({rng})" if rng else f"  - {k}: {lbl}")
-    keylist = "\n".join(lines)
+        keylist = ""
     return (
         "\n\n## ⛔ 비관리자(non-ADMIN) 프로필 — 강제 모드 (사장 피드백 2026-05-18)\n"
         "이 워커는 **비관리자 계정**의 지시로 실행 중입니다. ArQuant는 단일 공유 소스이므로 "
@@ -138,8 +126,28 @@ def _param_tuning_addendum() -> str:
         "- 대신 이 프로필에만 적용될 **튜닝 파라미터**를 `param_overrides` 객체로 출력하십시오.\n"
         "- `restart` 는 무시됩니다. 항상 false 로 두십시오.\n"
         "- 자격증명·계좌·소스 식별자는 절대 param_overrides 에 넣지 마십시오(거부됨).\n\n"
-        "### param_overrides 허용 키 (이 외 키는 조용히 탈락)\n"
+        "### param_overrides 허용 키 — 라벨·범위·효과 카탈로그 (이 외 키는 조용히 탈락)\n"
+        "각 키의 '효과'는 값을 올리면/내리면(켜면/끄면) 어느 방향(공격↔방어, 추세↔역추세)으로 가는지입니다. "
+        "전략 지시를 이 효과에 맞춰 여러 파라미터로 **함께** 번역하십시오(한 개만 만지지 말 것).\n"
         f"{keylist}\n\n"
+        "### 전략 지시 → 파라미터 번역 플레이북 (예시일 뿐 — 데이터·맥락에 맞게 LLM이 직접 판단)\n"
+        "퀀트 점수는 결정론 엔진(지표별 QIW_*·차원 DW_*, 음수 가능)으로 산정됩니다. 전략 색깔은 이 가중치로 표현하십시오.\n"
+        "- **급락장 대비/방어**: MIN_CASH_BUFFER↑ · PER_ORDER_BUDGET_RATIO↓ · STOP_LOSS_PCT 타이트↓ · CONSERVATIVE_MDD↓ · "
+        "QIW_VOL↑(고변동 페널티)·QIW_FLOW↑(수급)·QIW_CMF↑ · DW_MACRO↑ · MIN_QUANT_SCORE↑(예 7) · MAX_TRADES_PER_CYCLE↓.\n"
+        "- **추세추종**: QIW_ADX↑·QIW_MOM↑·QIW_HIGH52↑ · QIW_VWAP 음수(추격 허용) · DW_QUANT↑ · TAKE_PROFIT_PCT↑(길게).\n"
+        "- **역추세/평균회귀**: QIW_RSI↑(과매도 매수)·QIW_VWAP↑(과이격 회피) · QIW_MOM 음수(낙폭과대) · TAKE_PROFIT_PCT↓.\n"
+        "- **모멘텀/테마**: QIW_MOM↑·QIW_MACD↑ · DW_NEWS↑(뉴스 비중) · MIN_QUANT_SCORE↑ · PER_ORDER_BUDGET_RATIO↑.\n"
+        "- **뉴스 경시(차트만)**: DW_NEWS↓ 또는 음수 · DW_QUANT↑.  **매크로 추종 강화**: DW_MACRO↑.\n"
+        "- **고배당/저변동 방어**: QIW_VOL↑(또는 매우 크게) · QIW_HIGH52 음수(고점 회피) · CONSERVATIVE_STOCK_RATIO↓.\n"
+        "- **공격적 확대**: PER_ORDER_BUDGET_RATIO↑ · MAX_CYCLE_BUDGET_RATIO↑ · QIW_MOM↑ · QIW_VOL↓(또는 음수) · MIN_QUANT_SCORE↓.\n"
+        "- **점수 자체를 못 믿겠다(LLM로 회귀)**: DETERMINISTIC_SCORING=false (구 LLM 정성 채점으로 롤백).\n"
+        "- **포지션 사이징(제도권식)**: POSITION_SIZING_MODE=risk_weighted 면 점수↑·변동성↓ 종목에 예산을 더 싣습니다. "
+        "급락장엔 SIZING_TILT_STRENGTH↑(고확신·저변동 집중)·SIZING_MAX_TILT↑, 분산 강화엔 SIZING_TILT_STRENGTH↓(균등에 근접). equal=기존 균등분배.\n"
+        "- **유니버스 정제(급락장·품질)**: UNIVERSE_MIN_TURNOVER↑(유동성 확보)·UNIVERSE_MIN_PRICE↑(동전주 배제)·UNIVERSE_EXCLUDE_LEVERAGED=true(레버리지/인버스 배제).\n"
+        "- **집중 vs 분산**: MAX_BUY_NAMES↓ = 퀀트점수 상위 소수 집중(고확신), ↑ = 폭넓은 분산.\n"
+        "- **증거기반 튜닝**: 대시보드 /api/scorecard 의 에이전트 성과(퀀트·뉴스 IC, 슬리피지, 알파/베타)를 참고하십시오 — "
+        "IC 가 음수인 차원의 가중치(DW_*·QIW_*)를 재검토하고, 성과 좋은 차원에 비중을 더 싣습니다.\n"
+        "지시가 위에 없으면(예: '레버리지 비슷하게 가줘') 위 효과 카탈로그를 근거로 가장 가까운 방향의 파라미터 조합을 직접 구성하십시오.\n\n"
         "### 비관리자 응답 형식 (JSON 한 블록)\n"
         "```json\n"
         "{\n"

@@ -447,6 +447,27 @@ def load_daily_csv(code: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def forward_return_after(code: str, signal_ts: str, window_days: int = 30) -> Optional[float]:
+    """성과귀인(IC)용 — signal_ts(='YYYY-MM-DD ...') 시점 종가 대비 window_days(영업일) 경과 종가 수익률.
+    아직 미래 데이터가 없으면(최근 신호) 또는 데이터 부족이면 None(표본에서 제외 — 무음 안전)."""
+    try:
+        df = load_daily_csv(code)
+        if df is None or len(df) < 2:
+            return None
+        base = pd.to_datetime(str(signal_ts)[:10])
+        mask = df['date'] <= base
+        if not mask.any():
+            return None
+        start_pos = int(df.index[mask][-1])
+        end_pos = min(start_pos + int(window_days), len(df) - 1)
+        if end_pos <= start_pos:
+            return None
+        p0 = float(df['close'].iloc[start_pos]); p1 = float(df['close'].iloc[end_pos])
+        return (p1 / p0 - 1.0) if p0 > 0 else None
+    except Exception:
+        return None
+
+
 def load_investor_csv(code: str) -> Optional[pd.DataFrame]:
     """CSV에서 수급 데이터 로드"""
     path = DATA_DIR / f"investor_{code}.csv"
@@ -524,6 +545,88 @@ def _adx(daily_df, period: int = 14):
         return {"adx": float(adx.iloc[-1]), "plus_di": float(plus_di.iloc[-1]), "minus_di": float(minus_di.iloc[-1])}
     except Exception:
         return None
+
+
+def _cmf(daily_df, period: int = 20):
+    """Chaikin Money Flow(20). 매집(종가 고가근처)→+, 분산(저가근처)→−. 범위 -1..1, None if 데이터 부족.
+    (사장 지시 2026-06-04: 결정론 점수 엔진 신규 지표)"""
+    if daily_df is None or len(daily_df) < period:
+        return None
+    try:
+        h = daily_df['high'].astype(float); l = daily_df['low'].astype(float)
+        c = daily_df['close'].astype(float); v = daily_df['volume'].astype(float)
+        rng = (h - l).replace(0, 1e-9)
+        mfv = (((c - l) - (h - c)) / rng) * v
+        denom = v.rolling(period).sum().replace(0, 1e-9)
+        return float((mfv.rolling(period).sum() / denom).iloc[-1])
+    except Exception:
+        return None
+
+
+def compute_quant_indicators(code: str, daily=None, investor=None) -> dict:
+    """결정론 점수 엔진(tools/quant_score) 입력용 구조화 지표 dict (사장 지시 2026-06-04).
+    format_quant_data_for_agent 와 동일 계산을 '숫자'로 반환. 값 없는 지표는 키 자체를 생략한다
+    (indicator_signals 가 결손을 분모에서 제외). daily/investor 미주입 시 CSV 로드(테스트는 주입)."""
+    if daily is None:
+        daily = load_daily_csv(code)
+    if investor is None:
+        investor = load_investor_csv(code)
+    out: dict = {}
+    if daily is None or len(daily) < 20:
+        return out
+    close = daily['close'].astype(float)
+    last = float(close.iloc[-1])
+    rsi = _rsi(close, 14)
+    if rsi is not None:
+        out["rsi14"] = rsi
+    mh = _macd_hist(close)
+    if mh is not None and last:
+        out["macd_hist_pct"] = mh / last * 100.0
+    adx_dict = _adx(daily, 14)
+    if adx_dict is not None:
+        out["adx"] = adx_dict["adx"]
+        out["adx_dir"] = 1.0 if adx_dict["plus_di"] >= adx_dict["minus_di"] else -1.0
+    vwap = _vwap_20d(daily)
+    if vwap is not None and vwap > 0:
+        out["vwap_dev"] = (last / vwap - 1.0) * 100.0
+    if len(close) >= 21:
+        try:
+            out["sigma20"] = float(close.pct_change().tail(20).std() * (252 ** 0.5) * 100)
+        except Exception:
+            pass
+        try:
+            out["mom_1m"] = (last / float(close.iloc[-21]) - 1.0) * 100.0
+        except Exception:
+            pass
+    if len(close) >= 63:
+        try:
+            out["mom_3m"] = (last / float(close.iloc[-63]) - 1.0) * 100.0
+        except Exception:
+            pass
+    if len(daily) >= 252:
+        try:
+            high52 = float(daily['high'].astype(float).tail(252).max())
+            if high52 > 0:
+                out["high52_prox"] = last / high52
+        except Exception:
+            pass
+    cmf = _cmf(daily, 20)
+    if cmf is not None:
+        out["cmf"] = cmf
+    # flow — 외인+기관 순매수를 거래량 대비 비율로 정규화([-1,1] 사전정규화 신호)
+    if investor is not None and len(investor) > 0:
+        try:
+            net5 = float(investor['inst_net'].tail(5).sum() + investor['foreign_net'].tail(5).sum())
+            vol5 = float(daily['volume'].astype(float).tail(5).sum()) or 1.0
+            ratio = net5 / vol5
+            if len(investor) >= 20:
+                net20 = float(investor['inst_net'].tail(20).sum() + investor['foreign_net'].tail(20).sum())
+                vol20 = float(daily['volume'].astype(float).tail(20).sum()) or 1.0
+                ratio = 0.5 * ratio + 0.5 * (net20 / vol20)
+            out["flow"] = max(-1.0, min(1.0, ratio * 4.0))
+        except Exception:
+            pass
+    return out
 
 
 def format_quant_data_for_agent(code: str) -> str:

@@ -94,6 +94,7 @@ async def _coro(v):
 # ── ④ 평가액 동결 방지 (예수금 보존 라이브 폴백) ───────────────────────────────
 class _ValBroker(KISBroker):
     def __init__(self, present, us_holdings, cache):
+        self.is_mock = False                             # 실전 경로(모의 주입 없음)
         self._present = present
         self._us_holdings = us_holdings
         self._overseas_krw_cache = (cache[0], cache[1])  # (총평가, ts)
@@ -102,6 +103,14 @@ class _ValBroker(KISBroker):
 
     async def kr_account_snapshot(self, force=False):
         return {"buying_power": {"total_eval": 7975828.0, "cash": 7975828.0}, "holdings": [], "ok": True}
+
+    # Task 12 이후: 곡선 해외분=결제기준 우선. 이 테스트들은 결제기준/통합총자산 미사용(ok:False)
+    # 상태에서 실시간/캐시 폴백 경로를 검증한다.
+    async def _overseas_settled_krw(self):
+        return {"ok": False}
+
+    async def kr_account_asset(self):
+        return {"ok": False}
 
     async def _overseas_holdings(self):
         return list(self._us_holdings)

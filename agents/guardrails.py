@@ -110,8 +110,14 @@ def _check_single_order(o: Dict[str, Any], bp: Dict[str, Any], price_map: Dict[s
         issues.append("종목코드(ticker) 미지정")
     if qty <= 0:
         issues.append(f"주문 수량 비정상({qty})")
-    if qty > 1000:
-        issues.append(f"주문 수량({qty})이 1회 한도(1000주) 초과")
+    # 사장 지시 2026-06-04: 1회 한도는 매수에만 적용(매도=위험회피 전량청산은 보유수량으로 한정되므로
+    # 막지 않는다). 한도 = MAX_ORDER_QTY(>0) 우선, 없으면 config.HARD_MAX_ORDER_QTY. 사이징 단계에서
+    # 이 한도로 clamp 되므로 정상 주문은 여기서 걸리지 않는다(걸리면 비정상적으로 큰 수량 = 보수적 반려).
+    _mq = runtime.get("MAX_ORDER_QTY", uid=uid)
+    import config as _cfg
+    _qty_ceiling = int(_mq) if (_mq and _mq > 0) else int(_cfg.HARD_MAX_ORDER_QTY)
+    if side == "buy" and _qty_ceiling > 0 and qty > _qty_ceiling:
+        issues.append(f"주문 수량({qty})이 1회 한도({_qty_ceiling}주) 초과")
     if not reason or len(reason) < 5:
         issues.append("주문 사유(reason) 누락/불충분")
 
