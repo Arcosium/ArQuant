@@ -17,7 +17,7 @@
 
 ```
 Arquant/
-├── .env                       # API 키 (OpenRouter / KIS / Tavily / OpenDart)
+├── .env                       # API 키 (DeepSeek / KIS / OpenDart)
 ├── config.py                  # 중앙 설정 — 모델 배정, 출력 토큰 상한, 리스크 한도, 전략 프리셋(5종), 폴백 정책, STRATEGY_KEY_META
 ├── runtime.py                 # 전략 프리셋 영속화 + 런타임 오버라이드 + 사용자 정의 프리셋 (data/user_presets.json)
 ├── main_swarm.py              # FSM 오케스트레이터 — 감시 루프 + 2패스 분석 사이클 + 종목별 퀀트 + 사후관리 + DART 재심 + 분봉 진입 타이밍 watch loop
@@ -38,14 +38,13 @@ Arquant/
 │   ├── investor_*.csv         # 종목별 수급(기관/외인) 누적
 │   └── minute_*.csv           # 종목별 KIS 분봉(장중)
 ├── agents/
-│   ├── base_agent.py          # OpenRouter BaseAgent — 프롬프트 캐시(Anthropic), history 윈도우, per-agent max_tokens, **API 비용 추적**
+│   ├── base_agent.py          # DeepSeek BaseAgent — history 윈도우, per-agent max_tokens, API 비용 추적
 │   ├── specialists.py         # macro / quant / news / trader (자연어 보고) / post_manager / ops_support
 │   └── guardrails.py          # validate_order_draft() 결정론 검증 (KR=원/US=$ 분리) + risk_guard(DART + 재무 재심) / policy 페르소나
 ├── infra/
 │   ├── kis_broker.py          # KIS OpenAPI — 국내/해외 주식·채권 시세·주문·잔고, 멀티거래소 시세, 토큰 파일 캐시
 │   ├── ops_support_worker.py  # 운용지원실장 — 별도 프로세스 진단·파라미터 조정 제안 (코드 자가수정·재시작 RETIRED 2026-05-20)
 │   ├── cycle_store.py         # cycles.db CRUD + 보유기간 추적
-│   ├── news_classifier_log.py # 뉴스 분류 학습 로그 (주간 리뷰에서 키워드 가중치 조정에 활용)
 │   ├── ops_history.py         # 운용지원실장 변경 이력 누적
 │   └── weekly_review.py       # 주간 피드백 루프 (수요일 자동)
 ├── tools/
@@ -70,16 +69,13 @@ Arquant/
 │   ├── test_order_sizing.py      # _affordable_one_share 경계
 │   ├── test_parsing.py           # 매도결정/진입가/코드추출 파서
 │   ├── test_ops_worker_guards.py # 자가수정 롤백·diff상한·보호패턴 불변식
-│   ├── test_news_weight_tuner.py # 뉴스분류 폐루프 진단
 │   ├── test_backtest.py          # 백테스트 결정론·룩어헤드 없음
 │   └── test_notifier_metrics.py  # 알림/메트릭 '절대 예외 안 던짐'
-├── backtest/                                 # 프리셋 리스크/청산 규칙 백테스트 [신규]
-│   ├── engine.py                 # 과거 일봉 워크포워드 (LLM 픽은 SMA 프록시로 고정)
-│   └── report.py                 # 5개 프리셋 비교표 (python3.11 -m backtest.report)
+├── backtest/                                 # 전략 규칙 백테스트
+│   └── engine.py                 # 과거 일봉 워크포워드 엔진
 └── infra/ 추가 모듈 [신규]
     ├── notifier.py               # 운영자 실패 알림 (중복억제·파일싱크·선택적 웹훅)
-    ├── metrics.py                # 경량 구조화 메트릭 (data/metrics.jsonl)
-    └── news_weight_tuner.py      # 뉴스분류 폐루프 결정론 진단기
+    └── metrics.py                # 경량 구조화 메트릭 (data/metrics.jsonl)
 ```
 
 ---
@@ -89,23 +85,23 @@ Arquant/
 | # | 에이전트 | 역할 | 모델 | LLM 호출 |
 |---|---------|------|------|---------|
 | 1 | **운용전략실장** | Chief Orchestrator — **2패스**: ① 매크로 + 뉴스분석팀장 분석(원문 안 봄) → 후보 6종목 선정 / ② **종목별** 계량 평가 받아 최종 1~3개 매수 결정 + 자산 배분 권고(확대/축소/유지)를 매수 종목 수에 반영. 사이클 요약도 작성 | `moonshotai/kimi-k2.6` | ✅ 사이클당 3회 |
-| 2 | **전략리서치팀장** | Macro Analyst — 글로벌 지수·**Tavily 실시간 시황·해설**·뉴스·공시로 매크로 방향성 (30분 캐시) + **직전 사이클 자산 배분 권고를 컨텍스트로 기억** | `deepseek/deepseek-v4-flash` | ✅ |
-| 3 | **계량분석팀장** | Quant Analyst — **종목당 별개 호출**로 통일 5섹션 양식(추세·평균회귀·변동성·수급·뉴스연계)으로 평가, `퀀트점수: 코드=0~10` + 가중치 명시 + 선택적 `진입가: 코드=시장가/숫자/관망±X%` | `deepseek/deepseek-v4-flash` | ✅ 종목당 1회 |
-| 4 | **뉴스분석팀장** | News Analyst — **운용전략실장보다 먼저** 증권 속보를 KR/US/공통으로 분류해 종목/업종·이벤트·매크로 시사점 정리 → 후보 선정의 최우선 입력 | `deepseek/deepseek-v4-flash` | ✅ |
+| 2 | **전략리서치팀장** | Macro Analyst — 글로벌 지수·**Tavily 실시간 시황·해설**·뉴스·공시로 매크로 방향성 (30분 캐시) + **직전 사이클 자산 배분 권고를 컨텍스트로 기억** | `deepseek-v4-flash` | ✅ |
+| 3 | **계량분석팀장** | Quant Analyst — **종목당 별개 호출**로 통일 5섹션 양식(추세·평균회귀·변동성·수급·뉴스연계)으로 평가, `퀀트점수: 코드=0~10` + 가중치 명시 + 선택적 `진입가: 코드=시장가/숫자/관망±X%` | `deepseek-v4-flash` | ✅ 종목당 1회 |
+| 4 | **뉴스분석팀장** | News Analyst — **운용전략실장보다 먼저** 증권 속보를 KR/US/공통으로 분류해 종목/업종·이벤트·매크로 시사점 정리 → 후보 선정의 최우선 입력 | `deepseek-v4-flash` | ✅ |
 | ⚙️ | *뉴스 큐레이터* (내부) | 누적 헤드라인이 `NEWS_PREFILTER_TRIGGER`(40)건 초과면 **결정론적 키워드 스코어링**으로 굵직한 40건 선별 → **LLM 미호출, 파싱 실패 X** | (파이썬 결정론) | — |
 | ⚙️ | *뉴스 분류기* (내부) | 매 크롤마다 신규 헤드라인을 **LLM 배치 분류** → KR/US/BOTH 정확 라벨링. 검색 능력으로 기업명 → 상장 시장 자체 lookup → **화이트리스트·anti-example 불필요**. | `alibaba/tongyi-deepresearch-30b-a3b` (8차) | ✅ 크롤 시 |
 | ⚙️ | *매크로 리서치* (내부) | 매크로 분석가 호출 직전, 세션별 1개 종합 쿼리로 외국인 수급·정책·심리·지정학 합성 (Tavily 대체) | `alibaba/tongyi-deepresearch-30b-a3b` (8차) | ✅ 매크로마다 |
-| 5 | **트레이딩팀장** | Trader — **실행 직후** 체결 결과(체결가 포함) + 매매 사유를 한국어 산문으로 보고. JSON/표/마크다운 금지 | `deepseek/deepseek-v4-flash` | ✅ 실행 후 |
-| 6 | **리스크관리실장** | Risk Guard — ① 파이썬 결정론 룰 게이트(KR=원/US=$ 자동 분리 표기) → ② 통과한 **매수** 종목의 **DART 최근 공시 + 직전연도 요약재무(재무상태표/손익계산서) 재심** | 룰 엔진 (Python) + `openrouter/free` | ✅ 매수 있을 때 |
+| 5 | **트레이딩팀장** | Trader — **실행 직후** 체결 결과(체결가 포함) + 매매 사유를 한국어 산문으로 보고. JSON/표/마크다운 금지 | `deepseek-v4-flash` | ✅ 실행 후 |
+| 6 | **리스크관리실장** | Risk Guard — ① 파이썬 결정론 룰 게이트 → ② 통과한 매수 종목의 DART 공시·재무 재심 | 룰 엔진 + `deepseek-v4-flash` | ✅ 매수 있을 때 |
 | 7 | **사후관리실장** | Post-Management — **현재 세션 시장의 보유 종목**만 자유 재결정, 반대편 시장 종목은 자동 `보유`. 매크로 → 계량 → 뉴스 → 평가손익 순 가중 (`매도결정: 코드=전량/절반/보유`) | `moonshotai/kimi-k2.6` | ✅ 보유 있을 때 |
-| 8 | **수탁자책임실장** | Policy Filter — 수탁자 책임·정책 적합성 필터 (간단 분류) | `openrouter/free` | ✅ |
-| 8 | **운용지원실장** | Ops Support — 사이클 결과를 진단하고 **프로필 한정 전략 파라미터 조정**을 제안. **코드 자가수정·서버 재시작·산하 팀장 위임은 2026-05-20 폐지(RETIRED)**. ADMIN·일반 유저 모두 사용(본인 프로필 파라미터만). | `deepseek/deepseek-v4-pro` | ✅ 사이클 후 |
+| 8 | **수탁자책임실장** | Policy Filter — 수탁자 책임·정책 적합성 필터 | `deepseek-v4-flash` | ✅ |
+| 8 | **운용지원실장** | Ops Support — 사이클 결과를 진단하고 **프로필 한정 전략 파라미터 조정**을 제안. **코드 자가수정·서버 재시작·산하 팀장 위임은 2026-05-20 폐지(RETIRED)**. ADMIN·일반 유저 모두 사용(본인 프로필 파라미터만). | `deepseek-v4-pro` | ✅ 사이클 후 |
 
 **모델 배정 원칙** (config.py:MODEL_ASSIGNMENTS)
 - 최종 매수 결정자 (운용전략실장·사후관리실장) → **Kimi K2.6** (3000 tok) — 고지능 추론
 - 매크로·계량·뉴스·트레이더 → **DeepSeek V4 Flash** (1800/4096/2600/1500 tok) — 빠르고 저렴
 - **뉴스 분류기** → **`tencent/hy3-preview`** (12K tok, reasoning 모델) — 정확한 KR/US/BOTH 분류
-- 리스크·정책 → **`openrouter/free`** — 비용 0, 폴백·단순 분류
+- 리스크·정책 → **`deepseek-v4-flash`**
 - 운용지원실장 → **DeepSeek V4 Pro** (8000 tok) — 진단·파라미터 조정 제안의 정확성 우선
 - 변경: `config.py`의 `MODEL_ASSIGNMENTS` / `AGENT_MAX_TOKENS` 한 곳에서.
 
@@ -538,7 +534,7 @@ KIS 시장가 주문은 응답에 정확한 체결가를 안 주지만, **주문
 
 | 항목 | Tavily (이전) | alibaba (현재) |
 |------|--------------|----------------|
-| API 키 | 별도 `TAVILY_API_KEY` 필요 | OpenRouter 통합 |
+| API 키 | 별도 검색 키 또는 Hermes 검색 백엔드 | DeepSeek 공식 API |
 | 호출 패턴 | 4개 단일 쿼리 × 검색 결과 raw 반환 | 1개 종합 쿼리 → 합성 답변 |
 | 응답 형식 | 검색 결과 리스트 (raw URL + 발췌) | 한국어 합성 분석 (해설 + 출처 인용) |
 | 사이클당 비용 | ~$0.02–0.04 | ~$0.01–0.02 (reasoning 토큰 포함) |
@@ -616,7 +612,7 @@ KIS 시장가 주문은 응답에 정확한 체결가를 안 주지만, **주문
 
 - 8/8 (alibaba, 3초) — 사용자 표본 데이터 전수 정답
 - 이전 (tencent/hy3): 10/10
-- 이전 (openrouter/free + 130줄 프롬프트): 26/26
+- 이전 무료 모델 대비 구조화 프롬프트 검증: 26/26
 
 ---
 
@@ -695,7 +691,7 @@ Cloudflare Access(Zero Trust)를 제거하고 **앱 자체 로그인**으로 전
 ### 모델
 - **로그인**: 아이디 + 비밀번호만.
 - **최초 등록**: 아이디(중복 확인, 3자 이상) + 비밀번호(**10자 이상 + 특수문자 1개 이상**, 서버가 최종 강제) +
-  OpenRouter API Key(필수) · KIS App Key/Secret · **한국투자증권 계좌번호** · Base URL.
+  DeepSeek API Key(필수) · KIS App Key/Secret · **한국투자증권 계좌번호** · Base URL.
   - **제거됨(5-5)**: 사용자별 DART Key 입력칸 + 계정 이름(선택) 필드. DART 공시는
     이제 서버 소유 단일 `OPENDART_API_KEY` 환경변수(`config.py:18`)로 전 계정 공통 처리
     → API 키 하드코딩·GitHub 유출 위험 제거, 사용자 입력 표면 축소.
@@ -713,7 +709,7 @@ Cloudflare Access(Zero Trust)를 제거하고 **앱 자체 로그인**으로 전
 ### 계정 복구 — 블라인드 인덱스(HMAC), 2인자 (2026-05-20 단순화)
 사용자가 아이디/비밀번호를 잊었을 때, **암호화된 자격증명을 복호하지 않고** 복구한다.
 - 복구 인자(**2종**, 본인만 알 수 있는 값): **한국투자증권 계좌번호 + KIS App Secret**.
-  (직전 3인자 KIS App Key+Secret+OpenRouter Key에서 단순화 — 계좌번호는 본인이 외우기 쉽고
+  (KIS App Key+Secret+DeepSeek Key에서 단순화 — 계좌번호는 본인이 외우기 쉽고
   App Secret은 비밀이라 본인확인에 충분.)
 - 저장 형태: 각 값의 `HMAC-SHA256` 블라인드 인덱스 컬럼
   (`kis_account_no_bidx` / `kis_app_secret_bidx`). HMAC 키는 Fernet 원본키에서
@@ -745,8 +741,8 @@ Cloudflare Access(Zero Trust)를 제거하고 **앱 자체 로그인**으로 전
 ### 프로필 관리 (2026-05-20 — 신규)
 로그인 후 우상단 **프로필** 버튼 → 모달(아코디언)에서 본인 계정을 직접 관리한다. 모든 변경은 감사 로그(JSONL)에 기록.
 - **비밀번호 변경**(`POST /api/profile/password`): 현재 비번 확인 + 새 비번 정책 검증 후 argon2 재해시.
-- **API 자격증명 변경**(`POST /api/profile/credentials`): OpenRouter Key / KIS App Key·Secret / 계좌번호 / Base URL을
-  **부분 업데이트**(입력한 칸만). KIS·OpenRouter 값은 변경 시 **실호출 재검증**, 현재 활성 계정이면 런타임에 즉시 재주입.
+- **API 자격증명 변경**(`POST /api/profile/credentials`): DeepSeek Key / KIS App Key·Secret / 계좌번호 / Base URL을
+  부분 업데이트. KIS·DeepSeek 값은 변경 시 실호출 재검증하고 런타임에 즉시 재주입.
 - **상시 지시사항**(`GET/POST/DELETE /api/profile/directives`): 본인 계정 상시 지시 추가·삭제(위 📌 섹션, tombstone 영구삭제).
 - **회원 탈퇴**(`POST /api/profile/delete_account`): **비밀번호 재확인** 후 계정·세션·자격증명·프로필 폴더(`data/profiles/<uid>`) 영구 삭제.
   단독 ADMIN 보호 — ADMIN 계정은 탈퇴 불가(영구 잠금 방지).
@@ -786,7 +782,7 @@ cloudflared tunnel run hyfe-iqc
 1. **▶ 실행** — 무한 감시 루프 시작 (재접속 시 `/api/status.is_running`으로 버튼 자동 동기화)
 2. 1시간마다 + 한국/미국 장 개장 시 2패스 분석 사이클 자동
 3. `@에이전트명` + 지시로 직접 개입 / **⏹ 중지**로 정지
-4. **제목바**: 제목 우측에 [💵 $X.XXX/h (N콜)] 표시 — 최근 1시간 API 비용·호출 수 (OpenRouter usage 기반 추정)
+4. **제목바**: 제목 우측에 [💵 $X.XXX/h (N콜)] 표시 — 최근 1시간 DeepSeek API 추정 비용·호출 수
 5. **탭 4개**:
    - **📊 대시보드** — 세션·시간(KST)·감지 뉴스·다음 사이클·완료 사이클·실매매·전략·장 상태 + 에이전트 통신 로그 (마크다운 잔여물 자동 정리)
    - **💰 수익률** — (좌) 평가금액 추이 [실시간/일별/월별 토글] / (우) 보유 종목·잔고 [카테고리 배지, 🔄 새로고침, OFF_HOURS면 자동폴링 일시정지·10분 주기] / (하) 전체 거래 내역 [KST 시각, 🗑️ 비우기]
@@ -796,13 +792,13 @@ cloudflared tunnel run hyfe-iqc
 > 모든 이벤트·에이전트 응답(전문, 무삭제)은 `claude_response.json`에 실시간 기록 (KST aware ISO).
 
 ### 💵 API 비용 추적 (사장 피드백 #7 — 신규)
-- `agents/base_agent.py`가 OpenRouter `usage` 필드(prompt_tokens, completion_tokens)를 모델별 단가에 곱해 누적
+- `agents/base_agent.py`가 DeepSeek `usage` 필드를 공식 모델 단가에 곱해 누적
 - 모델별 추정 단가 (USD per 1M tokens):
   - `moonshotai/kimi-k2.6`: $0.73 in / $3.49 out (context 262K)
-  - `deepseek/deepseek-v4-flash`: $0.10 in / $0.30 out
-  - `deepseek/deepseek-v4-pro`: $0.50 in / $1.50 out
+  - `deepseek-v4-flash`: $0.10 in / $0.30 out
+  - `deepseek-v4-pro`: $0.50 in / $1.50 out
   - `tencent/hy3-preview` (reasoning): ~$0.40 in / $1.20 out
-  - `openrouter/free`: 무료 ($0)
+  - `deepseek-v4-flash`: 공식 Flash 단가
 - `/api/status` 응답에 `api_cost: {cost_usd, calls, window_sec}` 필드 추가
 - **실측치**:
   - KR 균형형 사이클 1회당 약 $0.05–0.10 (13~15콜 — 종목별 퀀트 7회 + 매크로 + 뉴스 + 리스크 + 트레이더 + Pass1/2 + 사후관리)
@@ -855,7 +851,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 | 키 | 사용처 | 호출 빈도 |
 |----|--------|----------|
-| `OPENROUTER_API_KEY` | 모든 LLM (`BaseAgent` · `news_classifier`(tencent) · `ops_support_worker`) | 사이클당 13~15회 + 크롤당 1회 분류 |
+| `DEEPSEEK_API_KEY` | 모든 LLM과 Hermes 매크로 리서치 | 사이클당 에이전트 호출 |
 | `KIS_APP_KEY` + `KIS_APP_SECRET` | KIS OpenAPI 토큰·시세·주문·잔고·체결확인 | 토큰 1회/24h + 주문·시세 다수 |
 | `OPENDART_API_KEY` | DART 공시 + corpCode 매핑 + 직전연도 요약재무(BS+IS) — **서버 소유 단일 env, 전 계정 공통**(2026-05-19 사용자별 입력칸 제거) | KR 세션 30분 간격 + 후보별 1회 |
 | ~~`TAVILY_API_KEY`~~ | **제거됨** (사장 피드백 8차) — `alibaba/tongyi-deepresearch`가 검색·분류·리서치 통합 | — |
@@ -936,16 +932,16 @@ MIN_HOLDING_DAYS_FOR_SELL = 0.5       # ALLOW_DAY_TRADING=False일 때만 적용
 # 모델 배정 (사장 피드백 다수 차수에 걸쳐 진화)
 MODEL_ASSIGNMENTS = {
     "chief_orchestrator": "moonshotai/kimi-k2.6",    # 운용전략실장·사후관리실장
-    "macro_analyst":      "deepseek/deepseek-v4-flash",
-    "quant_analyst":      "deepseek/deepseek-v4-flash",
-    "news_analyst":       "deepseek/deepseek-v4-flash",
-    "news_curator":       "deepseek/deepseek-v4-flash",       # 결정론 폴백 — 평소엔 LLM 미호출
+    "macro_analyst":      "deepseek-v4-flash",
+    "quant_analyst":      "deepseek-v4-flash",
+    "news_analyst":       "deepseek-v4-flash",
+    "news_curator":       "deepseek-v4-flash",       # 결정론 폴백 — 평소엔 LLM 미호출
     "news_classifier":    "tencent/hy3-preview",              # 사장 피드백 5차 — KR/US/BOTH 정확 분류
-    "trader":             "deepseek/deepseek-v4-flash",       # 사장 피드백 3차 — free → flash로 격상
-    "risk_guard":         "openrouter/free",
-    "policy_filter":      "openrouter/free",
+    "trader":             "deepseek-v4-flash",       # 사장 피드백 3차 — free → flash로 격상
+    "risk_guard":         "deepseek-v4-flash",
+    "policy_filter":      "deepseek-v4-flash",
     "post_manager":       "moonshotai/kimi-k2.6",
-    "ops_support":        "deepseek/deepseek-v4-pro",         # 진단·파라미터 조정 제안 (산하 팀장·코드 자가수정 폐지)
+    "ops_support":        "deepseek-v4-pro",         # 진단·파라미터 조정 제안 (산하 팀장·코드 자가수정 폐지)
 }
 
 # 프롬프트 캐싱
@@ -1003,11 +999,7 @@ python3.11 -m pytest                                # 전체 (<2초)
 사이클 소요시간(`metrics.timer`)·주문 체결/미체결·오류 카운트. `GET /api/metrics` 로 최근 집계 조회.
 
 ### 5) 백테스트 하네스 (`backtest/`)
-```bash
-python3.11 -m backtest.report
-```
-- ⚠️ **정직성 경계**: LLM 종목 선정은 오프라인 재현 불가 → 진입 신호는 고정 SMA 프록시로 통일하고 **프리셋의 결정론 규칙(사이징·익절·손절·MDD 차단)만** 비교. 절대 수익률이 아니라 *프리셋 간 상대 리스크/회전율* 로만 해석.
-- 검증 결과 프리셋 스펙트럼이 설계대로 단조(방어형 MDD 최소·샤프 최고 → 초공격형 수익률 최대·MDD 최대).
+`backtest.engine`의 워크포워드 엔진으로 결정론적 전략 규칙을 검증한다. LLM 종목 선정은 오프라인에서 재현하지 않는다.
 
 ### 6) 자가수정 안전 강화 (`infra/ops_support_worker.py`) — 2026-05-20 기능 자체 폐지
 > ⚠️ **운용지원실장 코드 자가수정은 2026-05-20 사장 지시로 RETIRED**. 아래 가드(전면 롤백·변경 크기 상한 등)는
@@ -1016,11 +1008,8 @@ python3.11 -m backtest.report
 - `append`도 백업, **변경 크기 상한**(`MAX_CHANGE_BYTES`/`MAX_NET_NEW_LINES`)으로 작은 앵커로 파일 전체 갈아엎기 차단.
 - 롤백 발생 시 `notifier` CRITICAL 알림.
 
-### 7) 뉴스 분류 폐루프 결정론화 (`infra/news_weight_tuner.py`)
-주간 피드백이 LLM의 "알아서 제안"에만 의존하던 것을, **분류 분포 vs 실제 매매 분포의 불일치**를 수치 권고로 변환해 directive 최상단에 배치(LLM이 약해도 신호 생존).
-
 > **남은 권장 작업**: `main_swarm._run_analysis_cycle`(849줄)·`ArquantOrchestrator`(~1960줄) 단계별 분해. 지금은 위험(라이브 머니·자가수정 대상 파일)하므로 *블라인드 리팩터링 대신* 테스트 안전망 + `metrics.timer` 관측을 먼저 깔았다. 분해는 파이프라인 단계별로 테스트를 붙이며 점진 수행 권장.
 
 ---
 
-**Built by ArQuant AI Team** | Powered by OpenRouter + KIS OpenAPI + OpenDart + Naver Finance
+**Built by ArQuant AI Team** | Powered by DeepSeek + Hermes Web Search + KIS OpenAPI + OpenDart

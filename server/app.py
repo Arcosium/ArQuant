@@ -18,6 +18,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 logger = logging.getLogger("APP")
 # KIS 실전 OpenAPI 기본 URL — 등록/검증 기본값. 한 곳에서 관리해 불일치를 막는다.
 DEFAULT_KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
+MOCK_KIS_BASE_URL = "https://openapivts.koreainvestment.com:29443"
+ALLOWED_KIS_BASE_URLS = frozenset({DEFAULT_KIS_BASE_URL, MOCK_KIS_BASE_URL})
 app = FastAPI(title="ArQuant v1.0", version="1.0.0")
 # 계정 프로필 디렉토리 루트. 모듈 상수로 둬서 테스트가 격리(monkeypatch)할 수 있게 한다.
 # (과거 엔드포인트가 실경로를 직접 계산해 테스트가 실데이터 profiles/<uid> 를 삭제하던 버그 방지)
@@ -80,6 +82,8 @@ async def app_auth(request: Request, call_next):
 # ─── 자격증명 검증 (등록 시 — HYFE가 WQB/Gemini를 검증하던 것과 동치) ──────────
 async def _validate_kis(app_key: str, app_secret: str, base_url: str) -> tuple[bool, str]:
     base_url = (base_url or DEFAULT_KIS_BASE_URL).rstrip("/")
+    if base_url not in ALLOWED_KIS_BASE_URLS:
+        return False, "KIS 거래 환경은 실전투자 또는 모의투자만 선택할 수 있습니다."
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
             async with s.post(f"{base_url}/oauth2/tokenP",
@@ -93,16 +97,17 @@ async def _validate_kis(app_key: str, app_secret: str, base_url: str) -> tuple[b
         return False, f"KIS 연결 실패: {e}"
 
 
-async def _validate_openrouter(api_key: str) -> tuple[bool, str]:
+async def _validate_deepseek(api_key: str) -> tuple[bool, str]:
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
-            async with s.get("https://openrouter.ai/api/v1/key",
-                              headers={"Authorization": f"Bearer {api_key}"}) as r:
-                if r.status == 200:
-                    return True, "ok"
-                return False, f"OpenRouter 키 검증 실패 (HTTP {r.status})"
+        from infra.deepseek_client import chat_completion
+        await chat_completion(
+            api_key=api_key, model="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "Reply only OK."}],
+            max_tokens=4, temperature=0.0, timeout_sec=15, thinking=False,
+        )
+        return True, "ok"
     except Exception as e:
-        return False, f"OpenRouter 연결 실패: {e}"
+        return False, f"DeepSeek 연결 실패: {e}"
 
 
 def _issue_session(uid: int, remember: bool) -> JSONResponse:
@@ -195,9 +200,10 @@ class WS:
     def __init__(self):
         self.conns: list[WebSocket] = []
         self.meta: dict = {}  # ws -> {"uid": int|None, "client": "web"|"mobile"}
-    async def connect(self, ws, uid=None, client="web"):
+    async def connect(self, ws, uid=None, client="web", view_uid=None):
         await ws.accept(); self.conns.append(ws)
-        self.meta[ws] = {"uid": uid, "client": client}
+        self.meta[ws] = {"uid": uid, "view_uid": view_uid if view_uid is not None else uid,
+                         "client": client}
     def disconnect(self, ws):
         if ws in self.conns: self.conns.remove(ws)
         self.meta.pop(ws, None)
@@ -216,7 +222,7 @@ class WS:
         dead=[]
         for c in self.conns:
             m = self.meta.get(c) or {}
-            if m.get("uid") == uid:
+            if m.get("view_uid", m.get("uid")) == uid:
                 try:
                     if _should_send(m, msg):
                         await c.send_json(msg)
@@ -256,10 +262,11 @@ class CostModeReq(BaseModel):
 class RegisterReq(BaseModel):
     username: str                   # 사용자가 정하는 아이디 (중복 불가)
     password: str                   # 10자 이상 + 특수문자 1개 이상
-    openrouter_key: str
-    kis_app_key: str
-    kis_app_secret: str
-    kis_account_no: str
+    account_mode: str = "trading"
+    deepseek_api_key: str = ""
+    kis_app_key: str = ""
+    kis_app_secret: str = ""
+    kis_account_no: str = ""
     kis_base_url: str = DEFAULT_KIS_BASE_URL
     dart_key: str = ""              # 선택 — 없으면 공시 분석 생략
     label: str = ""
@@ -330,18 +337,23 @@ async def register(req: RegisterReq, request: Request):
         raise HTTPException(400, perr)
     if auth_store.username_exists(username):
         raise HTTPException(409, f"이미 사용 중인 아이디입니다: {username}")
-    # API 자격증명은 실제 호출로 검증 (저장 전)
-    ok, msg = await _validate_kis(req.kis_app_key, req.kis_app_secret, req.kis_base_url)
-    if not ok:
-        raise HTTPException(400, msg)
-    ok, msg = await _validate_openrouter(req.openrouter_key)
-    if not ok:
-        raise HTTPException(400, msg)
+    mode = auth_store.VIEWER_MODE if req.account_mode == auth_store.VIEWER_MODE else auth_store.TRADING_MODE
+    kis_base_url = (req.kis_base_url or DEFAULT_KIS_BASE_URL).strip().rstrip("/")
+    if mode == auth_store.TRADING_MODE:
+        if not all((req.deepseek_api_key.strip(), req.kis_app_key.strip(),
+                    req.kis_app_secret.strip(), req.kis_account_no.strip())):
+            raise HTTPException(400, "거래 계정은 DeepSeek와 KIS 정보를 모두 입력해야 합니다.")
+        ok, msg = await _validate_kis(req.kis_app_key, req.kis_app_secret, kis_base_url)
+        if not ok:
+            raise HTTPException(400, msg)
+        ok, msg = await _validate_deepseek(req.deepseek_api_key)
+        if not ok:
+            raise HTTPException(400, msg)
     uid = auth_store.upsert_user(
         username=username, password=req.password,
         kis_app_key=req.kis_app_key.strip(), kis_app_secret=req.kis_app_secret.strip(),
-        openrouter_key=req.openrouter_key.strip(), kis_account_no=req.kis_account_no.strip(),
-        kis_base_url=req.kis_base_url.strip())
+        deepseek_api_key=req.deepseek_api_key.strip(), kis_account_no=req.kis_account_no.strip(),
+        kis_base_url=kis_base_url, account_mode=mode)
     auth_store.audit("register", username=username, ip=ip, outcome="ok", detail="")
     # Phase 2: 전역 활성화 폐지 — 세션만 발급한다. 유저 컨텍스트(브로커/스왐)는
     # 첫 인증 요청 시 REGISTRY.get_or_create(uid) 로 lazy 생성된다.
@@ -411,6 +423,8 @@ async def me(request: Request):
             "kis_account_no_masked": auth_store._mask(c.get("kis_account_no", ""), 4),
             "kis_base_url": c.get("kis_base_url", ""),  # 프로필 '정보 변경'의 실전/모의 선택자 기본값용 (비밀 아님)
             "has_dart": bool(c.get("dart_key")),
+            "account_mode": c.get("account_mode", auth_store.TRADING_MODE),
+            "is_viewer": c.get("account_mode") == auth_store.VIEWER_MODE,
             "is_admin": bool(c.get("is_admin"))}  # 사장 피드백 2026-05-18: 코드변경 전체반영 권한 표시
 
 class PwChangeReq(BaseModel):
@@ -418,7 +432,7 @@ class PwChangeReq(BaseModel):
     new: str
 
 class CredsReq(BaseModel):
-    openrouter_key: Optional[str] = None
+    deepseek_api_key: Optional[str] = None
     kis_app_key: Optional[str] = None
     kis_app_secret: Optional[str] = None
     kis_account_no: Optional[str] = None
@@ -452,32 +466,39 @@ async def profile_credentials(req: CredsReq, request: Request):
     creds_cr = auth_store.get_user_credentials(uid)
     uname_cr = (creds_cr or {}).get("username", "")
     cur = creds_cr or {}
+    upgrading_viewer = cur.get("account_mode") == auth_store.VIEWER_MODE
     # Fix 2 — strip whitespace on provided fields (mirrors register handler)
     ak = req.kis_app_key.strip() if req.kis_app_key is not None else None
     as_ = req.kis_app_secret.strip() if req.kis_app_secret is not None else None
-    or_key = req.openrouter_key.strip() if req.openrouter_key is not None else None
+    ds_key = req.deepseek_api_key.strip() if req.deepseek_api_key is not None else None
     an = req.kis_account_no.strip() if req.kis_account_no is not None else None
-    bu = req.kis_base_url.strip() if req.kis_base_url is not None else None
+    bu = req.kis_base_url.strip().rstrip("/") if req.kis_base_url is not None else None
     # Resolve effective values for KIS validation (fall back to stored values when not provided)
     eff_ak = ak if ak is not None else cur.get("kis_app_key")
     eff_as = as_ if as_ is not None else cur.get("kis_app_secret")
     eff_bu = bu if bu is not None else cur.get("kis_base_url")
+    if upgrading_viewer:
+        if not all((ak, as_, ds_key, an, bu)):
+            raise HTTPException(
+                400, "관전 모드 업그레이드는 DeepSeek, KIS App Key/Secret, 계좌번호, 거래 환경을 모두 입력해야 합니다.")
     if ak is not None or as_ is not None or bu is not None:
         ok, msg = await _validate_kis(eff_ak, eff_as, eff_bu)
         if not ok:
             auth_store.audit("profile_credentials", username=uname_cr, ip=ip,
                              outcome="fail", detail="validate")
             raise HTTPException(400, msg)
-    if or_key is not None:
-        ok, msg = await _validate_openrouter(or_key)
+    if ds_key is not None:
+        ok, msg = await _validate_deepseek(ds_key)
         if not ok:
             auth_store.audit("profile_credentials", username=uname_cr, ip=ip,
                              outcome="fail", detail="validate")
             raise HTTPException(400, msg)
     auth_store.update_credentials(
-        uid, openrouter_key=or_key, kis_app_key=ak,
+        uid, deepseek_api_key=ds_key, kis_app_key=ak,
         kis_app_secret=as_, kis_account_no=an,
         kis_base_url=bu)
+    if upgrading_viewer:
+        auth_store.set_account_mode(uid, auth_store.TRADING_MODE)
     auth_store.audit("profile_credentials", username=uname_cr, ip=ip, outcome="ok", detail="")
     # Phase 2: 이 유저의 컨텍스트(브로커/스왐)가 이미 살아있으면 새 자격증명으로 재생성되도록 리셋.
     # 단, 매매 루프가 도는 중이면 새 creds 채택을 위해 먼저 루프를 안전하게 멈춘다
@@ -491,24 +512,25 @@ async def profile_credentials(req: CredsReq, request: Request):
         if fresh:
             ctx.creds = fresh
         ctx.reset()
-    return {"ok": True}
+    return {"ok": True, "upgraded": upgrading_viewer,
+            "account_mode": auth_store.TRADING_MODE}
 
 @app.get("/api/profile/directives")
 async def profile_directives_list(request: Request):
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     from infra import standing_directives as sd
     return {"directives": sd.load(uid)}
 
 @app.post("/api/profile/directives")
 async def profile_directives_add(req: DirectiveReq, request: Request):
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     from infra import standing_directives as sd
     added = sd.append_directive(uid, req.text)
     return {"ok": True, "added": added, "directives": sd.load(uid)}
 
 @app.delete("/api/profile/directives/{did}")
 async def profile_directives_del(did: str, request: Request):
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     from infra import standing_directives as sd
     sd.remove_directive(uid, did)
     return {"ok": True, "directives": sd.load(uid)}
@@ -578,7 +600,9 @@ async def health(): return {"status":"ok","service":"ArQuant v1.0","timestamp":d
 @app.get("/api/status")
 async def status(request: Request):
     # Phase 2 멀티테넌트: 요청 유저(request.state.user_id)의 스왐 상태를 반환한다.
-    uid = _uid_or_403(request)
+    auth_uid = _uid_or_403(request)
+    viewer = auth_store.is_viewer(auth_uid)
+    uid = _read_uid(request)
     ctx = REGISTRY.get_or_create(uid)
     s = ctx.swarm.get_status()
     # Expose whether THIS user's background task is actively running so the frontend can sync buttons.
@@ -588,23 +612,26 @@ async def status(request: Request):
     try:
         from agents.base_agent import cost_summary
         import runtime
-        cs = cost_summary()
-        cs["mode"] = runtime.cost_display_mode(uid)
-        s["api_cost"] = cs
+        if not viewer:
+            cs = cost_summary()
+            cs["mode"] = runtime.cost_display_mode(uid)
+            s["api_cost"] = cs
     except Exception:
-        s["api_cost"] = {"h": dict(_empty), "d": dict(_empty), "m": dict(_empty),
-                         "total": dict(_empty), "mode": "h"}
+        if not viewer:
+            s["api_cost"] = {"h": dict(_empty), "d": dict(_empty), "m": dict(_empty),
+                             "total": dict(_empty), "mode": "h"}
     # 운용지원실장 피드백 on/off 토글 상태 (프로필별) — 요청 유저 본인 계정 기준.
     try:
         import runtime
-        s["ops_feedback_enabled"] = runtime.ops_feedback_enabled(uid)
+        s["ops_feedback_enabled"] = False if viewer else runtime.ops_feedback_enabled(uid)
     except Exception:
         s["ops_feedback_enabled"] = True
+    s["is_viewer"] = viewer
     return s
 
 @app.post("/api/start")
 async def start(req: Req, request: Request):
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     await _start_uid(uid, req.directive)
     return {"message":"🟢 Arquant 감시 시작"}
 
@@ -613,7 +640,7 @@ async def stop(request: Request):
     # 사장 지시 2026-05-22: 즉시 중지 — stop_event 만으로는 진행 중 사이클이 끝까지 돌므로,
     # 실행 중인 asyncio 태스크를 취소해 LLM 호출·분석을 그 자리에서 중단한다.
     # Phase 2: 요청 유저의 루프만 멈춘다(다른 유저 무영향).
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     await _stop_uid(uid)
     return {"message": "🔴 즉시 중지됨"}
 
@@ -622,14 +649,14 @@ async def ceo_command(req: CeoReq, request: Request):
     # 사장 지시 2026-05-21: 저장 여부는 체크박스 대신 ceo_directive 안에서 에이전트가
     # 지시 내용·결과로 자동 판단해 standing_directive 로 저장한다(자동 판단 경로).
     # Phase 2: 요청 유저의 스왐에 지시를 전달한다.
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     resp = await REGISTRY.get_or_create(uid).swarm.ceo_directive(req.message)
     return {"response": resp}
 
 @app.post("/api/cost_mode")
 async def cost_mode_set(req: CostModeReq, request: Request):
     """우상단 API 비용 표시 합산 모드 — 프로필(세션 사용자)별 저장."""
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     import runtime
     try:
         mode = runtime.set_cost_display_mode((req.mode or "").strip(), uid)
@@ -639,7 +666,7 @@ async def cost_mode_set(req: CostModeReq, request: Request):
 
 @app.get("/api/history")
 async def history(request: Request):
-    uid = _uid_or_403(request)
+    uid = _read_uid(request)
     return {"cycles": REGISTRY.get_or_create(uid).swarm.get_history()}
 
 @app.get("/api/events")
@@ -647,13 +674,13 @@ async def events(request: Request, limit: int = 500):
     """Persisted display log — the dashboard fetches this on load so a page refresh
     restores the trade/agent log. Accumulates until /api/events/clear.
     Phase 2 멀티테넌트: 요청 유저(request.state.user_id)의 로그만 반환한다."""
-    uid = _uid_or_403(request)
+    uid = _read_uid(request)
     from main_swarm import get_recent_events
     return {"events": get_recent_events(limit, uid=uid)}
 
 @app.post("/api/events/clear")
 async def events_clear(request: Request):
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     from main_swarm import clear_event_log; clear_event_log(uid=uid)
     return {"message": "🧹 로그 초기화됨"}
 
@@ -689,8 +716,9 @@ async def news(count: int = 20):
     return {"articles": m.get_recent_articles(n), "status": m.get_status()}
 
 @app.post("/api/news/clear")
-async def news_clear():
+async def news_clear(request: Request):
     # 사장 피드백 2026-05-18: 뉴스 로그 비우기 — 단, 최근 20건은 유지.
+    _require_trading(request)
     from tools.news_monitor import get_monitor; m = get_monitor()
     kept = m.clear_history(keep=20)
     return {"message": f"🧹 뉴스 로그 초기화됨 (최근 {kept}건 유지)", "kept": kept}
@@ -700,13 +728,16 @@ async def agents(request: Request):
     from config import MODEL_ASSIGNMENTS
     # 설명은 일관된 한국어 (사장 지시 2026-05-20). 산하 팀장(투자/경영/재무관리팀장)은 폐지되어 명단에 없음.
     roster = [
-        {"name":"운용전략실장","role":"총괄 전략·종목 선정 (2패스)","model":MODEL_ASSIGNMENTS["chief_orchestrator"]},
-        {"name":"전략리서치팀장","role":"거시·매크로 리서치","model":MODEL_ASSIGNMENTS["macro_analyst"]},
+        {"name":"주식운용실장","role":"총괄 전략·종목 선정 (2패스)","model":MODEL_ASSIGNMENTS["chief_orchestrator"]},
+        {"name":"글로벌리서치팀장","role":"거시·매크로 리서치","model":MODEL_ASSIGNMENTS["macro_analyst"]},
         {"name":"계량분석팀장","role":"후보 종목 정량 평가","model":MODEL_ASSIGNMENTS["quant_analyst"]},
-        {"name":"뉴스분석팀장","role":"뉴스 감성·이벤트 분석","model":MODEL_ASSIGNMENTS["news_analyst"]},
-        {"name":"트레이딩팀장","role":"주문 실행·결과 보고","model":MODEL_ASSIGNMENTS["trader"]},
+        {"name":"마켓센티먼트팀장","role":"뉴스 감성·이벤트 분석","model":MODEL_ASSIGNMENTS["news_analyst"]},
+        {"name":"프롭트레이딩팀장","role":"주문 실행·결과 보고","model":MODEL_ASSIGNMENTS["trader"]},
         {"name":"리스크관리실장","role":"리스크 게이트·DART 재심","model":f"룰 엔진(Python) + {MODEL_ASSIGNMENTS['risk_guard']}"},
-        {"name":"사후관리실장","role":"보유 종목 매도 판단","model":MODEL_ASSIGNMENTS["post_manager"]},
+        {"name":"사후관리실장","role":"보유 종목 매도 판단·슬리브 종합","model":MODEL_ASSIGNMENTS["post_manager"]},
+        {"name":"포트폴리오기획팀장","role":"진입 thesis·보유계획 상기","model":MODEL_ASSIGNMENTS["fund_planner"]},
+        {"name":"채권운용실장","role":"채권 ETF 매매·금리 전략","model":MODEL_ASSIGNMENTS["bond_manager"]},
+        {"name":"원자재운용실장","role":"원자재 ETF 매매·실물자산","model":MODEL_ASSIGNMENTS["commodity_manager"]},
         {"name":"운용지원실장","role":"진단·프로필 전략 조정","model":MODEL_ASSIGNMENTS["ops_support"]},
     ]
     # 사장 지시 2026-05-20: 운용지원실장은 ADMIN·일반 유저 모두 사용 가능(프로필 한정 파라미터 조정).
@@ -732,7 +763,7 @@ async def ops_feedback_set(request: Request, req: dict):
     # 사장 지시 2026-05-20: 운용지원 토글은 프로필별 — 각 유저가 본인 계정 것만 켜고 끈다
     # (코드 자가수정 폐지로 더 이상 ADMIN 전용일 필요 없음).
     import runtime
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     enabled = bool((req or {}).get("enabled"))
     st = runtime.set_ops_feedback(enabled, uid=uid, by="dashboard")
     try:
@@ -753,7 +784,7 @@ async def notif_settings_get(request: Request):
 @app.post("/api/notif_settings")
 async def notif_settings_set(request: Request, req: dict):
     import runtime
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     st = runtime.set_notif_settings(req or {}, uid=uid)
     return {"ok": True, "settings": st}
 
@@ -769,6 +800,28 @@ def _uid_or_403(request: Request) -> int:
     uid = getattr(request.state, "user_id", None)
     if uid is None:
         raise HTTPException(401, "로그인이 필요합니다.")
+    return uid
+
+
+def _read_uid(request: Request) -> int:
+    """조회 대상 uid. 관전 계정은 단독 ADMIN 계정, 거래 계정은 자기 자신."""
+    uid = _uid_or_403(request)
+    if auth_store.is_viewer(uid):
+        target = auth_store.admin_view_uid()
+        if target is None:
+            raise HTTPException(503, "관전할 ADMIN 계정을 찾을 수 없습니다.")
+        return target
+    return uid
+
+
+def _require_trading(request: Request) -> int:
+    uid = _uid_or_403(request)
+    # ADMIN(hh09080)은 관전 대상 계정이자 실제 운용 주체다. 계정 모드 마이그레이션이나
+    # 잘못된 프로필 값 때문에 실행/중지까지 잠기는 일이 없도록 관리자 권한을 우선한다.
+    if auth_store.is_admin(uid):
+        return uid
+    if auth_store.is_viewer(uid):
+        raise HTTPException(403, "관전 모드에서는 조회만 가능합니다. 정보 변경에서 거래 계정으로 업그레이드하세요.")
     return uid
 
 
@@ -824,17 +877,18 @@ async def admin_config_get(request: Request):
     # (이전엔 'post_manager' 같은 raw key만 떠서 어느 에이전트인지 헷갈렸다 → 사후관리실장 모델이
     #  의도와 다르게 설정되는 혼란의 원인).
     _labels = {
-        "chief_orchestrator": "운용전략실장 (총괄·종목선정)",
-        "macro_analyst": "전략리서치팀장 (매크로)",
+        "chief_orchestrator": "주식운용실장 (총괄·종목선정)",
+        "macro_analyst": "글로벌리서치팀장 (매크로)",
         "quant_analyst": "계량분석팀장 (정량평가)",
-        "news_analyst": "뉴스분석팀장 (감성·이벤트)",
+        "news_analyst": "마켓센티먼트팀장 (감성·이벤트)",
         "news_curator": "뉴스 크롤러 (헤드라인 선별)",
-        "news_classifier": "뉴스 분류기 (시장 매핑)",
-        "macro_researcher": "매크로 리서치 (Tavily 검색)",
-        "trader": "트레이딩팀장 (주문·보고)",
+        "macro_researcher": "매크로 리서치 (웹 리서치)",
+        "trader": "프롭트레이딩팀장 (주문·보고)",
         "risk_guard": "리스크관리실장 (DART 재심)",
         "post_manager": "사후관리실장 (매도 판단)",
-        "fund_planner": "펀드기획실장 (진입 thesis·거부권)",
+        "fund_planner": "포트폴리오기획팀장 (진입 thesis·강력 권고)",
+        "bond_manager": "채권운용실장 (채권 매매)",
+        "commodity_manager": "원자재운용실장 (원자재 매매)",
         "ops_support": "운용지원실장 (진단·조정)",
     }
     return {"model_overrides": cfg["model_overrides"],
@@ -948,6 +1002,40 @@ async def coresight_reject(request: Request, req: _CoresightItemReq):
     return {"ok": True, "item_id": req.item_id}
 
 
+# ─── 정책 변경 승인 (토요일 ops 제안) — 로그인 유저 본인 계정 ───
+# 거버넌스 2026-06-05: 평일 ops 는 정책 플래그 차단, 토요일 점검만 승인 대기로 회부.
+# 사장(또는 계정 소유자)이 명시 승인해야만 set_overrides 로 적용된다.
+class _PolicyKeyReq(BaseModel):
+    key: str
+
+
+@app.get("/api/policy_changes/pending")
+async def policy_changes_pending(request: Request):
+    uid = _require_trading(request)
+    from infra.policy_approval_inbox import list_pending
+    return {"pending": list_pending(uid)}
+
+
+@app.post("/api/policy_changes/approve")
+async def policy_changes_approve(request: Request, req: _PolicyKeyReq):
+    uid = _require_trading(request)
+    from infra.policy_approval_inbox import approve
+    ok = approve(uid, req.key)
+    if not ok:
+        raise HTTPException(404, f"key={req.key} 없음 또는 이미 처리됨")
+    return {"ok": True, "key": req.key}
+
+
+@app.post("/api/policy_changes/reject")
+async def policy_changes_reject(request: Request, req: _PolicyKeyReq):
+    uid = _require_trading(request)
+    from infra.policy_approval_inbox import reject
+    ok = reject(uid, req.key)
+    if not ok:
+        raise HTTPException(404, f"key={req.key} 없음")
+    return {"ok": True, "key": req.key}
+
+
 @app.get("/api/dart")
 async def dart_search(corp_name: str = "", days: int = 7):
     from tools.dart_disclosure import search_disclosures
@@ -958,17 +1046,17 @@ async def dart_search(corp_name: str = "", days: int = 7):
 
 @app.get("/api/price/kr/{code}")
 async def kr_price(code: str, request: Request):
-    broker = REGISTRY.get_or_create(_uid_or_403(request)).broker
+    broker = REGISTRY.get_or_create(_read_uid(request)).broker
     return {"result": await broker.kr_price_str(code)}
 
 @app.get("/api/price/us/{ticker}")
 async def us_price(ticker: str, request: Request):
-    broker = REGISTRY.get_or_create(_uid_or_403(request)).broker
+    broker = REGISTRY.get_or_create(_read_uid(request)).broker
     return {"result": await broker.us_price(ticker)}
 
 @app.get("/api/rank/volume")
 async def volume_rank(request: Request):
-    broker = REGISTRY.get_or_create(_uid_or_403(request)).broker
+    broker = REGISTRY.get_or_create(_read_uid(request)).broker
     return {"result": await broker.kr_volume_rank()}
 
 @app.get("/api/balance")
@@ -976,14 +1064,15 @@ async def balance(request: Request):
     """Account snapshot for the dashboard 'holdings' panel (single cached KIS read).
     Phase 2 멀티테넌트: 요청 유저의 브로커로 조회하고, 그 유저 equity_curve 에만 기록한다."""
     from main_swarm import record_equity, is_market_session_now
-    uid = _uid_or_403(request)
+    auth_uid = _uid_or_403(request)
+    uid = _read_uid(request)
     ctx = REGISTRY.get_or_create(uid)
     try:
         snap = await ctx.broker.portfolio_holdings()
         # 사장 지시 2026-05-24: 실제 정규장 세션(시간대+요일+휴장)일 때만 평가금액 포인트를 기록한다.
         # (모바일 위젯·열린 탭이 /api/balance 를 장외에도 폴링하면 equity_curve 에 장외 포인트가
         #  쌓여 수익률 KPI 가 장외에도 갱신됐다. 주말 밤 US 시간대 오인 방지 위해 요일·휴장까지 본다.)
-        if is_market_session_now():
+        if not auth_store.is_viewer(auth_uid) and is_market_session_now():
             try:
                 record_equity(ctx.swarm.equity_path, snap["buying_power"], "poll")
             except Exception as e:
@@ -1006,7 +1095,7 @@ async def equity(request: Request, limit: int = 500, view: str = "realtime"):
     Phase 2: 요청 유저의 equity_curve 를 읽는다."""
     from main_swarm import get_equity_series
     v = view if view in ("realtime", "daily", "monthly") else "realtime"
-    ep = REGISTRY.get_or_create(_uid_or_403(request)).swarm.equity_path
+    ep = REGISTRY.get_or_create(_read_uid(request)).swarm.equity_path
     return {"series": get_equity_series(ep, limit, v), "view": v}
 
 async def _attach_current_fallback(base: dict, broker) -> dict:
@@ -1032,7 +1121,7 @@ async def performance(request: Request):
     Phase 2: 요청 유저의 equity_curve 기준.
     사장 지시 2026-05-28: 곡선 비어도 현재 총평가는 broker 폴백으로 항상 표시."""
     from main_swarm import performance_kpis
-    uid = _uid_or_403(request)
+    uid = _read_uid(request)
     ctx = REGISTRY.get_or_create(uid)
     base = performance_kpis(ctx.swarm.equity_path, uid=uid)
     out = await _attach_current_fallback(base, ctx.broker)
@@ -1073,7 +1162,7 @@ def _scorecard_for_uid(uid: int):
 @app.get("/api/scorecard")
 async def api_scorecard(request: Request):
     """에이전트 성과 귀인 카드 — 요청 유저 기준(인증 필요)."""
-    return _scorecard_for_uid(_uid_or_403(request))
+    return _scorecard_for_uid(_read_uid(request))
 
 
 @app.get("/api/benchmark")
@@ -1085,7 +1174,7 @@ async def benchmark(request: Request, view: str = "daily"):
     Phase 2: 요청 유저의 equity_curve 기준."""
     from main_swarm import get_equity_series
     v = view if view in ("realtime", "daily", "monthly") else "daily"
-    ep = REGISTRY.get_or_create(_uid_or_403(request)).swarm.equity_path
+    ep = REGISTRY.get_or_create(_read_uid(request)).swarm.equity_path
     series = get_equity_series(ep, limit=600, view=v)
     if len(series) < 2:
         return {"benchmarks": []}
@@ -1114,14 +1203,14 @@ async def benchmark(request: Request, view: str = "daily"):
 async def trades(request: Request, limit: int = 500):
     """All real trade events (executed/failed), newest first — 전체 거래 내역.
     Phase 2 멀티테넌트: 요청 유저의 거래만 반환한다."""
-    uid = _uid_or_403(request)
+    uid = _read_uid(request)
     from main_swarm import get_trade_history
     return {"trades": get_trade_history(limit, uid=uid)}
 
 @app.post("/api/trades/clear")
 async def trades_clear(request: Request):
     """Wipe only the trade history (keeps system/agent logs intact). Used by the 수익률 탭 '비우기' button."""
-    uid = _uid_or_403(request)
+    uid = _require_trading(request)
     from main_swarm import clear_trade_log
     removed = clear_trade_log(uid=uid)
     return {"message": f"🗑️ 거래 내역 {removed}건 초기화됨", "removed": removed}
@@ -1134,72 +1223,40 @@ async def strategy_get(request: Request):
     import runtime
     from infra import profile_overrides
     from config import STRATEGY_KEY_META, STRATEGY_TUNABLE_KEYS
-    uid = getattr(request.state, "user_id", None)
+    uid = _read_uid(request)
     active = runtime.active(uid=uid)
     active["ops_since"] = profile_overrides.last_updated(uid)
-    return {"active": active, "presets": runtime.list_presets(uid=uid),
+    return {"active": active,
             "history": runtime.history(),
             "key_meta": STRATEGY_KEY_META, "key_order": STRATEGY_TUNABLE_KEYS}
 
 @app.post("/api/strategy")
 async def strategy_set(req: dict, request: Request):
+    """현재 적용 전략 파라미터 갱신 (사장 지시 2026-06-09: 프리셋 폐지 → custom params 전용)."""
     import runtime
     from main_swarm import _broadcast
-    uid = getattr(request.state, "user_id", None)
-    name = (req or {}).get("name", "")
+    uid = _require_trading(request)
     custom = (req or {}).get("params")
-    if not name and not custom:
-        raise HTTPException(400, "name 또는 params 필요")
-    active = runtime.set_strategy(name or "custom", custom=custom, by="dashboard", uid=uid)
+    if not custom:
+        raise HTTPException(400, "params 필요")
+    active = runtime.set_strategy(custom=custom, by="dashboard", uid=uid)
     try:
         await _broadcast({"type": "status", "state": "IDLE",
-                          "message": f"⚙️ 전략 변경 → {active['label']} ({active['name']})"})
+                          "message": f"⚙️ 전략 설정 변경 → {active['label']}"})
     except Exception: pass
     return {"active": active}
 
-@app.post("/api/strategy/preset")
-async def strategy_save_preset(req: dict):
-    """사용자 정의 프리셋 저장 (사장 지시 2026-05-14).
-    Body: {"name": "<id>", "label": "<표시명>", "params": {...}}"""
-    import runtime
-    from main_swarm import _broadcast
-    name = (req or {}).get("name", "")
-    label = (req or {}).get("label", name)
-    params = (req or {}).get("params") or {}
-    res = runtime.save_user_preset(name, label, params, by="dashboard")
-    if not res.get("ok"):
-        raise HTTPException(400, res.get("message", "프리셋 저장 실패"))
-    try:
-        await _broadcast({"type": "status", "state": "IDLE",
-                          "message": f"⚙️ 사용자 프리셋 저장: {label} ({name})"})
-    except Exception: pass
-    return res
-
-@app.delete("/api/strategy/preset/{name}")
-async def strategy_delete_preset(name: str):
-    """사용자 프리셋 삭제. 빌트인은 삭제 불가. (사장 지시 2026-05-14)"""
-    import runtime
-    from main_swarm import _broadcast
-    res = runtime.delete_user_preset(name)
-    if not res.get("ok"):
-        raise HTTPException(400, res.get("message", "삭제 실패"))
-    try:
-        await _broadcast({"type": "status", "state": "IDLE",
-                          "message": f"🗑 사용자 프리셋 삭제: {name}"})
-    except Exception: pass
-    return res
-
 @app.get("/api/cycles")
-async def cycles(limit: int = 50, offset: int = 0):
+async def cycles(request: Request, limit: int = 50, offset: int = 0):
     """Persisted analysis cycles (newest first). 사장 지시 2026-05-14 — 백테스트/장기 분석용."""
     from infra import cycle_store
-    return {"cycles": cycle_store.list_cycles(limit, offset)}
+    return {"cycles": cycle_store.list_cycles(limit, offset, uid=_read_uid(request))}
 
 @app.get("/api/cycles/{cycle_id}")
-async def cycle_detail(cycle_id: int):
+async def cycle_detail(cycle_id: int, request: Request):
     from infra import cycle_store
     row = cycle_store.get_cycle(cycle_id)
-    if not row:
+    if not row or row.get("uid") != _read_uid(request):
         raise HTTPException(404, f"cycle {cycle_id} 없음")
     return row
 
@@ -1223,7 +1280,12 @@ async def ws_ep(ws: WebSocket):
     # 사장 지시 2026-05-21: 모바일 네이티브 클라이언트(?client=mobile)는 프로필 알림설정으로
     # 4종 푸시를 게이트한다. 웹(기본)은 전부 수신.
     client = (ws.query_params.get("client") or "web").strip().lower()
-    await ws_mgr.connect(ws, uid=uid, client=("mobile" if client == "mobile" else "web"))
+    view_uid = auth_store.admin_view_uid() if auth_store.is_viewer(uid) else uid
+    if view_uid is None:
+        await ws.close(code=1013)
+        return
+    await ws_mgr.connect(ws, uid=uid, view_uid=view_uid,
+                         client=("mobile" if client == "mobile" else "web"))
     try:
         while True: await ws.receive_text()
     except WebSocketDisconnect: ws_mgr.disconnect(ws)
@@ -1303,7 +1365,7 @@ async def _auto_resume_running_uids():
                 from main_swarm import log_response_event
                 log_response_event({"source": "system_event", "type": "status",
                                     "state": "MONITORING",
-                                    "message": f"🟢 자동 재개 (uid={uid}, 부팅 시 .running 마커 발견)"},
+                                    "message": "🟢 자동 재개"},
                                    uid=uid)
             except Exception as e:
                 logging.getLogger("AUTH").warning("uid=%s 자동 재개 실패: %s", uid, e)

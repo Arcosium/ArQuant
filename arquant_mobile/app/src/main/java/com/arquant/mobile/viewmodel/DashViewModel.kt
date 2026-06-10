@@ -51,14 +51,17 @@ class DashViewModel @Inject constructor(
 
     // Agent colors matching web dashboard
     private val agentColors = mapOf(
-        "운용전략실장" to 0xFF6366F1,
-        "전략리서치팀장" to 0xFF06B6D4,
+        "주식운용실장" to 0xFF6366F1,        // 운용전략실장 → 주식운용실장 (사장 지시 2026-06-09)
+        "글로벌리서치팀장" to 0xFF06B6D4,    // (구 전략리서치팀장)
         "계량분석팀장" to 0xFF10B981,
-        "뉴스분석팀장" to 0xFFF59E0B,
-        "트레이딩팀장" to 0xFFEF4444,
+        "마켓센티먼트팀장" to 0xFFF59E0B,    // (구 뉴스분석팀장)
+        "프롭트레이딩팀장" to 0xFFEF4444,    // (구 트레이딩팀장)
         "리스크관리실장" to 0xFF8B5CF6,
         "사후관리실장" to 0xFFF43F5E,
         "운용지원실장" to 0xFF14B8A6,
+        "포트폴리오기획팀장" to 0xFFEC4899,  // 진입 thesis·보유계획
+        "채권운용실장" to 0xFF3B82F6,        // 채권 ETF 슬리브
+        "원자재운용실장" to 0xFFD97706,      // 원자재 ETF 슬리브 (사장 지시 2026-06-09)
     )
 
     init {
@@ -224,7 +227,7 @@ class DashViewModel @Inject constructor(
         viewModelScope.launch {
             try {
                 val r = repo.ceo(message)
-                addLog("agent", r.response, "운용전략실장", agentColors["운용전략실장"])
+                addLog("agent", r.response, "주식운용실장", agentColors["주식운용실장"])
             } catch (e: Exception) {
                 addLog("system", "❌ ${e.message}")
             }

@@ -33,3 +33,9 @@ def running_marker(uid: int) -> Path:
 
 def position_thesis_path(uid: int) -> Path:
     return user_dir(uid) / "position_thesis.json"
+
+
+def sleeve_thesis_path(uid: int, sleeve_key: str) -> Path:
+    """자산슬리브 thesis 경로. sleeve_key='bond' → bond_thesis.json(기존 라이브 파일과 동일 — 무손실),
+    'commodity' → commodity_thesis.json."""
+    return user_dir(uid) / f"{sleeve_key}_thesis.json"

@@ -66,6 +66,9 @@ class NaverFinanceMonitor:
             if not isinstance(data, dict):
                 return
             self._article_history = list(data.get("article_history") or [])[-_MAX_PERSIST_ARTICLES:]
+            # 사장 지시 2026-06-04: 시장 분류 폐지 — 재시작 전 영속화된 옛 기사의 잔존 market 키 제거.
+            for _a in self._article_history:
+                _a.pop("market", None)
             self._seen_links = set(data.get("seen_links") or [])
             self._seen_titles = list(data.get("seen_titles") or [])[-800:]
             self.total_articles_found = int(data.get("total_articles_found") or len(self._article_history))
@@ -117,55 +120,8 @@ class NaverFinanceMonitor:
             if len(self._seen_titles) > 800:
                 self._seen_titles = self._seen_titles[-800:]
 
-    # ── Market classification (KR / US / BOTH) ───────────────────────────────
-    # Heuristic: count keyword hits per market. KR-leaning words are weighted by 6자리 코드 매칭,
-    # US-leaning by NASDAQ/NYSE/Fed-style references + 미국 티커 정규식. Tie → 'BOTH'.
-    _US_TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
-    _KR_CODE_RE = re.compile(r"(?<!\d)\d{6}(?!\d)")
-    _US_KW = (
-        "나스닥", "뉴욕증시", "다우존스", "다우지수", "S&P", "에스앤피", "S&P500", "스앤피500",
-        "FOMC", "연준", "연방준비", "파월", "옐런", "트럼프", "바이든", "월가", "월街",
-        "미 증시", "미국증시", "미 연준", "미 국채", "미국채", "미국 국채",
-        "Apple", "Microsoft", "Google", "Tesla", "Nvidia", "Meta", "Amazon",
-        "애플", "테슬라", "엔비디아", "구글", "아마존", "메타플랫폼",
-        "wall street", "fed ", "treasury yield", "us cpi",
-    )
-    _KR_KW = (
-        "코스피", "코스닥", "KOSPI", "KOSDAQ", "KOSPI200", "코스피200",
-        "삼성전자", "SK하이닉스", "현대차", "기아", "네이버", "카카오",
-        "한국은행", "한은", "금감원", "금융위", "금융감독원", "원/달러", "원달러",
-        "국내 증시", "국내증시", "한국증시", "거래소", "한국거래소", "KRX",
-    )
-    _US_SAFE_TICKERS = (
-        "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "TSLA", "NVDA", "AMD",
-        "NFLX", "INTC", "QCOM", "AVGO", "ORCL", "CRM", "ADBE", "PYPL", "DIS",
-        "JPM", "BAC", "GS", "MS", "WFC", "C", "BRK", "V", "MA", "JNJ", "PG",
-        "KO", "PEP", "WMT", "HD", "MCD", "NKE", "BA", "CAT", "GE", "F",
-        "QQQ", "SPY", "DIA", "IWM", "VOO", "VTI", "SOXL", "SOXX", "SMH", "XLE", "XLF",
-    )
-
-    @classmethod
-    def classify_market(cls, title: str, summary: str = "") -> str:
-        """Return 'KR', 'US', or 'BOTH'. 'BOTH' is used both when the article is genuinely
-        global (e.g. global commodities) AND when the heuristic is uncertain — those
-        articles get included in BOTH the KR and US analysis pools."""
-        text = f"{title or ''} {summary or ''}"
-        kr = sum(1 for k in cls._KR_KW if k.lower() in text.lower())
-        us = sum(1 for k in cls._US_KW if k.lower() in text.lower())
-        if cls._KR_CODE_RE.search(text):
-            kr += 2  # 6-digit Korean stock code → strong KR signal
-        for tk in cls._US_TICKER_RE.findall(text):
-            if tk in cls._US_SAFE_TICKERS:
-                us += 2
-        # uncertain (no signal at all) → BOTH so neither session loses the news entirely
-        if kr == 0 and us == 0:
-            return "BOTH"
-        if kr > us * 2:
-            return "KR"
-        if us > kr * 2:
-            return "US"
-        # mixed signal — let both sessions see it
-        return "BOTH"
+    # 사장 지시 2026-06-04: 뉴스 KR/US 시장 분류 폐지(단일 풀). classify_market·LLM 분류기 전부 제거 —
+    # 시장 구분은 사이클의 마켓센티먼트팀장이 직접 한다([[arquant-data-dir-and-news-pipeline]]).
 
     # Known junk: bare company names / stock labels that crawl as "articles"
     _JUNK_TITLES = {
@@ -225,8 +181,7 @@ class NaverFinanceMonitor:
         self._remember_title(title)
         return {"title": title, "link": link, "summary": (summary or "")[:200],
                 "source": (source or "").strip(), "date": (date_str or "").strip(),
-                "crawled_at": self.last_crawl_time,
-                "market": self.classify_market(title, summary or "")}
+                "crawled_at": self.last_crawl_time}
 
     def _accept(self, art: Optional[Dict], out: List[Dict]) -> bool:
         if not art:
@@ -333,16 +288,6 @@ class NaverFinanceMonitor:
             logger.warning(f"clear_history 저장 실패: {e}")
         return len(self._article_history)
 
-    def reclassify_in_history(self, link_to_market: Dict[str, str]) -> int:
-        """LLM 재분류 결과를 in-memory history에 반영. Returns the number of updated entries."""
-        n = 0
-        for a in self._article_history:
-            m = link_to_market.get(a.get("link"))
-            if m and m in ("KR", "US", "BOTH") and a.get("market") != m:
-                a["market"] = m
-                n += 1
-        return n
-
     def format_articles_for_agent(self, articles: List[Dict]) -> str:
         """Format articles as a string for agent consumption."""
         if not articles:
@@ -376,122 +321,3 @@ def get_monitor() -> NaverFinanceMonitor:
     if _monitor is None:
         _monitor = NaverFinanceMonitor()
     return _monitor
-
-
-# ── 사장 피드백 2026-05-15 (4차): LLM 기반 뉴스 분류 (tencent/hy3-preview) ────────
-# 키워드 매칭이 부정확하다는 사장 지적에 따라 배치 LLM 분류로 전환.
-# 크롤 직후 새로 들어온 헤드라인 N건을 한 번의 LLM 호출로 분류.
-# 키워드 분류(classify_market)는 LLM 실패/타임아웃 시 폴백으로 유지.
-# 사장 피드백 2026-05-15 (8차): alibaba/tongyi-deepresearch-30b-a3b는 검색·합성 능력이 있는 reasoning 모델.
-# 모델이 헤드라인의 기업명을 직접 lookup해서 상장 시장을 판단할 수 있으므로 긴 화이트리스트·anti-example 불필요.
-# 짧고 명확한 분류 규칙만 제공.
-_CLASSIFIER_SYSTEM = """뉴스 헤드라인을 KR / US / BOTH 셋 중 하나로 분류하세요.
-
-기준:
-- KR = 한국 시장(KOSPI/KOSDAQ) 상장 기업/지수/한국 거시(한은·원달러)·정책
-- US = 미국 시장(NYSE/NASDAQ) 상장 기업/지수/미국 거시(Fed·美 국채)
-- BOTH = 양국 모두 영향 주는 매크로 (유가·미중관계·지정학·전쟁·글로벌 산업) 또는 양국 기업 동시 등장
-
-핵심 원칙:
-1. 헤드라인에 등장하는 기업명을 식별해 그 기업의 상장 시장으로 분류하세요.
-2. 기업 실적/매출/영업이익/순이익 헤드라인은 항상 해당 기업의 상장 시장.
-3. 기업명이 없는 순수 매크로/지정학/원자재 헤드라인만 BOTH로.
-4. 한국 지수(코스피/코스닥) = KR, 미국 지수(나스닥/다우/S&P) = US.
-5. 원/달러 환율은 한국 관점 → KR. "달러 강세"는 BOTH.
-
-응답은 JSON 배열 한 줄만. 예: ["KR","US","BOTH","KR"]
-다른 텍스트·설명 금지."""
-
-
-async def llm_classify_articles(articles: List[Dict], model: str = "alibaba/tongyi-deepresearch-30b-a3b",
-                                 max_tokens: int = 12000) -> Dict[str, str]:
-    """입력 articles의 헤드라인을 LLM에 배치 전송 → {link: market} 매핑 반환.
-    실패하면 빈 dict (호출처가 키워드 분류 결과를 그대로 사용).
-    사장 피드백 8차: alibaba/tongyi-deepresearch (검색·reasoning 통합 모델)로 전환.
-    - 짧은 프롬프트 + 모델이 기업명을 자체 lookup
-    - reasoning 모델 → content가 비면 reasoning 필드에서 폴백 추출"""
-    if not articles:
-        return {}
-    try:
-        from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS
-    except ImportError:
-        return {}
-    if not OPENROUTER_API_KEY:
-        return {}
-    try:
-        # 사장 지시 2026-05-30: ADMIN 모델 오버라이드 우선 — 그동안 config 만 읽어 오버라이드를
-        # 무시했다(BaseAgent 와 통일). 오버라이드 없으면 config news_classifier → 기존 기본값 폴백.
-        from infra import admin_config
-        model = admin_config.resolve_model("news_classifier", model) or model
-        max_tokens = AGENT_MAX_TOKENS.get("news_classifier", max_tokens) or max_tokens
-    except Exception:
-        pass
-
-    # 20건씩 청크 — reasoning 모델 + JSON 응답 + 정확도 균형
-    CHUNK = 20
-    out: Dict[str, str] = {}
-    for i in range(0, len(articles), CHUNK):
-        chunk = articles[i:i + CHUNK]
-        numbered = "\n".join(f"{j+1}. {(a.get('title') or '')[:160]}" for j, a in enumerate(chunk))
-        # 사장 피드백 8차: alibaba 모델은 기업명 lookup 가능 → 짧고 명확한 지시.
-        user_msg = (
-            f"다음 {len(chunk)}개 헤드라인을 KR / US / BOTH로 분류:\n\n"
-            f"{numbered}\n\n"
-            f"각 헤드라인의 주제 기업이 한국(KOSPI/KOSDAQ) 상장이면 KR, 미국(NYSE/NASDAQ) 상장이면 US. "
-            f"기업명이 없는 순수 매크로/지정학/원자재면 BOTH. "
-            f"JSON 배열 한 줄만 응답 — 예: [\"KR\",\"US\",\"BOTH\",...]"
-        )
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": _CLASSIFIER_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-            "max_tokens": max_tokens, "temperature": 0.0,
-        }
-        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json",
-                   "HTTP-Referer": "https://arquant.ai-ve.uk", "X-Title": "ArQuant-NewsClassifier"}
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
-                async with s.post(f"{OPENROUTER_BASE_URL}/chat/completions", json=payload, headers=headers) as r:
-                    if r.status != 200:
-                        logger.warning(f"news_classifier HTTP {r.status}")
-                        continue
-                    data = await r.json()
-        except Exception as e:
-            logger.warning(f"news_classifier 호출 예외: {e}")
-            continue
-        try:
-            _msg_obj = data.get("choices", [{}])[0].get("message", {}) or {}
-            reply = (_msg_obj.get("content") or "").strip()
-            # 사장 피드백 8차: alibaba는 reasoning 모델 — content가 비면 reasoning에서 추출.
-            if not reply:
-                reply = (_msg_obj.get("reasoning") or "").strip()
-        except Exception:
-            continue
-        # JSON 배열 매칭 우선
-        m = re.search(r"\[\s*(?:\"(?:KR|US|BOTH)\"\s*,?\s*){1,}\]", reply, re.IGNORECASE)
-        labels = None
-        if m:
-            try: labels = _json.loads(m.group(0).upper())
-            except _json.JSONDecodeError: labels = None
-        if labels is None:
-            # 폴백: 라벨만 추출 (따옴표 유무 무관)
-            tokens = re.findall(r"\b(KR|US|BOTH)\b", reply, re.IGNORECASE)
-            if tokens:
-                labels = [t.upper() for t in tokens][:len(chunk)]
-        if not labels:
-            _fin = data.get("choices", [{}])[0].get("finish_reason","?")
-            logger.warning(f"news_classifier 응답 파싱 실패 (finish={_fin}, len={len(reply)}): {reply[:200]!r}")
-            continue
-        if not isinstance(labels, list):
-            continue
-        for j, art in enumerate(chunk):
-            if j >= len(labels):
-                break
-            lbl = str(labels[j]).upper().strip()
-            if lbl in ("KR", "US", "BOTH"):
-                lnk = art.get("link")
-                if lnk:
-                    out[lnk] = lbl
-    return out

@@ -121,12 +121,13 @@ fun LoginScreen(
     val register = state.phase == AuthPhase.NEED_REGISTER
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
-    var openrouter by remember { mutableStateOf("") }
+    var deepseekApiKey by remember { mutableStateOf("") }
     var appKey by remember { mutableStateOf("") }
     var appSecret by remember { mutableStateOf("") }
     var accountNo by remember { mutableStateOf("") }
+    var viewer by remember { mutableStateOf(true) }
     // 사장 피드백 2026-05-16: KIS Base URL 직접 입력 제거 → 실전/모의 토글.
-    var mock by remember { mutableStateOf(false) }
+    var mock by remember { mutableStateOf(true) }
     val baseUrl = if (mock) "https://openapivts.koreainvestment.com:29443"
                   else "https://openapi.koreainvestment.com:9443"
     var remember7 by remember { mutableStateOf(true) }
@@ -182,17 +183,29 @@ fun LoginScreen(
             }
 
             if (register) {
-                // 5-6: 필드 레이블 명시
-                Field("OpenRouter API Key (필수)", openrouter, { openrouter = it })
-                Field("한국투자증권 App Key", appKey, { appKey = it })
-                Field("한국투자증권 App Secret", appSecret, { appSecret = it }, isPassword = true)
-                // 5-6: KIS 계좌번호 레이블
-                Field("한국투자증권 계좌번호 (예: 12345678-01)", accountNo, { accountNo = it })
-                Text("거래 환경", fontSize = 11.sp, color = AqColors.TextDim,
-                    modifier = Modifier.padding(top = 6.dp, bottom = 4.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ModeTab("실전투자", !mock) { mock = false }
-                    ModeTab("모의투자", mock) { mock = true }
+                    ModeTab("관전 모드", viewer) { viewer = true }
+                    ModeTab("투자 계정", !viewer) { viewer = false }
+                }
+                if (viewer) {
+                    Text("아이디와 비밀번호만으로 hh09080 계정을 읽기 전용으로 관전합니다.",
+                        color = AqColors.TextDim, fontSize = 11.sp,
+                        modifier = Modifier.padding(top = 6.dp))
+                } else {
+                    Field("DeepSeek API Key (필수)", deepseekApiKey, { deepseekApiKey = it })
+                    Field("한국투자증권 App Key", appKey, { appKey = it })
+                    Field("한국투자증권 App Secret", appSecret, { appSecret = it }, isPassword = true)
+                    Field("한국투자증권 계좌번호 (예: 12345678-01)", accountNo, { accountNo = it })
+                    Text("거래 환경", fontSize = 11.sp, color = AqColors.TextDim,
+                        modifier = Modifier.padding(top = 6.dp, bottom = 4.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ModeTab("실전투자", !mock) { mock = false }
+                        ModeTab("모의투자 (권장)", mock) { mock = true }
+                    }
+                    Text(if (mock) "처음에는 모의투자로 전체 흐름을 확인하세요."
+                        else "주의: 실전투자는 실제 계좌로 주문을 전송합니다.",
+                        color = if (mock) AqColors.TextDim else AqColors.Red,
+                        fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp))
                 }
                 Spacer(Modifier.height(6.dp))
                 // 5-5: DART API Key 및 계정 이름(선택) 필드 제거됨
@@ -214,15 +227,16 @@ fun LoginScreen(
                     if (register) onRegister(
                         RegisterRequest(
                             username = username.trim(), password = password,
-                            openrouterKey = openrouter.trim(), kisAppKey = appKey.trim(),
+                            accountMode = if (viewer) "viewer" else "trading",
+                            deepseekApiKey = deepseekApiKey.trim(), kisAppKey = appKey.trim(),
                             kisAppSecret = appSecret.trim(), kisAccountNo = accountNo.trim(),
                             kisBaseUrl = baseUrl.trim(), remember = remember7,
                         )
                     ) else onLogin(username, password, remember7)
                 },
                 enabled = !state.busy && username.trim().length >= 3 && password.isNotBlank()
-                    && (!register || (pwErr == null && openrouter.isNotBlank()
-                        && appKey.isNotBlank() && appSecret.isNotBlank() && accountNo.isNotBlank())),
+                    && (!register || (pwErr == null && (viewer || (deepseekApiKey.isNotBlank()
+                        && appKey.isNotBlank() && appSecret.isNotBlank() && accountNo.isNotBlank())))),
                 modifier = Modifier.fillMaxWidth().height(46.dp),
                 shape = RoundedCornerShape(9.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = AqColors.Primary),

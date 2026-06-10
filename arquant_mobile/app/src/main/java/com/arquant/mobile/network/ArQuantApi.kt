@@ -201,7 +201,7 @@ data class StartRequest(val directive: String? = null)
 data class StrategySetRequest(val name: String)
 
 // ─── Auth (사장 피드백 2026-05-16: CF Access 제거 → 앱 자체 로그인) ───────────
-// 필드 매핑: KIS App Key=아이디 / KIS App Secret=비밀번호 / OpenRouter=필수 키
+// 거래 계정 등록: KIS 자격증명 + DeepSeek API 키
 @Serializable
 data class LoginRequest(
     val username: String,
@@ -213,10 +213,11 @@ data class LoginRequest(
 data class RegisterRequest(
     val username: String,
     val password: String,
-    @SerialName("openrouter_key") val openrouterKey: String,
-    @SerialName("kis_app_key") val kisAppKey: String,
-    @SerialName("kis_app_secret") val kisAppSecret: String,
-    @SerialName("kis_account_no") val kisAccountNo: String,
+    @SerialName("account_mode") val accountMode: String = "viewer",
+    @SerialName("deepseek_api_key") val deepseekApiKey: String = "",
+    @SerialName("kis_app_key") val kisAppKey: String = "",
+    @SerialName("kis_app_secret") val kisAppSecret: String = "",
+    @SerialName("kis_account_no") val kisAccountNo: String = "",
     @SerialName("kis_base_url") val kisBaseUrl: String = "https://openapi.koreainvestment.com:9443",
     val remember: Boolean = true,
 )

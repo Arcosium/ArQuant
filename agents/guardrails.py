@@ -115,8 +115,24 @@ def _check_single_order(o: Dict[str, Any], bp: Dict[str, Any], price_map: Dict[s
     # 이 한도로 clamp 되므로 정상 주문은 여기서 걸리지 않는다(걸리면 비정상적으로 큰 수량 = 보수적 반려).
     _mq = runtime.get("MAX_ORDER_QTY", uid=uid)
     import config as _cfg
+    # I1 수정(사장 지시 2026-06-09): 슬리브 ETF(채권·원자재)는 자산배분 자산이라 단일종목 편중 한도를
+    # CONSERVATIVE_STOCK_RATIO(보통 0.15) 대신 그 슬리브의 *_TARGET_MAX_PCT 로 분기한다.
+    # (안 그러면 채권/원자재 배분이 15%에서 막혀 자산배분이 작동 못 한다.)
+    from infra.asset_sleeves import sleeve_for_code
+    _sleeve_spec = sleeve_for_code(ticker)
+    _is_sleeve_etf = _sleeve_spec is not None
+    # 코드리뷰 #2(2026-06-09): runtime override 의 정당한 0.0(비중 0% 제한)을 `or 0.40`이 둔갑시키지
+    # 않도록 None 일 때만 config 기본값(슬리브별 정확값 — 채권 0.40·원자재 0.20)으로 폴백.
+    if _is_sleeve_etf:
+        _tm = runtime.get(_sleeve_spec.target_max_key, uid=uid)
+        _concentration_ratio = float(_tm if _tm is not None
+                                     else getattr(_cfg, _sleeve_spec.target_max_key, 0.40))
+    else:
+        _concentration_ratio = CONSERVATIVE_STOCK_RATIO
     _qty_ceiling = int(_mq) if (_mq and _mq > 0) else int(_cfg.HARD_MAX_ORDER_QTY)
-    if side == "buy" and _qty_ceiling > 0 and qty > _qty_ceiling:
+    # 사장 지시 2026-06-09: 슬리브 ETF 는 수량 한도 면제 — 사이징 단계에서 예수금·*_PER_CYCLE_RATIO
+    # 로 이미 cap 되므로(자산배분 목표비중 추종은 큰 수량이 정상). 주식만 1회 한도 적용.
+    if side == "buy" and not _is_sleeve_etf and _qty_ceiling > 0 and qty > _qty_ceiling:
         issues.append(f"주문 수량({qty})이 1회 한도({_qty_ceiling}주) 초과")
     if not reason or len(reason) < 5:
         issues.append("주문 사유(reason) 누락/불충분")
@@ -143,17 +159,23 @@ def _check_single_order(o: Dict[str, Any], bp: Dict[str, Any], price_map: Dict[s
             pr = float(bp.get("pnl_ratio") or 0.0)
             if pr <= -abs(CONSERVATIVE_MDD):
                 issues.append(f"계좌 평가손익 {pr*100:.1f}% — 보수적 MDD(-{CONSERVATIVE_MDD*100:.0f}%) 초과, 모든 신규 매수 반려")
-            if total > 0 and notional_krw > total * CONSERVATIVE_STOCK_RATIO:
-                issues.append(f"단일 종목 비중 {notional_krw/total*100:.1f}% — 한도 {CONSERVATIVE_STOCK_RATIO*100:.0f}% 초과")
+            if total > 0 and notional_krw > total * _concentration_ratio:
+                _lim_label = "슬리브 한도" if _is_sleeve_etf else "한도"
+                issues.append(f"단일 종목 비중 {notional_krw/total*100:.1f}% — {_lim_label} {_concentration_ratio*100:.0f}% 초과")
             if cash > 0 and notional_krw * MIN_CASH_BUFFER > cash:
                 issues.append(f"예수금 부족: 필요 {notional_krw*MIN_CASH_BUFFER:,.0f}원 > 보유 {cash:,.0f}원")
             # cycle-level aggregate budget (원화 환산 누적)
-            if cash > 0 and (cycle_state.get("spent", 0.0) + notional_krw) > cash * MAX_CYCLE_BUDGET_RATIO:
+            # 사장 지시 2026-06-09: 슬리브 ETF 는 주식 사이클 예산비율(MAX_CYCLE_BUDGET_RATIO) 게이트 면제.
+            # 슬리브는 *_PER_CYCLE_RATIO(전용 사이클 예산) + 예수금으로 사이징 단계에서 cap 된다.
+            if not _is_sleeve_etf and cash > 0 and (cycle_state.get("spent", 0.0) + notional_krw) > cash * MAX_CYCLE_BUDGET_RATIO:
                 issues.append(f"사이클 누적 매수예산({cash*MAX_CYCLE_BUDGET_RATIO:,.0f}원) 초과")
     # 사장 지시 2026-05-21: 매도 경고("보유수량 확인은 브로커 단에서 수행") 출력 제거 — sell 은 별도 경고 없이 통과.
 
     status = "REJECTED" if issues else "APPROVED"
-    if status == "APPROVED" and side == "buy":
+    # 사장 지시 2026-06-09: 슬리브 매수 notional 은 *주식* 사이클 예산(spent)에 가산하지 않는다 —
+    # 슬리브는 예산비율 게이트가 면제(별도 *_PER_CYCLE_RATIO)이므로 spent 누적에서도 제외해야
+    # 슬리브 매수가 같은 사이클의 주식 매수예산을 잠식하지 않는다.
+    if status == "APPROVED" and side == "buy" and not _is_sleeve_etf:
         cycle_state["spent"] = cycle_state.get("spent", 0.0) + notional_krw
     return {"ticker": ticker, "side": side, "qty": qty, "price": price, "notional": notional,
             "status": status, "issues": issues, "warnings": warnings,

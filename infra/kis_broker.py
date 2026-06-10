@@ -88,6 +88,37 @@ def excd_to_excg(excd: Optional[str]) -> str:
     return {"NAS": "NASD", "NYS": "NYSE", "AMS": "AMEX"}.get(e, "NASD")
 
 
+def kr_tick_size(price: float) -> int:
+    """KRX/NXT 공통 호가단위 (2023~ 개정 기준)."""
+    p = float(price or 0)
+    if p < 2000:    return 1
+    if p < 5000:    return 5
+    if p < 20000:   return 10
+    if p < 50000:   return 50
+    if p < 200000:  return 100
+    if p < 500000:  return 500
+    return 1000
+
+
+def round_to_tick(price: float) -> int:
+    """가장 가까운 유효 호가로 반올림(nearest, Python round=banker's rounding). 밴드가 이미 공격성을 부여하므로 방향성 라운딩 불필요."""
+    p = float(price or 0)
+    if p <= 0:
+        return 0
+    t = kr_tick_size(p)
+    return int(round(p / t) * t)
+
+
+def compute_nxt_limit_price(last_price: float, *, side: str, slippage_pct: float) -> int:
+    """시간외 지정가 = 현재가 ± 슬리피지 밴드, 호가단위 반올림. last_price<=0 이면 0(주문 보류 신호)."""
+    last = float(last_price or 0)
+    if last <= 0:
+        return 0
+    band = (float(slippage_pct or 0) / 100.0)
+    raw = last * (1 + band) if side == "buy" else last * (1 - band)
+    return round_to_tick(raw)
+
+
 class OrderSide(str, Enum):
     BUY = "buy"; SELL = "sell"
 class PriceType(str, Enum):
@@ -95,7 +126,7 @@ class PriceType(str, Enum):
 class OrderDraft(BaseModel):
     ticker: str; side: OrderSide; qty: int = Field(gt=0)
     price_type: PriceType = PriceType.MARKET; limit_price: Optional[float] = None
-    market: str = "KR"; reason: str = ""; approved: bool = False
+    market: str = "KR"; exchange: str = "KRX"; reason: str = ""; approved: bool = False
     rejection_reason: Optional[str] = None
 
 class KISBroker:
@@ -117,6 +148,7 @@ class KISBroker:
         self._rate_lock = asyncio.Lock()
         self._last_call: float = 0.0
         self._min_interval: float = 0.5 if self.is_mock else 0.06
+        self._nxt_supported = None   # None=미탐, True=지원확인, False=미지원(시간외 스킵)
 
     async def _s(self):
         if not self._session or self._session.closed:
@@ -302,6 +334,36 @@ class KISBroker:
     # (실전 TTTT1006U → 모의 VTTT1001U, 단순 T→V 아님). 시세성(FH...)은 변환 불필요.
     _MOCK_TR_OVERRIDE = {"TTTT1006U": "VTTT1001U"}
 
+    # (side, exchange) → tr_id.  KRX = 검증된 구 TR 그대로(EXCG 미포함). NXT = 신 통합주문 TR.
+    _KR_ORD_TR = {
+        ("buy",  "KRX"): "TTTC0802U", ("sell", "KRX"): "TTTC0801U",
+        ("buy",  "NXT"): "TTTC0012U", ("sell", "NXT"): "TTTC0011U",
+    }
+
+    # NXT 미지원으로 판정할 메시지 시그니처(모의서버). 일반 거부(잔고부족 등)와 구분.
+    # 2026-06-08 라이브검증 확정: 모의서버 실제 거부 = "모의투자에서 대체거래소 서비스를 제공하지 않습니다."
+    # (msg_cd=41050000) → "대체거래소 서비스"·"제공하지" 로 매칭. 잔고/가격 거부엔 안 나오는 문구라 오탐 없음.
+    _NXT_UNSUPPORTED_HINTS = ("미지원", "지원하지", "지원되지", "제공되지", "제공하지",
+                              "사용할 수 없", "대체거래소 서비스")
+
+    def _note_nxt_result(self, exchange: str, resp: dict) -> None:
+        """NXT 주문 응답으로 거래소 지원 여부 학습. KRX 주문은 무관."""
+        if exchange != "NXT":
+            return
+        if (resp or {}).get("rt_cd") == "0":
+            if self._nxt_supported is not True:
+                self._nxt_supported = True
+            return
+        msg = str((resp or {}).get("msg1", ""))   # 원본 msg1 사용 — 힌트 키워드는 정제 전 원문에 들어있음
+        if any(h in msg for h in self._NXT_UNSUPPORTED_HINTS):
+            if self._nxt_supported is not False:
+                logger.warning(f"[NXT] 거래소 미지원 감지 — 시간외 매매 비활성화. msg={msg}")
+                self._nxt_supported = False
+        # 그 외 거부(잔고부족 등)는 지원 여부 미확정 → 플래그 불변
+
+    def nxt_supported(self):
+        return self._nxt_supported
+
     def _mock_tr(self, tr_id: str) -> str:
         if not self.is_mock or not tr_id:
             return tr_id
@@ -323,9 +385,10 @@ class KISBroker:
         return (cano, prdt or "01")
 
     # ═══════════════════ 국내주식 시세 ═══════════════════
-    async def kr_price(self, code: str) -> Dict:
+    async def kr_price(self, code: str, market: str = "J") -> Dict:
+        # market: J=KRX(기본), NX=NXT, UN=통합 (FID_COND_MRKT_DIV_CODE)
         d = await self._get_json("/uapi/domestic-stock/v1/quotations/inquire-price", "FHKST01010100",
-            {"FID_COND_MRKT_DIV_CODE":"J","FID_INPUT_ISCD":code})
+            {"FID_COND_MRKT_DIV_CODE": market, "FID_INPUT_ISCD": code})
         return d.get("output", {})
 
     async def kr_price_str(self, code: str) -> str:
@@ -418,17 +481,22 @@ class KISBroker:
         return rows
 
     # ═══════════════════ 국내주식 주문 ═══════════════════
-    async def kr_buy(self, code: str, qty: int, price: int = 0) -> str:
+    async def kr_buy(self, code: str, qty: int, price: int = 0, exchange: str = "KRX") -> str:
         s = await self._s(); c, p = self._acnt()
         # 사장 지시 2026-05-19: 지정가(price>0)면 ORD_DVSN="00"(지정가), 없으면 "01"(시장가).
         # 기존 '"01" if price else "01"'은 지정가 주문도 시장가로 체결시키던 버그.
-        body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":"00" if price else "01",
+        ord_dvsn = "00" if (price or (exchange == "NXT")) else "01"   # NXT는 시장가 미지원→지정가 강제
+        body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":ord_dvsn,
                 "ORD_QTY":str(qty),"ORD_UNPR":str(price) if price else "0","CTAC_TLNO":""}
+        if exchange == "NXT":
+            body["EXCG_ID_DVSN_CD"] = "NXT"; body["CNDT_PRIC"] = ""
+        tr = self._KR_ORD_TR[("buy", exchange)]
         async def _do(tk):
             async with s.post(f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash",
-                headers=self._h(tk,"TTTC0802U"), json=body) as r:
+                headers=self._h(tk, tr), json=body) as r:
                 return await r.json()
         d = await self._authed_json(_do)
+        self._note_nxt_result(exchange, d)
         return f"[국내매수] {code} {qty}주 → {_clean_kis_msg(d.get('msg1',''))}" if d.get("rt_cd")=="0" else f"[실패] {_clean_kis_msg(d.get('msg1',''))}"
 
     async def kr_pending_orders(self, code: Optional[str] = None) -> List[Dict]:
@@ -491,7 +559,7 @@ class KISBroker:
                 if d.get("rt_cd") == "0"
                 else f"[취소실패] {pdno} {odno} → {_clean_kis_msg(d.get('msg1',''))}")
 
-    async def kr_sell(self, code: str, qty: int, price: int = 0) -> str:
+    async def kr_sell(self, code: str, qty: int, price: int = 0, exchange: str = "KRX") -> str:
         # 사장 지시 2026-05-28: 새 매도 판단이 들어오면 같은 종목의 살아있는 펜딩 매도는 폐기하고 신규로 대체.
         # 배경: KIS는 펜딩 주문이 ord_psbl_qty(매도가능수량)를 깎아, 보유 1주에 28,000원 펜딩 매도가 있으면
         # 후속 매도 시도가 모두 "주문 가능한 수량을 초과했습니다"로 거부된다(003490 사례 5/28 14:09·15:20).
@@ -507,13 +575,18 @@ class KISBroker:
         s = await self._s(); c, p = self._acnt()
         # 사장 지시 2026-05-19: 지정가(price>0)면 ORD_DVSN="00"(지정가), 없으면 "01"(시장가).
         # 기존 '"01" if price else "01"'은 지정가 매도도 시장가로 체결시키던 버그.
-        body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":"00" if price else "01",
+        ord_dvsn = "00" if (price or (exchange == "NXT")) else "01"   # NXT는 시장가 미지원→지정가 강제
+        body = {"CANO":c,"ACNT_PRDT_CD":p,"PDNO":code,"ORD_DVSN":ord_dvsn,
                 "ORD_QTY":str(qty),"ORD_UNPR":str(price) if price else "0","CTAC_TLNO":""}
+        if exchange == "NXT":
+            body["EXCG_ID_DVSN_CD"] = "NXT"; body["SLL_TYPE"] = "01"; body["CNDT_PRIC"] = ""
+        tr = self._KR_ORD_TR[("sell", exchange)]
         async def _do(tk):
             async with s.post(f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash",
-                headers=self._h(tk,"TTTC0801U"), json=body) as r:
+                headers=self._h(tk, tr), json=body) as r:
                 return await r.json()
         d = await self._authed_json(_do)
+        self._note_nxt_result(exchange, d)
         return f"[국내매도] {code} {qty}주 → {_clean_kis_msg(d.get('msg1',''))}" if d.get("rt_cd")=="0" else f"[실패] {_clean_kis_msg(d.get('msg1',''))}"
 
     # ── one canonical balance read (paginated) → cached 8s; everything else derives from it ──
@@ -688,11 +761,12 @@ class KISBroker:
     async def kr_buying_power(self) -> Dict[str, float]:
         return (await self.kr_account_snapshot())["buying_power"]
 
-    async def kr_last_price(self, code: str) -> float:
+    async def kr_last_price(self, code: str, market: str = "J") -> float:
         """Current price as a float. KIS primary → 네이버 금융 폴백 (사장 지시 2026-05-14 — 028670 0원 이슈 해결).
+        market: J=KRX(기본), NX=NXT, UN=통합. 네이버 폴백은 KRX 근사로 fallback 허용.
         Returns 0.0 only when both sources fail."""
         try:
-            d = await self.kr_price(code)
+            d = await self.kr_price(code, market=market)
             px = self._num(d.get("stck_prpr"))
             if px > 0:
                 return px
@@ -1164,6 +1238,23 @@ class KISBroker:
             if _cv > 0 and abs(_ta - _cv) / _cv > 0.01:
                 logger.warning(f"[총자산 검증] KIS통합 {_ta:,.0f}원 vs 곡선식 {_cv:,.0f}원 "
                                f"({(_ta - _cv) / _cv * 100:+.1f}%) — 구성차(D0예수금/미결제 등) 확인")
+                # 2026-06-10 진단(사장 지시: 괴리 해결): 곡선식 vs KIS통합의 구성요소를 1회성 분해해
+                # 638K 괴리가 '국내(D+2 vs D0)'에서 오는지 '해외(결제기준 vs 실시간/USD예수금)'에서
+                # 오는지 못박는다. 원인 확정 후 진단 로그는 제거하고 타깃 수정한다.
+                try:
+                    logger.warning(
+                        "[총자산 진단] 곡선=국내(유가+D2) %s + 해외결제 %s | 해외실시간(frcr_evlu_tota) %s "
+                        "= 주식 %s + USD예수금 %s | KIS통합 6548=%s · 6504=%s · 6010(2)=%s",
+                        f"{self._num(bp.get('total_eval_kr')):,.0f}",
+                        f"{self._num(curve_overseas):,.0f}",
+                        f"{self._num(pk.get('krw_value')):,.0f}",
+                        f"{self._num(pk.get('stock_value')):,.0f}",
+                        f"{self._num(pk.get('deposit_krw')):,.0f}",
+                        f"{self._num(asset.get('tot_asst_amt')):,.0f}",
+                        f"{self._num(pk.get('tot_asst_amt')):,.0f}",
+                        f"{self._num(settled.get('tot_asst_amt2')):,.0f}")
+                except Exception as _de:
+                    logger.warning("[총자산 진단] 분해 실패: %s", _de)
         return {"buying_power": bp, "holdings": holdings,
                 "holdings_stale": snap.get("holdings_stale", False), "ok": snap.get("ok", False)}
 
@@ -1265,18 +1356,28 @@ class KISBroker:
         if tk in self._us_excd_cache:  # try the known exchange first
             codes = [self._us_excd_cache[tk]] + [c for c in codes if c != self._us_excd_cache[tk]]
         for i, excd in enumerate(codes):
-            try:
-                if i:
-                    await asyncio.sleep(0.3)  # ease KIS TPS between probes
-                async with s.get(f"{self.base_url}/uapi/overseas-price/v1/quotations/price",
-                    headers=self._h(tok,"HHDFS00000300"),
-                    params={"AUTH":"","EXCD":excd,"SYMB":tk}) as r:
-                    d = (await r.json()).get("output", {}) or {}
-                if d.get("last") not in (None, "", "0", "0.0", "0.00", "0.0000"):
-                    self._us_excd_cache[tk] = excd
-                    return {**d, "_excd": excd}
-            except Exception:
-                continue
+            if i:
+                await asyncio.sleep(0.3)  # ease KIS TPS between probes
+            # 버그수정 2026-06-05: rate-limit(초당 거래건수 초과)면 그 거래소를 '미스'로 건너뛰지 말고
+            # 백오프 후 재시도한다 — 올바른 거래소를 rate-limit 때문에 놓쳐 시세 0 → 주문 무음 스킵되던 문제.
+            for attempt in range(1, self._RATE_LIMIT_MAX_RETRY + 1):
+                try:
+                    async with s.get(f"{self.base_url}/uapi/overseas-price/v1/quotations/price",
+                        headers=self._h(tok,"HHDFS00000300"),
+                        params={"AUTH":"","EXCD":excd,"SYMB":tk}) as r:
+                        full = await r.json()
+                    if self._resp_rate_limited(full):
+                        logger.warning(f"[US시세] {tk} {excd} rate-limit — "
+                                       f"{self._RATE_LIMIT_BACKOFF_SEC*attempt:.2f}s 후 재시도 {attempt}/{self._RATE_LIMIT_MAX_RETRY}")
+                        await asyncio.sleep(self._RATE_LIMIT_BACKOFF_SEC * attempt)
+                        continue  # 같은 거래소 재시도
+                    d = full.get("output", {}) or {}
+                    if d.get("last") not in (None, "", "0", "0.0", "0.00", "0.0000"):
+                        self._us_excd_cache[tk] = excd
+                        return {**d, "_excd": excd}
+                    break  # rate-limit 아닌 빈 응답 → 다음 거래소
+                except Exception:
+                    break
         return {}
 
     async def us_price(self, ticker: str, excd: Optional[str] = None) -> str:
@@ -1323,30 +1424,41 @@ class KISBroker:
         data: List[Dict] = []
         exchange_results = []
         for i, excd in enumerate(codes):
-            try:
-                if i:
-                    await asyncio.sleep(0.3)  # KIS TPS 완화
-                async with s.get(f"{self.base_url}/uapi/overseas-price/v1/quotations/dailyprice",
-                    headers=self._h(tok, "HHDFS76240000"),
-                    params={"AUTH":"","EXCD":excd,"SYMB":tk,
-                            "GUBN":"0",          # 0=일, 1=주, 2=월
-                            "BYMD": datetime.now(KST).strftime("%Y%m%d"),
-                            "MODP":"1"}) as r:   # 1=수정주가 반영
-                    resp_json = await r.json()
+            if i:
+                await asyncio.sleep(0.3)  # KIS TPS 완화
+            # 버그수정 2026-06-05: rate-limit(초당 거래건수 초과)면 그 거래소를 백오프 후 재시도한다 —
+            # CVX(NYS) 처럼 올바른 거래소가 rate-limit으로 0건이 돼 일봉 결손→퀀트/주문 누락되던 문제.
+            _out = []; status = "?"; resp_json = {}
+            for attempt in range(1, self._RATE_LIMIT_MAX_RETRY + 1):
+                try:
+                    async with s.get(f"{self.base_url}/uapi/overseas-price/v1/quotations/dailyprice",
+                        headers=self._h(tok, "HHDFS76240000"),
+                        params={"AUTH":"","EXCD":excd,"SYMB":tk,
+                                "GUBN":"0",          # 0=일, 1=주, 2=월
+                                "BYMD": datetime.now(KST).strftime("%Y%m%d"),
+                                "MODP":"1"}) as r:   # 1=수정주가 반영
+                        resp_json = await r.json()
+                    if self._resp_rate_limited(resp_json):
+                        logger.warning(f"[US일봉] {tk} {excd} rate-limit — "
+                                       f"{self._RATE_LIMIT_BACKOFF_SEC*attempt:.2f}s 후 재시도 {attempt}/{self._RATE_LIMIT_MAX_RETRY}")
+                        await asyncio.sleep(self._RATE_LIMIT_BACKOFF_SEC * attempt)
+                        continue  # 같은 거래소 재시도
                     status = resp_json.get("rt_cd", "?")
                     _out = resp_json.get("output2", []) or []
-                    exchange_results.append({"excd": excd, "status": status, "output2_len": len(_out)})
-                    if status != "0":
-                        logger.warning(f"[US일봉] {tk} {excd} rt_cd={status} msg1={resp_json.get('msg1','')} output2_len={len(_out)}")
-                    elif not _out:
-                        logger.info(f"[US일봉] {tk} {excd} rt_cd=0 but output2 empty (msg1={resp_json.get('msg1','')})")
-                if _out:
-                    data = _out
-                    self._us_excd_cache[tk] = excd   # 다음 조회는 단일 요청으로
                     break
-            except Exception as e:
-                logger.warning(f"[US일봉] {tk} {excd} 조회 예외: {e}")
-                continue
+                except Exception as e:
+                    logger.warning(f"[US일봉] {tk} {excd} 조회 예외: {e}")
+                    _out = []; status = "예외"
+                    break
+            exchange_results.append({"excd": excd, "status": status, "output2_len": len(_out)})
+            if status != "0" and status not in ("?",):
+                logger.warning(f"[US일봉] {tk} {excd} rt_cd={status} msg1={resp_json.get('msg1','')} output2_len={len(_out)}")
+            elif status == "0" and not _out:
+                logger.info(f"[US일봉] {tk} {excd} rt_cd=0 but output2 empty (msg1={resp_json.get('msg1','')})")
+            if _out:
+                data = _out
+                self._us_excd_cache[tk] = excd   # 다음 조회는 단일 요청으로
+                break
         if not data:
             details = "; ".join(f"{r['excd']}: status={r['status']}, output2_len={r['output2_len']}" for r in exchange_results)
             _all_clean_empty = (len(exchange_results) == len(codes)
@@ -1530,9 +1642,9 @@ class KISBroker:
             return "[주문 거부] 리스크관리실 승인 필요"
         if order.market == "KR":
             if order.side == OrderSide.BUY:
-                return await self.kr_buy(order.ticker, order.qty, int(order.limit_price or 0))
+                return await self.kr_buy(order.ticker, order.qty, int(order.limit_price or 0), exchange=order.exchange)
             else:
-                return await self.kr_sell(order.ticker, order.qty, int(order.limit_price or 0))
+                return await self.kr_sell(order.ticker, order.qty, int(order.limit_price or 0), exchange=order.exchange)
         elif order.market == "US":
             if order.side == OrderSide.BUY:
                 return await self.us_buy(order.ticker, order.qty, order.limit_price or 0)

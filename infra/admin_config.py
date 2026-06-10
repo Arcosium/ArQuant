@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 _PATH = Path(__file__).resolve().parent.parent / "data" / "admin_config.json"
 _LOCK = threading.Lock()
+_ALLOWED_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
 
 
 def _read() -> Dict[str, Any]:
@@ -28,16 +29,17 @@ def _read() -> Dict[str, Any]:
 
 
 def get_model_override(model_key: str) -> str:
-    """해당 model_key 의 전역 모델 오버라이드(OpenRouter 모델명). 없으면 ''."""
-    return str((_read().get("model_overrides") or {}).get(model_key) or "").strip()
+    """해당 역할의 공식 DeepSeek 모델 오버라이드. 허용되지 않은 과거 값은 무시한다."""
+    value = str((_read().get("model_overrides") or {}).get(model_key) or "").strip()
+    return value if value in _ALLOWED_MODELS else ""
 
 
 def resolve_model(model_key: str, default: str = "") -> str:
     """이 model_key 의 실제 사용 모델 — ADMIN 오버라이드 우선, 없으면 config 기본값, 그것도 없으면 default.
-    사장 지시 2026-05-30: 매크로 리서치(deep_research)·뉴스 분류기(llm_classify_articles)는
-    BaseAgent 가 아니라 tool 함수라 그동안 config.MODEL_ASSIGNMENTS 만 읽어 ADMIN 모델 오버라이드를
-    '무시'했다(사장이 모델을 바꿔도 재시작 후 늘 config 기본값으로 보임). BaseAgent(base_agent.py)와
-    동일한 우선순위를 이 헬퍼로 통일해 두 tool 에도 오버라이드가 먹히게 한다."""
+    사장 지시 2026-05-30: 매크로 리서치(deep_research)는 BaseAgent 가 아니라 tool 함수라 그동안
+    config.MODEL_ASSIGNMENTS 만 읽어 ADMIN 모델 오버라이드를 '무시'했다(사장이 모델을 바꿔도 재시작 후 늘
+    config 기본값으로 보임). BaseAgent(base_agent.py)와 동일한 우선순위를 이 헬퍼로 통일한다.
+    (사장 지시 2026-06-04: 뉴스 분류기 폐지 — 단일 뉴스 풀로 전환.)"""
     ov = get_model_override(model_key)
     if ov:
         return ov
@@ -70,8 +72,10 @@ def set_config(*, model_overrides: Optional[Dict[str, str]] = None,
     with _LOCK:
         d = _read()
         if model_overrides is not None:
-            d["model_overrides"] = {str(k): str(v).strip()
-                                    for k, v in model_overrides.items() if str(v).strip()}
+            d["model_overrides"] = {
+                str(k): str(v).strip() for k, v in model_overrides.items()
+                if str(v).strip() in _ALLOWED_MODELS
+            }
         if news_crawl_interval_sec is not None:
             try:
                 d["news_crawl_interval_sec"] = max(0, int(news_crawl_interval_sec))

@@ -1,11 +1,10 @@
 """
 NPS Swarm v1.0 - Base Agent
-OpenRouter-powered agent base class with dynamic model allocation.
+DeepSeek-powered agent base class with dynamic model allocation.
 """
 import json
 import logging
 import time
-import aiohttp
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
@@ -15,17 +14,12 @@ from infra.error_log import record_error  # 사장 지시 2026-05-19 — 상세 
 logger = logging.getLogger("AGENT")
 KST = timezone(timedelta(hours=9))
 
-# 사장 피드백 2026-05-15: API 비용 추적 — OpenRouter usage 필드를 모델별 단가에 곱해 추정.
-# 단가는 대략적인 OpenRouter 공시가 (input/output USD per 1M tokens). 정확도는 ±20% 수준.
-_MODEL_PRICING = {  # (input $/M, output $/M)
-    "moonshotai/kimi-k2.6":          (0.73, 3.49),
-    "deepseek/deepseek-v4-flash":    (0.10, 0.30),
-    "deepseek/deepseek-v4-pro":      (0.50, 1.50),
-    "xiaomi/mimo-v2.5-pro":          (0.40, 1.20),
-    "openrouter/free":                (0.00, 0.00),
-    "openrouter/pareto-code":         (0.40, 1.20),
+# DeepSeek 공식 가격표 기준 cache-miss 입력/출력 USD per 1M tokens.
+_MODEL_PRICING = {
+    "deepseek-v4-flash": (0.14, 0.28),
+    "deepseek-v4-pro": (0.435, 0.87),
 }
-_DEFAULT_PRICING = (0.50, 1.50)  # 모르는 모델은 보수적으로 deepseek-pro 단가로 추정
+_DEFAULT_PRICING = (0.435, 0.87)
 
 _API_CALL_LOG: List[Dict] = []   # {ts, model, prompt_tokens, completion_tokens, cost_usd, agent}
 _API_LOG_CAP = 500
@@ -110,7 +104,7 @@ def _bump_rollup(cost_usd: float, ts: float) -> None:
 
 def _record_api_call(model: str, agent: str, prompt_tokens: int, completion_tokens: int,
                      ts: Optional[float] = None, uid: Optional[int] = None) -> float:
-    """OpenRouter usage → 모델 단가로 비용 추정 → 회전식 로그 + 영속 롤업에 적재. 비용(USD) 반환."""
+    """DeepSeek usage → 모델 단가로 비용 추정 → 회전식 로그 + 영속 롤업에 적재."""
     ts = ts if ts is not None else time.time()
     in_rate, out_rate = _MODEL_PRICING.get(model, _DEFAULT_PRICING)
     cost = (prompt_tokens / 1_000_000.0) * in_rate + (completion_tokens / 1_000_000.0) * out_rate
@@ -143,7 +137,7 @@ def cost_summary() -> Dict[str, Any]:
 
 class BaseAgent:
     """
-    Base agent class that communicates via OpenRouter API.
+    Base agent class that communicates via the official DeepSeek API.
     Each agent has a persona, system prompt, assigned LLM model, and tool set.
     """
 
@@ -156,8 +150,8 @@ class BaseAgent:
         tools: Optional[List[Dict[str, Any]]] = None,
         injection: Optional[Dict[str, Any]] = None,
     ):
-        from config import (MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS, ENABLE_PROMPT_CACHE,
-                            AGENT_HISTORY_TURNS, OPENROUTER_API_KEY, OPENROUTER_BASE_URL)
+        from config import (MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS,
+                            AGENT_HISTORY_TURNS, DEEPSEEK_API_KEY)
         self.name = name
         self.role = role
         self.system_prompt = system_prompt
@@ -171,18 +165,14 @@ class BaseAgent:
                 _ov = admin_config.get_model_override(model_key)
             except Exception:
                 _ov = ""
-        self.model = _ov or MODEL_ASSIGNMENTS.get(model_key, "deepseek/deepseek-v4-flash")
-        # Credentials: injected per-uid OpenRouter key, else config global (legacy/no-uid).
-        self.api_key = inj.get("openrouter_key") or OPENROUTER_API_KEY
-        self.base_url = inj.get("openrouter_base_url") or OPENROUTER_BASE_URL
+        self.model = _ov or MODEL_ASSIGNMENTS.get(model_key, "deepseek-v4-flash")
+        self.api_key = inj.get("deepseek_api_key") or DEEPSEEK_API_KEY
         self.tools = tools or []
         self.conversation_history: List[Dict[str, str]] = []
         self._tool_functions: Dict[str, Callable] = {}
         # ── Cost-reduction knobs ──────────────────────────────────────────
         self.max_tokens = AGENT_MAX_TOKENS.get(model_key, AGENT_MAX_TOKENS.get(role, 2048))
         self.history_turns = AGENT_HISTORY_TURNS
-        # Anthropic prompt caching (cache_control) only applies to Anthropic-routed models
-        self.use_prompt_cache = bool(ENABLE_PROMPT_CACHE) and self.model.startswith("anthropic/")
 
     def register_tool_function(self, name: str, func: Callable):
         """Register a callable function that can be invoked as a tool."""
@@ -199,14 +189,7 @@ class BaseAgent:
         Returns:
             Agent's response text
         """
-        # System prompt — mark as a cache breakpoint for Anthropic prompt caching.
-        # (For non-Anthropic models we keep the plain-string form to avoid surprises.)
-        if self.use_prompt_cache:
-            messages = [{"role": "system", "content": [
-                {"type": "text", "text": self.system_prompt, "cache_control": {"type": "ephemeral"}}
-            ]}]
-        else:
-            messages = [{"role": "system", "content": self.system_prompt}]
+        messages = [{"role": "system", "content": self.system_prompt}]
 
         # Add trailing conversation history only (was: last 10 messages → now last N, default 3)
         for h in self.conversation_history[-self.history_turns:]:
@@ -219,40 +202,13 @@ class BaseAgent:
         messages.append({"role": "user", "content": user_content})
 
         try:
-            async with aiohttp.ClientSession() as session:
-                payload = {
-                    "model": self.model,
-                    "messages": messages,
-                    "max_tokens": self.max_tokens,
-                    "temperature": 0.3,
-                }
+            from infra.deepseek_client import chat_completion
+            data = await chat_completion(
+                api_key=self.api_key, model=self.model, messages=messages,
+                max_tokens=self.max_tokens, temperature=0.3, timeout_sec=300,
+            )
 
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://arquant.ai-ve.uk",
-                    "X-Title": f"NPS-Swarm-{self.name}",
-                }
-
-                async with session.post(
-                    f"{self.base_url}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                    # 2026-05-19: reasoning 모델(kimi-k2.6 등)은 대형 max_tokens에서
-                    # 응답에 분 단위가 걸린다 — 120s론 timeout. ceiling이므로 빠른
-                    # 비-reasoning 에이전트엔 영향 없음(즉시 반환).
-                    timeout=aiohttp.ClientTimeout(total=300),
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        record_error(self.name, context=(
-                            f"OpenRouter HTTP {resp.status} | model={self.model} | "
-                            f"resp={error_text[:600]}"), uid=self.uid)
-                        return f"[{self.name} 에러] API 호출 실패: {resp.status}"
-
-                    data = await resp.json()
-
-            # 사장 피드백 2026-05-15: 가끔 OpenRouter가 빈 JSON/None을 돌려줘서 'NoneType has no attribute get' 예외 발생.
+            # 공급자가 빈 JSON/None을 반환해도 명시적 오류로 변환한다.
             # 방어 코드로 비정상 응답을 빈 reply + 명시적 에러 메시지로 변환.
             if not data or not isinstance(data, dict):
                 logger.error(f"[{self.name}] 비정상 응답 (빈 JSON 또는 dict 아님): {str(data)[:200]}")
@@ -278,27 +234,18 @@ class BaseAgent:
                 # 큰' 진짜 상향이 되도록 (8000이면 base 12000보다 작아 무의미했음).
                 _retry_max = min(max(self.max_tokens * 2, 4000), 16000)
                 try:
-                    async with aiohttp.ClientSession() as _s2:
-                        async with _s2.post(
-                            f"{self.base_url}/chat/completions",
-                            json={**payload, "max_tokens": _retry_max},
-                            headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=300),
-                        ) as _r2:
-                            if _r2.status == 200:
-                                _d2 = await _r2.json()
-                                _c2 = _d2.get("choices") or []
-                                if _c2:
-                                    _r2c = (_c2[0] or {}).get("message", {}).get("content", "") or ""
-                                    if _r2c.strip():
-                                        reply = _r2c
-                                        data = _d2  # 비용/사용량도 재시도분으로 갱신
-                                        logger.info(f"[{self.name}] 빈응답 재시도 성공 "
-                                                    f"({len(reply)} chars, max_tokens={_retry_max})")
-                            else:
-                                record_error(self.name, context=(
-                                    f"빈응답 재시도 실패 HTTP {_r2.status} | model={self.model} | "
-                                    f"max_tokens={_retry_max}"), uid=self.uid)
+                    _d2 = await chat_completion(
+                        api_key=self.api_key, model=self.model, messages=messages,
+                        max_tokens=_retry_max, temperature=0.3, timeout_sec=300,
+                    )
+                    _c2 = _d2.get("choices") or []
+                    if _c2:
+                        _r2c = (_c2[0] or {}).get("message", {}).get("content", "") or ""
+                        if _r2c.strip():
+                            reply = _r2c
+                            data = _d2
+                            logger.info(f"[{self.name}] 빈응답 재시도 성공 "
+                                        f"({len(reply)} chars, max_tokens={_retry_max})")
                 except Exception as _re:
                     record_error(self.name, _re, context=(
                         f"빈응답 재시도 예외 | model={self.model} | max_tokens={_retry_max}"), uid=self.uid)

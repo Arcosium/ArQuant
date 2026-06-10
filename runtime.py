@@ -1,16 +1,15 @@
 """
 Arquant v1.0 — runtime strategy state.
 A "strategy" = the set of tunable trading parameters (sizing, TP/SL, risk gates, news threshold...).
-The active preset is chosen in the dashboard '전략' tab; this module persists the choice and
-serves live overrides so the engine picks them up without a restart.
+사장 지시 2026-06-09: 프리셋 폐지 → config.STRATEGY_DEFAULTS 단일 기본값 위에 사장이
+대시보드 '전략' 탭에서 직접 편집한 값(custom)을 프로필별로 영속·라이브 반영한다.
 
   runtime.get("PER_ORDER_BUDGET_RATIO")   # override-or-config-default
-  runtime.active()                         # {name, label, params, since}
-  runtime.set_strategy("aggressive")       # apply a preset, persist, append to history
-  runtime.set_strategy("custom", custom={...})  # ad-hoc params
-  runtime.list_presets() / runtime.history()
+  runtime.active()                         # {name, label('사용자 설정'), params, since}
+  runtime.set_strategy(custom={...})       # apply ad-hoc params, persist, append to history
+  runtime.history()
 """
-import json, time, re
+import json, time
 from datetime import datetime
 from pathlib import Path
 import config
@@ -19,7 +18,6 @@ _DIR = Path(__file__).parent / "data"
 _DIR.mkdir(exist_ok=True)
 _STATE = _DIR / "strategy_state.json"
 _HIST = _DIR / "strategy_history.json"
-_USER_PRESETS = _DIR / "user_presets.json"  # 사장 지시 2026-05-14: 사용자 정의 프리셋 영구 저장
 _OPS_FLAG = _DIR / "ops_feedback.json"      # 사장 피드백 2026-05-18: 운용지원실장 피드백 on/off 토글
 
 # ── 전략 상태 — 프로필(계정)별 (Task 10: 멀티테넌트 마무리) ──────────────────────
@@ -30,8 +28,8 @@ _OPS_FLAG = _DIR / "ops_feedback.json"      # 사장 피드백 2026-05-18: 운�
 # 저장 형식: {"_default": {name,params,since}, "<uid>": {name,params,since}}.
 # 구버전 flat 포맷({name,params,since})은 로드 시 _default 로 자동 이관(하위호환).
 def _default_state() -> dict:
-    return {"name": config.DEFAULT_STRATEGY,
-            "params": dict(config.STRATEGY_PRESETS[config.DEFAULT_STRATEGY]),
+    return {"name": "default",
+            "params": dict(config.STRATEGY_DEFAULTS),
             "since": datetime.now().isoformat()}
 
 
@@ -51,18 +49,6 @@ def _get_state(uid=None) -> dict:
 # Task 10: 전역 인메모리 레이어를 폐지하고 get(key, uid) 가 디스크
 # (infra.profile_overrides.load(uid) = data/profiles/<uid>/overrides.json)를 직접 참조한다.
 # uid=None 이면 프로필 오버라이드 미적용(시스템 기본).
-
-
-def set_profile_overrides(d: dict | None):
-    """(LEGACY no-op) 과거 전역 오버라이드 레이어 교체용. Task 10 에서 프로필 오버라이드는
-    get(key, uid) 가 디스크에서 uid 별로 직접 읽으므로 전역 레이어는 폐지됐다.
-    하위호환을 위한 thin shim — 아무 동작도 하지 않는다."""
-    return None
-
-
-def profile_overrides() -> dict:
-    """(LEGACY) 전역 오버라이드 레이어는 폐지됨 — 항상 빈 dict."""
-    return {}
 
 
 # ── 운용지원실장 피드백 on/off — 프로필(계정)별 (사장 지시 2026-05-20) ───────────
@@ -295,107 +281,12 @@ def get(key, default=None, uid=None):
     return getattr(config, key, default)
 
 
-def _load_user_presets() -> dict:
-    """Load {name: {label, params}} from data/user_presets.json. Returns {} if missing."""
-    if not _USER_PRESETS.exists():
-        return {}
-    try:
-        d = json.loads(_USER_PRESETS.read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-
-def _save_user_presets(presets: dict):
-    try:
-        _USER_PRESETS.write_text(json.dumps(presets, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _preset_label(name):
-    pr = config.STRATEGY_PRESETS.get(name)
-    if pr: return pr.get("label", name)
-    up = _load_user_presets().get(name)
-    if up: return up.get("label", name)
-    return "사용자 지정" if name == "custom" else name
-
-
 def active(uid=None) -> dict:
-    """그 uid 의 활성 전략(이름·라벨·since + 효과적 params). uid=None → _default."""
+    """그 uid 의 활성 전략(라벨·since + 효과적 params). 프리셋 폐지 → 항상 '사용자 설정'."""
     st = _get_state(uid)
     keys = config.STRATEGY_TUNABLE_KEYS
-    return {"name": st["name"], "label": _preset_label(st["name"]),
+    return {"name": st.get("name", "default"), "label": "사용자 설정",
             "since": st.get("since"), "params": {k: get(k, uid=uid) for k in keys}}
-
-
-def list_presets(uid=None) -> list:
-    """Built-in presets first, then user-saved presets (사장 지시 2026-05-14).
-    Each row carries `source` ∈ {'builtin','user'} so the UI can show a delete button for user ones.
-    `active` 플래그는 그 uid 의 활성 전략 기준(uid=None → _default)."""
-    cur_name = _get_state(uid)["name"]
-    keys = config.STRATEGY_TUNABLE_KEYS
-    out = []
-    for name, pr in config.STRATEGY_PRESETS.items():
-        out.append({"name": name, "label": pr.get("label", name), "source": "builtin",
-                    "params": {k: pr.get(k, getattr(config, k, None)) for k in keys},
-                    "active": name == cur_name})
-    for name, pr in _load_user_presets().items():
-        # user names cannot collide with builtins — skip if they somehow do (builtin wins)
-        if name in config.STRATEGY_PRESETS:
-            continue
-        params = pr.get("params") or {}
-        out.append({"name": name, "label": pr.get("label", name), "source": "user",
-                    "params": {k: params.get(k, getattr(config, k, None)) for k in keys},
-                    "active": name == cur_name})
-    return out
-
-
-_NAME_RE = re.compile(r"^[A-Za-z0-9_\-가-힣 ]{1,40}$")
-
-
-def save_user_preset(name: str, label: str, params: dict, by: str = "dashboard") -> dict:
-    """Persist a user-defined preset. Rejects names that would shadow built-ins or contain weird chars.
-    Returns {ok, message, presets}. (사장 지시 2026-05-14)"""
-    name = (name or "").strip()
-    label = (label or name or "").strip()
-    if not name or not _NAME_RE.match(name):
-        return {"ok": False, "message": f"이름 형식 오류: 한글/영문/숫자/하이픈 1~40자 이내 ({name!r})"}
-    if name in config.STRATEGY_PRESETS:
-        return {"ok": False, "message": f"빌트인 프리셋 이름은 사용 불가: {name}"}
-    if name == "custom":
-        return {"ok": False, "message": "'custom'은 예약된 이름입니다"}
-    # filter to known keys only
-    keys = set(config.STRATEGY_TUNABLE_KEYS)
-    clean_params = {k: v for k, v in (params or {}).items() if k in keys}
-    presets = _load_user_presets()
-    presets[name] = {"label": label or name, "params": clean_params,
-                     "created_at": datetime.now().isoformat(),
-                     "updated_at": datetime.now().isoformat(),
-                     "created_by": by}
-    _save_user_presets(presets)
-    _append_history({"name": name, "label": label, "params": clean_params, "by": f"{by}:save_preset"})
-    return {"ok": True, "message": f"사용자 프리셋 '{name}' 저장 완료", "presets": list_presets()}
-
-
-def delete_user_preset(name: str) -> dict:
-    """Delete a user preset. Built-in presets cannot be deleted. (사장 지시 2026-05-14)"""
-    name = (name or "").strip()
-    if name in config.STRATEGY_PRESETS:
-        return {"ok": False, "message": f"빌트인 프리셋은 삭제할 수 없습니다: {name}"}
-    presets = _load_user_presets()
-    if name not in presets:
-        return {"ok": False, "message": f"존재하지 않는 사용자 프리셋: {name}"}
-    removed = presets.pop(name)
-    _save_user_presets(presets)
-    _append_history({"name": name, "by": "dashboard:delete_preset", "removed": removed.get("label", name)})
-    # 사용자 프리셋은 전역 공유 정의다. 삭제 시, 이 프리셋을 활성으로 쓰던 모든 프로필을
-    # DEFAULT_STRATEGY 로 폴백시킨다(전역 단일 _state 시절엔 한 개였으나 이제 uid 별).
-    for k, st in list(_states.items()):
-        if isinstance(st, dict) and st.get("name") == name:
-            _uid = None if k == "_default" else int(k)
-            set_strategy(config.DEFAULT_STRATEGY, by="auto_fallback_after_delete", uid=_uid)
-    return {"ok": True, "message": f"사용자 프리셋 '{name}' 삭제됨", "presets": list_presets()}
 
 
 def history() -> list:
@@ -408,31 +299,22 @@ def history() -> list:
     return []
 
 
-def set_strategy(name: str, custom: dict = None, by: str = "user", uid=None) -> dict:
-    """Activate a preset by name OR apply custom params — 프로필(uid)별. uid=None → _default.
-    (사장 지시 2026-05-14: 사용자 프리셋도 인식)
-    Resolution order: builtin → user → 'custom' (use supplied params).
+def set_strategy(custom: dict = None, by: str = "user", uid=None) -> dict:
+    """현재 적용 전략 파라미터를 갱신 — 프로필(uid)별. uid=None → _default.
+    프리셋 폐지(2026-06-09): STRATEGY_DEFAULTS 베이스 위에 custom(알려진 키만)만 얇는다.
     """
-    keys = set(config.STRATEGY_TUNABLE_KEYS)
-    if name in config.STRATEGY_PRESETS:
-        params = {k: v for k, v in config.STRATEGY_PRESETS[name].items() if k in keys}
-        new_state = {"name": name, "params": params, "since": datetime.now().isoformat()}
-    elif name in _load_user_presets():
-        up = _load_user_presets()[name].get("params") or {}
-        new_state = {"name": name, "params": {k: up.get(k, getattr(config, k, None)) for k in keys},
-                     "since": datetime.now().isoformat()}
-    else:
-        # 'custom' or unknown → use supplied params (filtered to known keys), defaulting from balanced
-        base = dict(config.STRATEGY_PRESETS[config.DEFAULT_STRATEGY])
-        if custom:
-            for k, v in custom.items():
-                if k in keys:
-                    base[k] = v
-        new_state = {"name": "custom", "params": {k: base.get(k) for k in config.STRATEGY_TUNABLE_KEYS},
-                     "since": datetime.now().isoformat()}
+    keys = config.STRATEGY_TUNABLE_KEYS
+    base = dict(config.STRATEGY_DEFAULTS)
+    if custom:
+        known = set(keys)
+        for k, v in custom.items():
+            if k in known:
+                base[k] = v
+    new_state = {"name": "custom", "params": {k: base.get(k) for k in keys},
+                 "since": datetime.now().isoformat()}
     _states[_strat_key(uid)] = new_state
     _persist()
-    _append_history({"name": new_state["name"], "label": _preset_label(new_state["name"]),
+    _append_history({"name": "custom", "label": "사용자 설정",
                      "params": new_state["params"], "by": by,
                      "uid": (None if uid is None else int(uid))})
     return active(uid)

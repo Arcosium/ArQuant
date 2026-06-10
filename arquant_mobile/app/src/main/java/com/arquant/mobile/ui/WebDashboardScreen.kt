@@ -164,7 +164,7 @@ fun WebDashboardScreen(
                     domStorageEnabled = true          // localStorage — 웹 UI 상태 보존
                     databaseEnabled = true
                     cacheMode = WebSettings.LOAD_DEFAULT
-                    setSupportMultipleWindows(true)   // target=_blank (OpenRouter 링크)
+                    setSupportMultipleWindows(true)
                     javaScriptCanOpenWindowsAutomatically = true
                     mediaPlaybackRequiresUserGesture = false
                 }

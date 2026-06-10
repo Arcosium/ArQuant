@@ -168,7 +168,7 @@ class AuthViewModel @Inject constructor(
         return when {
             "401" in m -> "아이디 또는 비밀번호가 일치하지 않습니다."
             "409" in m -> "이미 사용 중인 아이디입니다."
-            "400" in m -> "검증 실패 — 아이디/비밀번호 정책 또는 KIS·OpenRouter 키를 확인하세요."
+            "400" in m -> "검증 실패 — 아이디/비밀번호 정책 또는 KIS·DeepSeek 키를 확인하세요."
             else -> m
         }
     }

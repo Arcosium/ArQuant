@@ -7,10 +7,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
-load_dotenv(BASE_DIR / ".env")
+# 공용 환경을 먼저 읽고, ArQuant 전용 비밀값은 저장소의 git-ignored .env로 덮어쓴다.
+load_dotenv("/home/opc/projects/.env")
+load_dotenv(BASE_DIR / ".env", override=True)
 
 # ─── API Keys ───────────────────────────────────────────────────────────────
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 KIS_APP_KEY = os.getenv("KIS_APP_KEY", "")
 KIS_APP_SECRET = os.getenv("KIS_APP_SECRET", "")
 KIS_BASE_URL = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
@@ -26,27 +28,38 @@ CORESIGHT_CHROMA_PATH = os.getenv("CORESIGHT_CHROMA_PATH", "/home/opc/ArcAI.ve/c
 LEGACY_AUTOTRADING_PATH = Path("/home/opc/projects/매매자동화")
 LEGACY_KRX_SIMULATOR_PATH = Path("/home/opc/projects/KRX Quant Simulator")
 
-# ─── OpenRouter Model Assignments (by agent role) ───────────────────────────
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# ─── Official DeepSeek model assignments (by agent role) ───────────────────
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 MODEL_ASSIGNMENTS = {
-    "chief_orchestrator": "deepseek/deepseek-v4-pro",   # 사장 지시 2026-05-19 — Kimi가 length-truncate/타임아웃으로 빈·degenerate 결정 빈발 → 안정적 deepseek-v4-pro로 교체
-    "macro_analyst": "deepseek/deepseek-v4-flash",
-    "quant_analyst": "deepseek/deepseek-v4-flash",          # 다양한 계량기법 — 무료 모델은 출력 망가짐 → flash로 상향
-    "news_analyst": "deepseek/deepseek-v4-flash",           # 종목명 환각 방지 — flash로 상향
-    "news_curator": "deepseek/deepseek-v4-flash",           # 헤드라인이 40개 초과 시 굵직한 40건 선별
-    # 사장 지시 2026-06-01 (3회 반복): 뉴스 분류·매크로 리서치 기본 모델을 nousresearch/hermes-4-70b 로 고정.
-    # tongyi-deepresearch 가 뉴스 분석을 이상하게 만들어 명시적으로 교체. ★기본값 자체를 hermes 로 둬서,
-    # admin 패널 '전역 설정 저장'으로 model_overrides 가 비워져도(과거 회귀 원인) 절대 tongyi 로 폴백 안 함.
-    # (회귀 방지: tests/test_model_default_hermes.py)
-    "news_classifier":   "nousresearch/hermes-4-70b",
-    "macro_researcher":  "nousresearch/hermes-4-70b",
-    "trader": "deepseek/deepseek-v4-flash",  # 사장 피드백 2026-05-15 (3차) — free 모델 말투 어색 → flash로 격상. 자연어 보고 품질 향상
-    "risk_guard": "openrouter/free",                     # DART 공시 기반 재심 (룰 게이트는 파이썬, 파싱 실패 시 fail-open)
+    # 결정 핵심경로는 pro(추론품질 우위). 2026-06-10 '주식운용실장 정체' 의심은 오진이었다 —
+    # 매수후보 0·매도할 주식보유 0 사이클에서 PASS2·post_manager가 정상 SKIP된 뒤 '다음 정시 대기
+    # (유휴)'를 정체로 오독한 것(ops 워커가 사이클 완료 직후 spawn된 게 완료 증거). → pro 유지.
+    # pro 동시성(500) hold 리스크는 deepseek_client 백오프 재시도로 방어한다.
+    "chief_orchestrator": "deepseek-v4-pro",
+    "macro_analyst": "deepseek-v4-flash",
+    "quant_analyst": "deepseek-v4-flash",
+    "news_analyst": "deepseek-v4-flash",
+    "news_curator": "deepseek-v4-flash",
+    # 매크로 리서치만 Hermes Agent의 web 도구를 통해 이 모델을 호출한다.
+    # ⚠ web 도구(web_search/web_extract)는 tool-calling 지원 모델이어야 한다. deepseek-v4-pro
+    #   (reasoning)는 공식 API에서 function-calling 미지원이라 도구가 안 붙어 빈 리서치+180s 정체가
+    #   났다(2026-06-10 라이브 확인). flash 는 web_search 정상 동작 → 리서치는 flash 고정.
+    "macro_researcher": "deepseek-v4-flash",
+    "trader": "deepseek-v4-flash",
+    "risk_guard": "deepseek-v4-flash",
     # policy_filter 폐지(사장 피드백 2026-05-18) — 역할 risk_guard 통합
-    "post_manager": "deepseek/deepseek-v4-pro",     # 사장 지시 2026-05-24 — 매도 타이밍 결정자, kimi-k2.6에서 deepseek-v4-pro로 교체(안정성). ADMIN 오버라이드가 비더라도 이 기본값으로 적용
-    "ops_support": "deepseek/deepseek-v4-pro",  # 사장 피드백 2026-05-15 — DeepSeek V4 Pro로 변경 (운용지원실장은 분류·조정만; 실제 코딩은 산하 팀장 워커가 수행)
-    "fund_planner": "deepseek/deepseek-v4-flash",   # 사장 지시 2026-05-28 — 매수 직후 thesis 4줄(목표가/손절가/계획 보유/사유) 구조적 출력. flash로 충분.
+    # 사장 원칙 2026-06-10: '주관이 들어가서 결정을 내리는' 에이전트는 pro(추론품질).
+    #   → post_manager(매도결정)·ops_support(파라미터 튜닝결정)·bond_manager·commodity_manager
+    #     (슬리브 ETF 매수/매도 결정) = pro. (chief_orchestrator 매수결정도 pro.)
+    #   ⚠ 예외: macro_researcher 는 결정성이지만 Hermes web 도구(tool-calling)를 써야 해 flash 필수
+    #     (pro=reasoning은 공식 API function-calling 미지원 → 도구 미장착·180s 정체). fund_planner
+    #     (thesis 자문, veto 폐지)는 자문성이라 일단 flash — 사장이 '결정'으로 보면 pro 승격.
+    "post_manager": "deepseek-v4-pro",
+    "ops_support": "deepseek-v4-pro",
+    "fund_planner": "deepseek-v4-flash",
+    "bond_manager": "deepseek-v4-pro",
+    "commodity_manager": "deepseek-v4-pro",
 }
 
 # ─── Risk Management Constants ──────────────────────────────────────────────
@@ -66,7 +79,6 @@ AGENT_MAX_TOKENS = {
     "quant_analyst":      8000,   # 5500으로도 5개 섹션 + 점수/진입가 줄이 잘리는 사례 발생 → 8000으로 재상향
     "news_analyst":       2600,   # 6개 후보 + 보유 종목 감성 분석
     "news_curator":        600,   # 큐레이터는 번호 목록만 → 작게
-    "news_classifier":   12000,   # 사장 피드백 2026-05-15 (8차) — alibaba는 reasoning 모델 → 내부 사고 토큰 + JSON 응답 모두 수용
     "macro_researcher":   8000,   # 매크로 리서치 — 시황·심리·정책 합성 응답
     "trader":             1500,   # 사장 피드백 (3차) — 자연어 보고용. 체결 결과 요약 + 매매 이유 정리
     "risk_guard":         2200,   # DART 공시 읽고 종목별 재심 + 사유
@@ -74,8 +86,10 @@ AGENT_MAX_TOKENS = {
     "post_manager":      12000,   # deepseek-v4-pro(2026-05-24 교체) — chief_orchestrator와 동일 모델·동일 토큰 한도
     "ops_support":        8000,   # 코드 변경 JSON + 근거 설명 (사장 지시 2026-05-14 — 토큰 한도 상향)
     "fund_planner":       1200,   # 사장 지시 2026-05-28 — 4줄(목표가/손절가/계획 보유/사유) 정형 출력 + 한 단락 보강
+    "bond_manager":       2000,   # 사장 지시 2026-06-08 — 채권운용실장. 종목별 금리뷰 줄글 + 채권결정 한 줄
+    "commodity_manager":  2000,   # 사장 지시 2026-06-09 — 원자재운용실장. 종목별 실물자산 매크로뷰 + 원자재결정 한 줄
 }
-ENABLE_PROMPT_CACHE = True            # Anthropic prompt caching via OpenRouter cache_control
+ENABLE_PROMPT_CACHE = False
 AGENT_HISTORY_TURNS = 3               # trailing history messages to resend (was 10)
 
 # Macro/DART recompute throttling (slow-moving inputs — don't regenerate every cycle)
@@ -88,7 +102,7 @@ DART_CACHE_TTL_SEC  = 24 * 60 * 60    # 1 day
 PERIODIC_CYCLE_SEC      = 1 * 60 * 60 # run a cycle this often while a market is open (1시간마다 1회)
 HEADLINE_DEDUP_RATIO    = 0.85        # difflib ratio above which two headlines are "the same"
 NEWS_PREFILTER_TRIGGER  = 40          # 누적 헤드라인이 이 수를 넘으면 큐레이터로 사전 선별
-NEWS_PREFILTER_LIMIT    = 40          # 사전 선별 후 뉴스분석팀장에게 넘길 최대 헤드라인 수
+NEWS_PREFILTER_LIMIT    = 40          # 사전 선별 후 마켓센티먼트팀장에게 넘길 최대 헤드라인 수
 MATERIAL_NEWS_KEYWORDS = [
     "실적", "어닝", "영업이익", "순이익", "적자", "흑자전환", "가이던스",
     "M&A", "인수", "합병", "분할", "지분", "최대주주", "경영권",
@@ -120,14 +134,75 @@ TRIM_OVER_RATIO       = True          # if a holding's notional exceeds CONSERVA
 ALLOW_DAY_TRADING     = True
 # 0.5일 미만 회피가 켜졌을 때(ALLOW_DAY_TRADING=False) 적용되는 최소 보유일.
 MIN_HOLDING_DAYS_FOR_SELL = 0.5
-# 사장 지시 2026-05-29: 펀드기획실장 거부권 — 진입 thesis(목표·손절·계획 보유기간) 대비
-# 계획기간 미경과 + 손익이 ±노이즈밴드 이내 + 손절·목표 미해당인 매도결정을 '보유'로 결정론적 보류
-# (무계획 단타 차단). 손절터치·목표도달·계획기간경과·진짜손실(밴드 밖) 매도는 비차단.
-# 사장 지시 2026-06-04: 소폭'손실'까지 밴드로 확대 + ALLOW_DAY_TRADING 무관하게 발동(이 플래그로만 on/off).
-THESIS_VETO_ENABLED   = True
-# 노이즈밴드 폭(±%). 진입가 대비 이 폭 이내의 미세 손익은 '계획이 펼쳐지기 전 noise'로 보고 매도 보류.
-# 진짜 손실(이 폭 밖, 예: -7% 손절)은 통과. 기본 3% — 오늘 churn(-1.5%/-0.6%)이 정확히 이 안에 들어온다.
-THESIS_NOISE_BAND_PCT = 0.03
+# 사장 지시 2026-06-08: 포트폴리오기획팀장 '거부권'(사후관리실장 매도결정을 '보유'로 강제 오버라이드)은
+# 권한이 과도하여 폐지했다. 이제 thesis 는 사후관리실장 프롬프트에 '강력 권고'로 주입만 하며
+# (agents.specialists.format_thesis_reminder), 최종 매도 권한은 사후관리실장에게 있다.
+# 이에 따라 THESIS_VETO_ENABLED / THESIS_NOISE_BAND_PCT 설정은 제거되었다.
+
+# ─── 넥스트레이드(NXT) 시간외 매매 (사장 지시 2026-06-08) ─────────────────────
+# 프리마켓(08:00–08:50)·애프터마켓(15:50–20:00)을 NXT 거래소 경유로 매매. 정규장은 KRX 유지.
+ENABLE_NXT_EXTENDED_HOURS    = True   # 마스터 스위치 (끄면 시간외 세션을 OFF_HOURS처럼 취급)
+ENABLE_NXT_PRE_MARKET        = True   # 프리마켓 08:00–08:50 on/off
+ENABLE_NXT_AFTER_MARKET      = True   # 애프터마켓 15:50–20:00 on/off
+EXT_HOURS_LIMIT_SLIPPAGE_PCT = 0.5   # 시간외 지정가 밴드(%) — 매수=현재가×(1+x%), 매도=×(1−x%)
+
+# ─── 자산슬리브: 채권 ETF + 원자재 ETF 자동매매 ───────────────────────────────
+# 매크로 자산배분 권고('채권 X%' / '원자재 W%')를 채권운용실장·원자재운용실장이 ETF 매수/
+# 매도로 실현(주식 퀀트 파이프라인 우회 독립 트랙). 엔진은 infra/asset_sleeves.py 가 SleeveSpec
+# 하나로 일반화한다. 풀 태그 = (code, name, duration, kind, fx):
+#   duration ∈ {short, mid, long, na}  | kind ∈ {govt, rate, credit, tips, gold, oil, agri, broad}
+#   fx ∈ {krw(원화자산), hedged(환헤지 (H)), exposed(환노출 USD)}
+# 풀은 화이트리스트(LLM 티커 환각 방지) — 코드 오류=실주문 실패이므로 검증된 코드만 등재
+# (KR 코드는 2026-06-09 웹 검증: 한국거래소 상장 ETF).
+#
+# ── 채권 슬리브 (사장 지시 2026-06-08, 2026-06-09 자산군 확장) ──
+ENABLE_BOND_ETF         = True    # 마스터 스위치 (사장 지시 2026-06-09: 기본 ON)
+BOND_TARGET_MAX_PCT     = 0.40    # 채권 비중 절대 상한(매크로 권고가 넘어도 이 값으로 클램프)
+BOND_REBALANCE_BAND_PCT = 0.03    # 목표 대비 ±이 폭 이내면 매매 안 함(채권 churn 방지 데드존)
+BOND_PER_CYCLE_RATIO    = 0.15    # 채권 전용 사이클 매수 예산비율(총평가 대비). 주식 MAX_CYCLE_BUDGET_RATIO 와 분리.
+# 허용 채권 ETF 풀 — 국고채(govt)·CD금리(rate)·종합채권/회사채(credit)·환헤지 미국채(hedged).
+BOND_ETF_POOL_KR = [
+    ("153130", "KODEX 단기채권",                  "short", "govt",   "krw"),
+    ("114260", "KODEX 국고채3년",                 "mid",   "govt",   "krw"),
+    ("148070", "KOSEF 국고채10년",                "long",  "govt",   "krw"),
+    ("357870", "TIGER CD금리투자KIS(합성)",       "short", "rate",   "krw"),  # CD 91일 금리(파킹)
+    ("459580", "KODEX CD금리액티브(합성)",        "short", "rate",   "krw"),  # 보수 0.02%
+    ("273130", "KODEX 종합채권(AA-이상)액티브",   "mid",   "credit", "krw"),  # 국채+회사채 4천종
+    ("451540", "TIGER 종합채권(AA-이상)액티브",   "mid",   "credit", "krw"),
+    ("458250", "TIGER 미국채30년스트립액티브(합성H)", "long", "govt", "hedged"),  # 환헤지 장기 미국채
+]
+BOND_ETF_POOL_US = [
+    ("SHY", "iShares 1-3Y Treasury",  "short", "govt",   "exposed"),
+    ("IEF", "iShares 7-10Y Treasury", "mid",   "govt",   "exposed"),
+    ("TLT", "iShares 20+Y Treasury",  "long",  "govt",   "exposed"),
+    ("LQD", "iShares IG Corp Bond",   "mid",   "credit", "exposed"),  # 투자등급 회사채
+    ("HYG", "iShares High Yield Corp","mid",   "credit", "exposed"),  # 하이일드 회사채
+    ("TIP", "iShares TIPS",           "mid",   "tips",   "exposed"),  # 물가연동
+]
+
+# ── 원자재 슬리브 (사장 지시 2026-06-09: 신설, 기본 ON) ──
+# 실물자산(원유·금·농산물) ETF. 원자재는 듀레이션 개념 없음→na, kind 로 종류 구분.
+ENABLE_COMMODITY_ETF         = True   # 마스터 스위치 (사장 지시 2026-06-09: 기본 ON)
+COMMODITY_TARGET_MAX_PCT     = 0.20   # 원자재 비중 절대 상한
+COMMODITY_REBALANCE_BAND_PCT = 0.03   # 목표 대비 데드존
+COMMODITY_PER_CYCLE_RATIO    = 0.10   # 원자재 전용 사이클 매수 예산비율(총평가 대비)
+COMMODITY_ETF_POOL_KR = [
+    ("132030", "KODEX 골드선물(H)",          "na", "gold", "hedged"),
+    ("261220", "KODEX WTI원유선물(H)",       "na", "oil",  "hedged"),
+    ("137610", "TIGER 농산물선물Enhanced(H)","na", "agri", "hedged"),
+]
+COMMODITY_ETF_POOL_US = [
+    ("GLD", "SPDR Gold Shares",          "na", "gold",  "exposed"),
+    ("USO", "US Oil Fund",               "na", "oil",   "exposed"),
+    ("DBA", "Invesco Agriculture Fund",  "na", "agri",  "exposed"),
+    ("DBC", "Invesco Commodity Index",   "na", "broad", "exposed"),
+]
+
+# ─── ADMIN 단일 인텔리전스 공유 (사장 지시 2026-06-08) ─────────────────────────
+# hh09080(ADMIN)이 시장 전역 분석(뉴스 분류·매크로 리서치·매크로 분석)을 사이클마다 1회
+# 산출·게시하고, 비관리자 계정은 그 결과를 공유받아 같은 LLM 호출을 중복하지 않는다.
+SHARE_MARKET_INTELLIGENCE = True   # 마스터 토글. False면 전 계정이 현행대로 각자 계산
+SHARE_PRODUCER_WAIT_SEC   = 120    # 소비자가 ADMIN 게시를 기다리는 단계별 최대 초(초과 시 자체계산 폴백)
 
 # When no target is affordable with available cash, look for a cheaper liquid name in whatever
 # market is tradeable right now (KR session → KRX volume rank; US session → the shortlist below).
@@ -142,7 +217,8 @@ CHEAP_FALLBACK_US_TICKERS = ["F", "BAC", "T", "PFE", "KO", "CSCO", "INTC", "SOFI
 
 # Which instruments the autonomous engine may BUY. KR equities & ETFs are 6-digit codes (same path).
 # US needs USD cash; derivatives (선물/옵션) need margin/contract handling — off by default (high risk).
-ALLOW_US_STOCKS       = True
+# 사장 지시 2026-06-08: 미국장 기능은 기본 비활성 — 대시보드'전략'탭에서 체크할 때만 활성(체크=per-uid override).
+ALLOW_US_STOCKS       = False
 ALLOW_DERIVATIVES     = False         # KR/해외 선물·옵션 자동매매 (마진·만기·증거금 처리 필요 — 기본 비활성)
 # Position sizing — orders are sized to the *actual* account, not a fixed share count.
 MAX_ORDER_QTY        = 0              # tunable share-count ceiling per order; 0 = fall back to HARD_MAX_ORDER_QTY
@@ -171,6 +247,9 @@ MAX_PRICE_EXTENSION_PCT = 0.0         # 프롬프트: VWAP/이평 대비 이격(
 # (B) 퀀트 채점 가중치(QW_*) — 2026-06-04 결정론 점수 엔진 도입으로 **완전 폐기**. 더 세밀한 QIW_*(지표별)로 대체.
 # (C) 레짐 대응
 MACRO_STOCK_GATE_ENABLED = True       # 결정론: 매크로 권고 주식비중 ≤ 현재 주식비중이면 신규 매수평가 스킵
+
+# 운용지원실장 사이클 자동튜닝 최소 간격(초) — 사장 지시 2026-06-05: 매 사이클 spawn(낭비) → 시간당 1회.
+OPS_THROTTLE_SEC = 3600
 
 # ─── 결정론 점수 엔진 (사장 지시 2026-06-04: LLM 일관성 문제 → 점수는 무조건 파이썬) ───────
 # spec: docs/superpowers/specs/2026-06-04-deterministic-score-engine-design.md
@@ -228,13 +307,17 @@ def strategy_param_catalog_text():
             rng = f" {m['min']}~{m['max']}{m.get('unit','')}"
         eff = m.get("effect") or STRATEGY_KEY_EFFECT.get(k)
         eff_txt = f" 효과: {eff}" if eff else ""
-        lines.append(f"- {k} ({m.get('label','')}) [{m.get('type','')}{rng}]: {m.get('help','')}.{eff_txt}")
+        # 사장 지시 2026-06-09 #7: tier 표기 — 사이클 즉시 조정 가능 vs 토요일 백테스트 검증 후만.
+        _tier = m.get("tier", "cycle")
+        tier_txt = " 〔토요일 검증 후〕" if _tier == "weekly" else " 〔사이클 조정 가능〕"
+        lines.append(f"- {k} ({m.get('label','')}) [{m.get('type','')}{rng}]{tier_txt}: {m.get('help','')}.{eff_txt}")
     return "\n".join(lines)
 
 
-# ─── Strategy presets ───────────────────────────────────────────────────────
-# A "strategy" is the set of tunable trading parameters. The active preset is picked in the
-# dashboard '전략' tab; runtime.py persists the choice and serves live overrides to the engine.
+# ─── Strategy tunable parameters ─────────────────────────────────────────────
+# A "strategy" is the set of tunable trading parameters. 사장 지시 2026-06-09: 프리셋
+# (방어형~초공격형) 폐지 → 단일 STRATEGY_DEFAULTS(아래)가 기본값. 사장이 대시보드
+# '전략' 탭에서 값을 직접 편집하면 runtime.py 가 프로필별로 영속·라이브 반영한다.
 # Keys here MUST match module-level constant names above (runtime.get() falls back to those).
 STRATEGY_TUNABLE_KEYS = [
     "PER_ORDER_BUDGET_RATIO", "PER_ORDER_BUDGET_OVERSHOOT", "MAX_CYCLE_BUDGET_RATIO", "MIN_CASH_BUFFER",
@@ -253,9 +336,33 @@ STRATEGY_TUNABLE_KEYS = [
     # (C) 레짐 대응
     "MACRO_STOCK_GATE_ENABLED",
     "ENABLE_SELL_REBALANCE", "TAKE_PROFIT_PCT", "STOP_LOSS_PCT", "TRIM_OVER_RATIO",
-    "ALLOW_DAY_TRADING", "MIN_HOLDING_DAYS_FOR_SELL", "THESIS_VETO_ENABLED", "THESIS_NOISE_BAND_PCT",
+    "ALLOW_DAY_TRADING", "MIN_HOLDING_DAYS_FOR_SELL",
     "ENABLE_CHEAP_FALLBACK", "ALLOW_US_STOCKS", "ALLOW_DERIVATIVES",
+    # NXT 시간외 매매 (사장 지시 2026-06-08)
+    "ENABLE_NXT_EXTENDED_HOURS", "ENABLE_NXT_PRE_MARKET", "ENABLE_NXT_AFTER_MARKET",
+    "EXT_HOURS_LIMIT_SLIPPAGE_PCT",
+    # ADMIN 인텔리전스 공유 (사장 지시 2026-06-08)
+    "SHARE_MARKET_INTELLIGENCE", "SHARE_PRODUCER_WAIT_SEC",
+    # 채권 ETF 자동매매 (사장 지시 2026-06-08)
+    "ENABLE_BOND_ETF", "BOND_TARGET_MAX_PCT", "BOND_REBALANCE_BAND_PCT",
+    "BOND_PER_CYCLE_RATIO",
+    # 원자재 ETF 자동매매 (사장 지시 2026-06-09)
+    "ENABLE_COMMODITY_ETF", "COMMODITY_TARGET_MAX_PCT", "COMMODITY_REBALANCE_BAND_PCT",
+    "COMMODITY_PER_CYCLE_RATIO",
 ]
+
+# ─── 정책 플래그 봉인 (회사 운영 거버넌스, 사장 지시 2026-06-05) ────────────────
+# 운용지원실장(ops)은 전술 파라미터는 적극 튜닝하되, 아래 '정책/구조 플래그'는
+# 자율(cycle/weekly)로 변경할 수 없다 — 사장(대시보드 '전략' 탭 / 직접 지시)만 바꾼다.
+#   • ALLOW_US_STOCKS / ALLOW_DERIVATIVES : 자산군 정책 (ops 가 미국 매매를 꺼 실거래
+#     계정 매수가 막혔던 사고 2026-06-05 재발 방지)
+#   • ENABLE_CHEAP_FALLBACK : 사장 영구 OFF 정책 (저가 대체매수 금지)
+#   • DETERMINISTIC_SCORING : 채점 엔진 구조 토글 (LLM 롤백은 사장 결정 사항)
+# STRATEGY_TUNABLE_KEYS 에는 남겨 대시보드에서 사장이 직접 토글 가능하게 유지한다.
+OPS_PROTECTED_KEYS = {
+    "ALLOW_US_STOCKS", "ALLOW_DERIVATIVES",
+    "ENABLE_CHEAP_FALLBACK", "DETERMINISTIC_SCORING",
+}
 
 # ─── Strategy parameter metadata (사장 지시 2026-05-14: UI에 한국어 라벨로 표시) ────
 # type:
@@ -358,13 +465,53 @@ STRATEGY_KEY_META = {
     "MIN_HOLDING_DAYS_FOR_SELL":  {"label": "최소 보유일 (데이트레이딩 OFF일 때만)", "type": "pct_raw", "unit": "일",
                                    "help": "데이트레이딩 비허용 시 이 일수 미만 보유 종목은 매도 회피 (사후관리실장)",
                                    "min": 0, "max": 30, "step": 0.5, "group": "매도 규칙"},
-    "THESIS_VETO_ENABLED":        {"label": "펀드기획실장 거부권 (무계획 단타 차단)", "type": "bool",
-                                   "help": "진입 thesis 대비 계획기간 미경과 + 손익이 ±노이즈밴드 이내(소폭손실 포함) + 손절·목표 미해당 "
-                                           "매도결정을 '보유'로 보류. ALLOW_DAY_TRADING 무관(이 토글로만 on/off). 손절터치·목표도달·계획기간경과·진짜손실은 비차단",
-                                   "group": "매도 규칙"},
     "ENABLE_CHEAP_FALLBACK":      {"label": "최종 종목 매수 불가 시 저가 대체 종목 매수", "type": "bool",
                                    "help": "OFF 권장 — 후보 모두 예산 초과 시 거래량 상위 저가주를 대신 매수",
                                    "group": "기타"},
+    "ENABLE_NXT_EXTENDED_HOURS":  {"label": "넥스트레이드(NXT) 시간외 매매", "type": "bool",
+                                   "help": "ON이면 프리마켓(08:00–08:50)·애프터마켓(15:50–20:00)에 NXT 경유 매매",
+                                   "group": "시간외(NXT)"},
+    "ENABLE_NXT_PRE_MARKET":      {"label": "프리마켓(08:00–08:50) 매매", "type": "bool",
+                                   "help": "넥스트레이드 프리마켓 지정가 매매 (마스터 스위치 ON 전제)",
+                                   "group": "시간외(NXT)"},
+    "ENABLE_NXT_AFTER_MARKET":    {"label": "애프터마켓(15:50–20:00) 매매", "type": "bool",
+                                   "help": "넥스트레이드 애프터마켓 지정가 매매 (마스터 스위치 ON 전제)",
+                                   "group": "시간외(NXT)"},
+    "EXT_HOURS_LIMIT_SLIPPAGE_PCT": {"label": "시간외 지정가 밴드", "type": "pct_raw", "unit": "%",
+                                   "help": "시간외 지정가 = 현재가 ± 이 폭. 체결확률↑ vs 슬리피지 상한 트레이드오프",
+                                   "min": 0, "max": 5, "step": 0.1, "group": "시간외(NXT)"},
+    "SHARE_MARKET_INTELLIGENCE":  {"label": "시장 인텔리전스 공유(ADMIN 단일 생산)", "type": "bool",
+                                   "help": "ON이면 관리자 계정이 매크로·뉴스 분석을 1회 산출, 다른 계정은 공유받아 LLM 중복 비용 절감",
+                                   "group": "비용"},
+    "SHARE_PRODUCER_WAIT_SEC":    {"label": "공유 대기 타임아웃", "type": "int", "unit": "초",
+                                   "help": "공유받는 계정이 생산 계정의 게시를 기다리는 최대 초. 초과하면 자체 계산(생산자 부재 대응)",
+                                   "min": 10, "max": 600, "step": 10, "group": "비용"},
+    # 채권 ETF 자동매매 (사장 지시 2026-06-08)
+    "ENABLE_BOND_ETF":         {"label": "채권 ETF 자동매매(채권운용실장)", "type": "bool",
+                                "help": "켜면 매크로 채권 비중 권고를 채권 ETF 매수/매도로 실현. 끄면 채권 트랙 전체 스킵.",
+                                "group": "매도 규칙"},
+    "BOND_TARGET_MAX_PCT":     {"label": "채권 비중 상한", "type": "pct_raw", "unit": "%비율",
+                                "help": "채권 평가비중 절대 상한. 매크로 권고가 이를 넘어도 이 값으로 클램프(0.40=40%)",
+                                "min": 0.0, "max": 1.0, "step": 0.05, "group": "매도 규칙"},
+    "BOND_REBALANCE_BAND_PCT": {"label": "채권 리밸런싱 데드존", "type": "pct_raw", "unit": "%비율",
+                                "help": "목표 대비 ±이 폭 이내면 채권 매매 안 함(잦은 교체 방지). 0.03=±3%p",
+                                "min": 0.0, "max": 0.2, "step": 0.01, "group": "매도 규칙"},
+    "BOND_PER_CYCLE_RATIO":    {"label": "채권 사이클 예산비율", "type": "pct_raw", "unit": "%비율",
+                                "help": "채권 전용 사이클 매수 한도(총평가 대비). 0.15=총평가의 15%까지 한 사이클에 채권 매수",
+                                "min": 0.0, "max": 1.0, "step": 0.05, "group": "매도 규칙"},
+    # 원자재 ETF 자동매매 (사장 지시 2026-06-09)
+    "ENABLE_COMMODITY_ETF":    {"label": "원자재 ETF 자동매매(원자재운용실장)", "type": "bool",
+                                "help": "켜면 매크로 원자재 비중 권고를 원유·금·농산물 ETF 매수/매도로 실현. 끄면 원자재 트랙 전체 스킵.",
+                                "group": "매도 규칙"},
+    "COMMODITY_TARGET_MAX_PCT":     {"label": "원자재 비중 상한", "type": "pct_raw", "unit": "%비율",
+                                "help": "원자재 평가비중 절대 상한. 매크로 권고가 이를 넘어도 이 값으로 클램프(0.20=20%)",
+                                "min": 0.0, "max": 1.0, "step": 0.05, "group": "매도 규칙"},
+    "COMMODITY_REBALANCE_BAND_PCT": {"label": "원자재 리밸런싱 데드존", "type": "pct_raw", "unit": "%비율",
+                                "help": "목표 대비 ±이 폭 이내면 원자재 매매 안 함(잦은 교체 방지). 0.03=±3%p",
+                                "min": 0.0, "max": 0.2, "step": 0.01, "group": "매도 규칙"},
+    "COMMODITY_PER_CYCLE_RATIO":    {"label": "원자재 사이클 예산비율", "type": "pct_raw", "unit": "%비율",
+                                "help": "원자재 전용 사이클 매수 한도(총평가 대비). 0.10=총평가의 10%까지 한 사이클에 원자재 매수",
+                                "min": 0.0, "max": 1.0, "step": 0.05, "group": "매도 규칙"},
     "ALLOW_US_STOCKS":            {"label": "미국 주식 매매 허용", "type": "bool",
                                    "help": "US 장 시간(KST 22:30~05:00)에 미국 상장 종목 거래",
                                    "group": "기타"},
@@ -435,8 +582,6 @@ STRATEGY_KEY_EFFECT = {
     "TRIM_OVER_RATIO": "켜면 비중 초과분 자동 부분매도(리밸런싱).",
     "ALLOW_DAY_TRADING": "켜면 보유기간 무관 매도, 끄면 최소보유일 미만 단타 회피.",
     "MIN_HOLDING_DAYS_FOR_SELL": "올리면 더 오래 보유 강제(데이트레이딩 OFF 시).",
-    "THESIS_VETO_ENABLED": "켜면 계획 펼쳐지기 전 무계획 단타 차단(churn 방지).",
-    "THESIS_NOISE_BAND_PCT": "올리면 더 넓은 손익대를 noise로 보고 단타 차단(보유 강화), 내리면 완화.",
     "ENABLE_CHEAP_FALLBACK": "OFF 권장 — 켜면 후보 매수불가 시 저가주 대체매수(권장X).",
     "ALLOW_US_STOCKS": "켜면 미국 주식 매매 허용.",
     "ALLOW_DERIVATIVES": "켜면 파생(선물/옵션) — 고위험, 기본 OFF.",
@@ -448,71 +593,71 @@ STRATEGY_KEY_EFFECT = {
     "UNIVERSE_MIN_TURNOVER": "올리면 거래 활발한 종목만(유동성·급락장 방어), 0=제한없음.",
     "UNIVERSE_EXCLUDE_LEVERAGED": "켜면 레버리지/인버스/ETN 배제(변동성 방어), 끄면 허용.",
     "SCORECARD_WINDOW_DAYS": "올리면 더 긴 기간으로 에이전트 성과 평가(안정), 내리면 최근 위주(민감).",
+    "ENABLE_NXT_EXTENDED_HOURS": "켜면 프리/애프터마켓(NXT) 시간외 매매 활성, 끄면 정규장(KRX)만(방어).",
+    "ENABLE_NXT_PRE_MARKET": "켜면 프리마켓(08:00–08:50) NXT 매매, 끄면 해당 구간 매매 안 함.",
+    "ENABLE_NXT_AFTER_MARKET": "켜면 애프터마켓(15:50–20:00) NXT 매매, 끄면 해당 구간 매매 안 함.",
+    "EXT_HOURS_LIMIT_SLIPPAGE_PCT": "올리면 시간외 지정가를 현재가에서 더 멀리(체결확률↑·슬리피지↑), 내리면 가깝게.",
+    "SHARE_MARKET_INTELLIGENCE": "켜면 ADMIN이 매크로·뉴스 분석을 1회만 하고 다른 계정이 공유(LLM 비용↓), 끄면 계정마다 각자 계산.",
+    "SHARE_PRODUCER_WAIT_SEC": "올리면 ADMIN 분석을 더 오래 기다림(공유 적중↑), 내리면 빨리 자체계산으로 전환(지연↓).",
+    "ENABLE_BOND_ETF": "켜면 매크로 채권 권고를 채권 ETF로 실현(자산배분 충실), 끄면 채권 매매 안 함.",
+    "BOND_TARGET_MAX_PCT": "올리면 채권에 더 많이 배분 허용, 내리면 채권 상한 축소.",
+    "BOND_REBALANCE_BAND_PCT": "올리면 채권 교체 둔감(churn↓), 내리면 목표 추종 민감.",
+    "BOND_PER_CYCLE_RATIO": "올리면 채권을 더 빠르게 목표비중까지 매수, 내리면 천천히.",
+    "ENABLE_COMMODITY_ETF": "켜면 매크로 원자재 권고를 원유·금·농산물 ETF로 실현(인플레 헤지), 끄면 원자재 매매 안 함.",
+    "COMMODITY_TARGET_MAX_PCT": "올리면 원자재에 더 많이 배분 허용, 내리면 원자재 상한 축소.",
+    "COMMODITY_REBALANCE_BAND_PCT": "올리면 원자재 교체 둔감(churn↓), 내리면 목표 추종 민감.",
+    "COMMODITY_PER_CYCLE_RATIO": "올리면 원자재를 더 빠르게 목표비중까지 매수, 내리면 천천히.",
 }
-# 사장 지시 2026-05-14: 보수→공격 스펙트럼 순서로 노출 (방어형 → 보수형 → 균형형 → 공격형 → 초공격형)
-STRATEGY_PRESETS = {
-    "defensive": {"label": "방어형 — 변동성 시장·자산 보존 우선",
-        "PER_ORDER_BUDGET_RATIO": 0.03, "PER_ORDER_BUDGET_OVERSHOOT": 1.05, "MAX_CYCLE_BUDGET_RATIO": 0.10, "MIN_CASH_BUFFER": 1.20,
-        "CONSERVATIVE_MDD": 0.025, "CONSERVATIVE_STOCK_RATIO": 0.07, "MAX_TRADES_PER_CYCLE": 1, "MAX_ORDER_QTY": 0,
-        "MIN_QUANT_SCORE": 7, "MAX_BUY_VOLATILITY_PCT": 40, "RSI_OVERBOUGHT_SKIP": 70, "MIN_ADX_FOR_BUY": 0,
-        "REQUIRE_FOREIGN_NET_BUY": True, "MAX_PRICE_EXTENSION_PCT": 10,
-        "QIW_RSI": 6, "QIW_MACD": 8, "QIW_ADX": 6, "QIW_VWAP": 12, "QIW_VOL": 16, "QIW_MOM": 6, "QIW_CMF": 10, "QIW_FLOW": 16, "QIW_HIGH52": 4,
-        "DW_QUANT": 55, "DW_NEWS": 15, "DW_MACRO": 30, "DETERMINISTIC_SCORING": True, "MACRO_STOCK_GATE_ENABLED": True,
-        "MAX_BUY_NAMES": 3, "POSITION_SIZING_MODE": "risk_weighted", "SIZING_TILT_STRENGTH": 0.6, "SIZING_MAX_TILT": 2.0,
-        "UNIVERSE_MIN_PRICE": 2000, "UNIVERSE_MIN_TURNOVER": 1000000000, "UNIVERSE_EXCLUDE_LEVERAGED": True, "SCORECARD_WINDOW_DAYS": 30,
-        "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 6.0, "STOP_LOSS_PCT": 3.5, "TRIM_OVER_RATIO": True,
-        "ALLOW_DAY_TRADING": False, "MIN_HOLDING_DAYS_FOR_SELL": 1.0, "THESIS_VETO_ENABLED": True,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": False, "ALLOW_DERIVATIVES": False},
-    "conservative": {"label": "보수형 — 작게, 손절 빠르게, 사이클 드물게",
-        "PER_ORDER_BUDGET_RATIO": 0.05, "PER_ORDER_BUDGET_OVERSHOOT": 1.10, "MAX_CYCLE_BUDGET_RATIO": 0.15, "MIN_CASH_BUFFER": 1.15,
-        "CONSERVATIVE_MDD": 0.04, "CONSERVATIVE_STOCK_RATIO": 0.10, "MAX_TRADES_PER_CYCLE": 1, "MAX_ORDER_QTY": 0,
-        "MIN_QUANT_SCORE": 7, "MAX_BUY_VOLATILITY_PCT": 50, "RSI_OVERBOUGHT_SKIP": 75, "MIN_ADX_FOR_BUY": 0,
-        "REQUIRE_FOREIGN_NET_BUY": True, "MAX_PRICE_EXTENSION_PCT": 15,
-        "QIW_RSI": 6, "QIW_MACD": 9, "QIW_ADX": 7, "QIW_VWAP": 10, "QIW_VOL": 12, "QIW_MOM": 9, "QIW_CMF": 9, "QIW_FLOW": 14, "QIW_HIGH52": 6,
-        "DW_QUANT": 58, "DW_NEWS": 20, "DW_MACRO": 22, "DETERMINISTIC_SCORING": True, "MACRO_STOCK_GATE_ENABLED": True,
-        "MAX_BUY_NAMES": 4, "POSITION_SIZING_MODE": "risk_weighted", "SIZING_TILT_STRENGTH": 0.5, "SIZING_MAX_TILT": 2.0,
-        "UNIVERSE_MIN_PRICE": 1000, "UNIVERSE_MIN_TURNOVER": 500000000, "UNIVERSE_EXCLUDE_LEVERAGED": True, "SCORECARD_WINDOW_DAYS": 30,
-        "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 8.0, "STOP_LOSS_PCT": 5.0, "TRIM_OVER_RATIO": True,
-        "ALLOW_DAY_TRADING": False, "MIN_HOLDING_DAYS_FOR_SELL": 0.5, "THESIS_VETO_ENABLED": True,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": False, "ALLOW_DERIVATIVES": False},
-    "balanced": {"label": "균형형 — 기본값 (권장)",
-        "PER_ORDER_BUDGET_RATIO": 0.10, "PER_ORDER_BUDGET_OVERSHOOT": 1.20, "MAX_CYCLE_BUDGET_RATIO": 0.25, "MIN_CASH_BUFFER": 1.10,
-        "CONSERVATIVE_MDD": 0.05, "CONSERVATIVE_STOCK_RATIO": 0.15, "MAX_TRADES_PER_CYCLE": 2, "MAX_ORDER_QTY": 0,
-        "MIN_QUANT_SCORE": 6, "MAX_BUY_VOLATILITY_PCT": 0, "RSI_OVERBOUGHT_SKIP": 0, "MIN_ADX_FOR_BUY": 0,
-        "REQUIRE_FOREIGN_NET_BUY": False, "MAX_PRICE_EXTENSION_PCT": 0,
-        "QIW_RSI": 5, "QIW_MACD": 10, "QIW_ADX": 8, "QIW_VWAP": 8, "QIW_VOL": 8, "QIW_MOM": 12, "QIW_CMF": 8, "QIW_FLOW": 12, "QIW_HIGH52": 8,
-        "DW_QUANT": 60, "DW_NEWS": 25, "DW_MACRO": 15, "DETERMINISTIC_SCORING": True, "MACRO_STOCK_GATE_ENABLED": True,
-        "MAX_BUY_NAMES": 8, "POSITION_SIZING_MODE": "risk_weighted", "SIZING_TILT_STRENGTH": 0.5, "SIZING_MAX_TILT": 2.0,
-        "UNIVERSE_MIN_PRICE": 0, "UNIVERSE_MIN_TURNOVER": 0, "UNIVERSE_EXCLUDE_LEVERAGED": True, "SCORECARD_WINDOW_DAYS": 30,
-        "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 12.0, "STOP_LOSS_PCT": 5.0, "TRIM_OVER_RATIO": True,
-        "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.5, "THESIS_VETO_ENABLED": True,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False},
-    "aggressive": {"label": "공격형 — 크게, 길게 보유, 사이클 잦게",
-        "PER_ORDER_BUDGET_RATIO": 0.20, "PER_ORDER_BUDGET_OVERSHOOT": 1.30, "MAX_CYCLE_BUDGET_RATIO": 0.40, "MIN_CASH_BUFFER": 1.05,
-        "CONSERVATIVE_MDD": 0.08, "CONSERVATIVE_STOCK_RATIO": 0.25, "MAX_TRADES_PER_CYCLE": 3, "MAX_ORDER_QTY": 0,
-        "MIN_QUANT_SCORE": 5, "MAX_BUY_VOLATILITY_PCT": 0, "RSI_OVERBOUGHT_SKIP": 0, "MIN_ADX_FOR_BUY": 0,
-        "REQUIRE_FOREIGN_NET_BUY": False, "MAX_PRICE_EXTENSION_PCT": 0,
-        "QIW_RSI": 4, "QIW_MACD": 12, "QIW_ADX": 10, "QIW_VWAP": 5, "QIW_VOL": 4, "QIW_MOM": 18, "QIW_CMF": 7, "QIW_FLOW": 10, "QIW_HIGH52": 12,
-        "DW_QUANT": 55, "DW_NEWS": 35, "DW_MACRO": 10, "DETERMINISTIC_SCORING": True, "MACRO_STOCK_GATE_ENABLED": True,
-        "MAX_BUY_NAMES": 10, "POSITION_SIZING_MODE": "risk_weighted", "SIZING_TILT_STRENGTH": 0.7, "SIZING_MAX_TILT": 3.0,
-        "UNIVERSE_MIN_PRICE": 0, "UNIVERSE_MIN_TURNOVER": 0, "UNIVERSE_EXCLUDE_LEVERAGED": False, "SCORECARD_WINDOW_DAYS": 30,
-        "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 18.0, "STOP_LOSS_PCT": 10.0, "TRIM_OVER_RATIO": False,
-        "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.0, "THESIS_VETO_ENABLED": True,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False},
-    "ultra_aggressive": {"label": "초공격형 — 최대 베팅·고위험 고리워드",
-        "PER_ORDER_BUDGET_RATIO": 0.35, "PER_ORDER_BUDGET_OVERSHOOT": 1.50, "MAX_CYCLE_BUDGET_RATIO": 0.70, "MIN_CASH_BUFFER": 1.02,
-        "CONSERVATIVE_MDD": 0.15, "CONSERVATIVE_STOCK_RATIO": 0.40, "MAX_TRADES_PER_CYCLE": 5, "MAX_ORDER_QTY": 0,
-        "MIN_QUANT_SCORE": 4, "MAX_BUY_VOLATILITY_PCT": 0, "RSI_OVERBOUGHT_SKIP": 0, "MIN_ADX_FOR_BUY": 0,
-        "REQUIRE_FOREIGN_NET_BUY": False, "MAX_PRICE_EXTENSION_PCT": 0,
-        "QIW_RSI": 3, "QIW_MACD": 14, "QIW_ADX": 12, "QIW_VWAP": 3, "QIW_VOL": 2, "QIW_MOM": 22, "QIW_CMF": 6, "QIW_FLOW": 8, "QIW_HIGH52": 16,
-        "DW_QUANT": 50, "DW_NEWS": 40, "DW_MACRO": 10, "DETERMINISTIC_SCORING": True, "MACRO_STOCK_GATE_ENABLED": True,
-        "MAX_BUY_NAMES": 12, "POSITION_SIZING_MODE": "risk_weighted", "SIZING_TILT_STRENGTH": 1.0, "SIZING_MAX_TILT": 4.0,
-        "UNIVERSE_MIN_PRICE": 0, "UNIVERSE_MIN_TURNOVER": 0, "UNIVERSE_EXCLUDE_LEVERAGED": False, "SCORECARD_WINDOW_DAYS": 14,
-        "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 30.0, "STOP_LOSS_PCT": 15.0, "TRIM_OVER_RATIO": False,
-        "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.0, "THESIS_VETO_ENABLED": True,
-        "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False},
+
+# ─── ops 파라미터 tier: 사이클 조정 가능 vs 토요일 검증 후 (사장 지시 2026-06-09 #7) ─────
+# 운용지원실장이 (a) **매 사이클** 자유롭게 조정해도 안전한 '전술·반응형' 파라미터(cycle)와
+# (b) 모델·구조를 바꿔 **토요일 백테스트+실데이터 검증 후에만** 조정해야 하는 파라미터(weekly)를
+# 코드로 강제 구분한다(infra.ops_param_clamp.partition_by_tier 가 enforcement).
+#   • weekly = 점수엔진 가중치(QIW_*·DW_*)·사이징 모델·유니버스 스크린·종목수·스코어카드 윈도우·
+#     슬리브 구조값(상한/밴드/사이클예산)·슬리브 마스터스위치·결정론 채점 토글.
+#   • cycle  = 그 외 전술 파라미터(사이징 비율·리스크 한도·매도룰·종목 필터·레짐 게이트·NXT·공유).
+# (OPS_PROTECTED_KEYS 는 tier 와 무관하게 ops 자율변경 불가 — partition_protected 가 먼저 처리.)
+STRATEGY_WEEKLY_TIER_KEYS = {
+    "QIW_RSI", "QIW_MACD", "QIW_ADX", "QIW_VWAP", "QIW_VOL", "QIW_MOM", "QIW_CMF", "QIW_FLOW", "QIW_HIGH52",
+    "DW_QUANT", "DW_NEWS", "DW_MACRO", "DETERMINISTIC_SCORING",
+    "POSITION_SIZING_MODE", "SIZING_TILT_STRENGTH", "SIZING_MAX_TILT",
+    "UNIVERSE_MIN_PRICE", "UNIVERSE_MIN_TURNOVER", "UNIVERSE_EXCLUDE_LEVERAGED",
+    "MAX_BUY_NAMES", "SCORECARD_WINDOW_DAYS",
+    "ENABLE_BOND_ETF", "BOND_TARGET_MAX_PCT", "BOND_REBALANCE_BAND_PCT", "BOND_PER_CYCLE_RATIO",
+    "ENABLE_COMMODITY_ETF", "COMMODITY_TARGET_MAX_PCT", "COMMODITY_REBALANCE_BAND_PCT", "COMMODITY_PER_CYCLE_RATIO",
 }
-DEFAULT_STRATEGY = "balanced"
+for _mk, _mm in STRATEGY_KEY_META.items():
+    _mm["tier"] = "weekly" if _mk in STRATEGY_WEEKLY_TIER_KEYS else "cycle"
+del _mk, _mm
+
+
+# ─── 단일 기본 전략값 (사장 지시 2026-06-09: 프리셋 폐지) ──────────────────────
+# 과거 STRATEGY_PRESETS["balanced"] 가 모든 프로필의 기본 베이스였다. 프리셋을 없애고
+# 그 균형형 값을 유일한 기본값으로 승격한다. 균형형에 없던 후발 추가 키(NXT/인텔리전스/
+# 채권)는 모듈 상수에서 채워 전 튜닝키를 빠짐없이 커버한다(기존 폴백 동작 보존).
+STRATEGY_DEFAULTS = {
+    "PER_ORDER_BUDGET_RATIO": 0.10, "PER_ORDER_BUDGET_OVERSHOOT": 1.20,
+    "MAX_CYCLE_BUDGET_RATIO": 0.25, "MIN_CASH_BUFFER": 1.10,
+    "CONSERVATIVE_MDD": 0.05, "CONSERVATIVE_STOCK_RATIO": 0.15,
+    "MAX_TRADES_PER_CYCLE": 2, "MAX_ORDER_QTY": 0,
+    "MIN_QUANT_SCORE": 6, "MAX_BUY_VOLATILITY_PCT": 0, "RSI_OVERBOUGHT_SKIP": 0, "MIN_ADX_FOR_BUY": 0,
+    "REQUIRE_FOREIGN_NET_BUY": False, "MAX_PRICE_EXTENSION_PCT": 0,
+    "QIW_RSI": 5, "QIW_MACD": 10, "QIW_ADX": 8, "QIW_VWAP": 8, "QIW_VOL": 8,
+    "QIW_MOM": 12, "QIW_CMF": 8, "QIW_FLOW": 12, "QIW_HIGH52": 8,
+    "DW_QUANT": 60, "DW_NEWS": 25, "DW_MACRO": 15,
+    "DETERMINISTIC_SCORING": True, "MACRO_STOCK_GATE_ENABLED": True,
+    "MAX_BUY_NAMES": 8, "POSITION_SIZING_MODE": "risk_weighted",
+    "SIZING_TILT_STRENGTH": 0.5, "SIZING_MAX_TILT": 2.0,
+    "UNIVERSE_MIN_PRICE": 0, "UNIVERSE_MIN_TURNOVER": 0,
+    "UNIVERSE_EXCLUDE_LEVERAGED": True, "SCORECARD_WINDOW_DAYS": 30,
+    "ENABLE_SELL_REBALANCE": True, "TAKE_PROFIT_PCT": 12.0, "STOP_LOSS_PCT": 5.0, "TRIM_OVER_RATIO": True,
+    "ALLOW_DAY_TRADING": True, "MIN_HOLDING_DAYS_FOR_SELL": 0.5,
+    "ENABLE_CHEAP_FALLBACK": False, "ALLOW_US_STOCKS": True, "ALLOW_DERIVATIVES": False,
+}
+# 균형형에 없던 후발 키(NXT/인텔리전스/채권 등)는 모듈 상수에서 보충 → 단일 기본값 완성.
+for _k in STRATEGY_TUNABLE_KEYS:
+    STRATEGY_DEFAULTS.setdefault(_k, globals().get(_k))
+del _k
 
 # ─── Server ──────────────────────────────────────────────────────────────────
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")

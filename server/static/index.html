@@ -108,32 +108,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
 .trow-detail .dh{font-weight:700;color:var(--acc);margin-bottom:4px;font-size:11px}
 .trow-detail .dl{color:var(--dim);font-size:10px;margin-top:6px}
 .trow-detail .pos{color:var(--grn)}.trow-detail .neg{color:var(--red)}.trow-detail .mut{color:var(--dim)}
-.strat-now{background:linear-gradient(135deg,#1e1b4b,#0e1530);border:1px solid #312e81;border-radius:10px;padding:14px}
-.strat-now .nm{font-size:16px;font-weight:800;background:linear-gradient(90deg,#fff,var(--acc));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.preset{display:flex;justify-content:space-between;align-items:center;gap:10px;background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:6px}
-.preset.active{border-color:var(--pri);box-shadow:0 0 8px var(--glow)}
-.preset .pinfo{font-size:11px}.preset .pinfo b{font-size:12px}
-.preset .pactions{display:flex;gap:6px;align-items:center}
-.preset.user-preset{border-style:dashed}
-.preset .src-badge{font-size:9px;padding:2px 6px;border-radius:4px;margin-left:6px;background:var(--s2);border:1px solid var(--border);color:var(--dim);vertical-align:middle}
-.preset .src-badge.user{background:#1e3a5f;border-color:#3b82f6;color:#93c5fd}
-/* Collapsible 카드 (사장 지시 2026-05-14: 평소엔 납작, 클릭 시 펼침) */
-.collapse-card .ch-toggle{cursor:pointer;user-select:none;display:flex;align-items:center;gap:8px}
-.collapse-card .ch-toggle:hover{background:rgba(99,102,241,.06)}
-.collapse-card .ch-toggle .ch-sub{font-size:10px;color:var(--dim);flex:1;margin-left:8px}
-.collapse-card .ch-caret{font-size:14px;color:var(--dim);transition:transform .2s}
-.collapse-card.collapsed .ch-caret{transform:rotate(-90deg)}
-.collapse-card .collapse-body{overflow:hidden;transition:max-height .25s ease, opacity .2s;max-height:4000px;opacity:1;padding-top:6px}
-.collapse-card.collapsed .collapse-body{max-height:0;opacity:0;padding-top:0;pointer-events:none}
-/* 사장 지시 2026-05-14: 접힌 상태에서도 헤더 위·아래 여백을 확보해 카드가 잘려보이지 않도록 */
-.collapse-card{padding:16px 14px;transition:padding .2s,.3s}
-.collapse-card.collapsed{padding:14px 14px}
-.collapse-card.collapsed .ch{margin-bottom:0;border-bottom-color:transparent}
-.collapse-card .ch-toggle{padding:4px 0}
-/* 펼친 후 액션 행은 flex 가로 정렬 (인라인 display:flex 손상 방지) */
-.collapse-card #customActions{display:flex !important}
-.collapse-card.collapsed #customActions{display:none !important}
-/* 전략 커스터마이즈 박스 (사장 지시 2026-05-14) */
+/* 전략 설정 편집 패널 — 그룹별 입력칸 (사장 지시 2026-06-09) */
 .cust-group{margin-top:10px}
 .cust-group .ghead{font-size:11px;font-weight:700;color:var(--acc);margin:8px 0 4px;text-transform:uppercase;letter-spacing:.5px}
 .cust-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;padding:6px 0;border-bottom:1px dashed var(--border)}
@@ -215,16 +190,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
   .hrow .hl,.hrow .hr{white-space:normal;word-break:keep-all;overflow-wrap:anywhere;line-height:1.4}
   .hrow .hr{font-size:11px}
   #bpLine{word-break:keep-all;overflow-wrap:anywhere;line-height:1.5}
-  /* 전략 탭 — 모바일에선 간략·세로 정렬 (줄바꿈 깨짐 방지) */
-  .strat-now{padding:11px}
-  .strat-now .nm{font-size:14px}
-  .preset{flex-direction:column;align-items:stretch;gap:8px;padding:10px}
-  .preset .pinfo b{word-break:keep-all;overflow-wrap:anywhere}
-  .preset .pp{display:none}                     /* 프리셋별 6개 파라미터 요약은 숨김 → '편집'으로 확인 */
-  .preset .pactions{justify-content:flex-end;flex-wrap:wrap}
-  .preset .pactions .btn-apply{flex:1 1 auto;min-width:64px;text-align:center}
-  .strat-now .pp,.pp{word-break:keep-all;overflow-wrap:anywhere}
-  .collapse-card .ch-toggle .ch-sub{display:none} /* 긴 안내문 숨김 — 제목+화살표만 */
+  /* 전략 탭 — 모바일에선 라벨 줄바꿈 유지 */
   .cust-row .clbl{word-break:keep-all;overflow-wrap:anywhere}
   /* ⑧ 일반 글자 줄바꿈 — 한국어는 단어단위 유지, 긴 토큰만 줄바꿈 */
   .cm,.ni{word-break:keep-all;overflow-wrap:anywhere}
@@ -262,15 +228,18 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <div class="regonly" id="unameHint" style="font-size:11px;margin:-6px 0 9px"></div>
       <div class="fld"><label>비밀번호 <span class="regonly" style="color:#7a869c">(10자 이상 · 특수문자 1개 이상)</span></label><input id="f_password" type="password" required autocomplete="current-password"></div>
       <div class="regonly" id="pwHint" style="font-size:11px;margin:-6px 0 9px"></div>
-      <div class="regonly"><div class="fld"><label>OpenRouter API Key <span style="color:#7a869c">(필수)</span></label><input id="f_or" autocomplete="off"></div></div>
-      <div class="regonly"><div class="fld"><label>한국투자증권 App Key</label><input id="f_appkey" autocomplete="off"></div></div>
-      <div class="regonly"><div class="fld"><label>한국투자증권 App Secret</label><input id="f_appsecret" type="password" autocomplete="off"></div></div>
-      <div class="regonly"><div class="fld"><label>한국투자증권 계좌번호 <span style="color:#7a869c">(예: 12345678-01)</span></label><input id="f_acct"></div></div>
-      <div class="regonly"><div class="fld"><label>거래 환경</label>
+      <div class="regonly"><div class="fld"><label>가입 유형</label><select id="f_account_mode" onchange="syncRegisterMode()" style="width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;border:1px solid #2a3344;background:#0e131d;color:#e8edf6;font-size:13px;outline:none"><option value="viewer" selected>관전 모드 (아이디와 비밀번호만)</option><option value="trading">투자 계정 (KIS/DeepSeek 연결)</option></select></div></div>
+      <div class="regonly" id="viewerJoinHint" style="font-size:11px;color:#9fb0c9;margin:-4px 0 8px">hh09080 계정의 에이전트 통신, 수익률, 보유 종목, 뉴스를 읽기 전용으로 봅니다.</div>
+      <div class="regonly tradeonly"><div class="fld"><label>DeepSeek API Key <span style="color:#7a869c">(필수)</span></label><input id="f_ds" autocomplete="off"></div></div>
+      <div class="regonly tradeonly"><div class="fld"><label>한국투자증권 App Key</label><input id="f_appkey" autocomplete="off"></div></div>
+      <div class="regonly tradeonly"><div class="fld"><label>한국투자증권 App Secret</label><input id="f_appsecret" type="password" autocomplete="off"></div></div>
+      <div class="regonly tradeonly"><div class="fld"><label>한국투자증권 계좌번호 <span style="color:#7a869c">(예: 12345678-01)</span></label><input id="f_acct"></div></div>
+      <div class="regonly tradeonly"><div class="fld"><label>거래 환경</label>
         <select id="f_envmode" style="width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;border:1px solid #2a3344;background:#0e131d;color:#e8edf6;font-size:13px;outline:none">
-          <option value="real" selected>실전투자 (실거래)</option>
-          <option value="mock">모의투자 (페이퍼)</option>
+          <option value="mock" selected>모의투자 (권장 · 페이퍼)</option>
+          <option value="real">실전투자 (실제 주문 전송)</option>
         </select></div></div>
+      <div class="regonly tradeonly" style="font-size:11px;color:#fbbf24;margin:-4px 0 8px">처음에는 모의투자로 가입해 전체 흐름을 확인하세요. 실전투자는 실제 계좌로 주문을 전송합니다.</div>
       <label for="f_remember" style="display:flex;align-items:center;gap:8px;font-size:12px;color:#9fb0c9;margin:10px 0 14px;cursor:pointer;white-space:nowrap;line-height:1"><input type="checkbox" id="f_remember" checked style="width:16px;height:16px;margin:0;flex:none;accent-color:#6366f1;cursor:pointer"><span>이 기기에서 7일간 로그인 유지</span></label>
       <div id="authErr" style="display:none;font-size:12px;color:#f87171;background:#3b1a1a;border:1px solid #5b2626;border-radius:7px;padding:8px 10px;margin-bottom:10px"></div>
       <button id="authSubmit" type="submit" style="width:100%;padding:11px;border-radius:9px;border:0;background:linear-gradient(135deg,#6366f1,#06b6d4);color:#fff;font-weight:700;font-size:13px;cursor:pointer">로그인</button>
@@ -317,9 +286,9 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <button onclick="closeProfile()" class="btn btn-ghost">✕</button>
     </div>
     <div class="pf-sec pf-acc collapsed"><div class="pf-head" onclick="pfToggle(this)"><b>비밀번호 변경</b><span class="pf-caret">▼</span></div><div class="pf-body"><input id="pf_cur" type="password" placeholder="현재 비밀번호"><input id="pf_new" type="password" placeholder="새 비밀번호(10자+특수문자)"><button class="btn" onclick="pfChangePw()">변경</button> <span id="pf_pwmsg"></span></div></div>
-    <div class="pf-sec pf-acc collapsed"><div class="pf-head" onclick="pfToggle(this)"><b>정보 변경</b><span class="pf-caret">▼</span></div><div class="pf-body"><input id="pf_or" placeholder="OpenRouter Key(미입력=유지)"><input id="pf_ak" placeholder="KIS App Key"><input id="pf_as" placeholder="KIS App Secret"><input id="pf_acct2" placeholder="한국투자증권 계좌번호"><select id="pf_envmode" style="width:100%;box-sizing:border-box;padding:8px;border-radius:7px;border:1px solid #2a3344;background:#0e131d;color:#e8edf6;font-family:inherit;font-size:12px;margin:4px 0"><option value="real">실전투자 (실거래)</option><option value="mock">모의투자 (페이퍼)</option></select><button class="btn" onclick="pfSaveCreds()">저장</button> <span id="pf_cmsg"></span></div></div>
-    <div class="pf-sec pf-acc collapsed"><div class="pf-head" onclick="pfToggle(this)"><b>지시사항 관리</b><span class="pf-caret">▼</span></div><div class="pf-body"><div id="pf_dirs"></div><input id="pf_dir" placeholder="새 지시사항"><button class="btn" onclick="pfAddDir()">추가</button></div></div>
-    <div class="pf-sec pf-acc collapsed"><div class="pf-head" onclick="pfToggle(this)"><b>API 비용 표시</b><span class="pf-caret">▼</span></div><div class="pf-body">
+    <div class="pf-sec pf-acc collapsed"><div class="pf-head" onclick="pfToggle(this)"><b>정보 변경</b><span class="pf-caret">▼</span></div><div class="pf-body"><div id="pf_upgrade_hint" style="display:none;font-size:11px;color:#9fb0c9;margin-bottom:6px">모든 값을 입력하면 모의투자 또는 실전투자 계정으로 업그레이드됩니다.</div><input id="pf_ds" placeholder="DeepSeek API Key(미입력=유지)"><input id="pf_ak" placeholder="KIS App Key"><input id="pf_as" placeholder="KIS App Secret"><input id="pf_acct2" placeholder="한국투자증권 계좌번호"><select id="pf_envmode" style="width:100%;box-sizing:border-box;padding:8px;border-radius:7px;border:1px solid #2a3344;background:#0e131d;color:#e8edf6;font-family:inherit;font-size:12px;margin:4px 0"><option value="real">실전투자 (실거래)</option><option value="mock">모의투자 (페이퍼)</option></select><button class="btn" onclick="pfSaveCreds()">저장</button> <span id="pf_cmsg"></span></div></div>
+    <div class="pf-sec pf-acc collapsed" id="pf_directives_sec"><div class="pf-head" onclick="pfToggle(this)"><b>지시사항 관리</b><span class="pf-caret">▼</span></div><div class="pf-body"><div id="pf_dirs"></div><input id="pf_dir" placeholder="새 지시사항"><button class="btn" onclick="pfAddDir()">추가</button></div></div>
+    <div class="pf-sec pf-acc collapsed" id="pf_cost_sec"><div class="pf-head" onclick="pfToggle(this)"><b>API 비용 표시</b><span class="pf-caret">▼</span></div><div class="pf-body">
       <div style="font-size:11px;color:#9fb0c9;margin-bottom:6px">우상단 비용 합산 단위 (이 프로필에만 적용)</div>
       <select id="pf_costmode" onchange="pfSetCostMode(this.value)" style="width:100%;box-sizing:border-box;padding:8px;border-radius:7px;border:1px solid #2a3344;background:#0e131d;color:#e8edf6;font-family:inherit;font-size:12px">
         <option value="h">시간당 (최근 1시간)</option>
@@ -386,8 +355,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
     <div class="header-left"><div class="logo" style="background:linear-gradient(135deg,#6366f1,#06b6d4);border-radius:9px;box-shadow:0 2px 10px #6366f155"><svg width='19' height='19' viewBox='0 0 24 24' fill='none' stroke='#fff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9.2' opacity='.35'/><path d='M5 16.5l4-5 3.2 3 4.3-6.2'/><circle cx='16.5' cy='8.3' r='1.6' fill='#fff' stroke='none'/></svg></div><h1>ArQuant<span>v1.0 — Multi-Asset AI Trading</span></h1></div>
     <div class="hdr-btns" style="display:flex;align-items:center;gap:10px">
       <!-- 사장 피드백 2026-05-15: 최근 사이클 API 비용 (달러 추정) — STOPPED 배지 왼쪽 -->
-      <!-- 사장 피드백 2026-05-18: 클릭 시 OpenRouter 크레딧 페이지로 이동 -->
-      <a id="apiCost" href="https://openrouter.ai/settings/credits" target="_blank" rel="noopener" title="최근 사이클 API 추정 비용 (USD) — 클릭하면 OpenRouter 크레딧 페이지로 이동" style="font-size:11px;color:var(--dim);background:var(--s2);border-radius:6px;padding:3px 10px;border:1px solid var(--border);text-decoration:none;cursor:pointer">💵 $0.00/cycle</a>
+      <span id="apiCost" title="DeepSeek API 사용량 기반 추정 비용" style="font-size:11px;color:var(--dim);background:var(--s2);border-radius:6px;padding:3px 10px;border:1px solid var(--border)">💵 $0.00/cycle</span>
       <!-- 운용지원 on/off 토글은 전략 탭 '적용 가능 전략' 헤더로 이동 (사장 지시 2026-05-21) -->
       <div id="acctChip" title="프로필">👤<span id="acctDot" style="display:none;position:relative;top:-8px;left:-2px;color:#ef4444;font-size:9px">●</span></div>
     </div>
@@ -426,7 +394,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <button class="dash-more" id="dashMore" onclick="toggleDashMore()" type="button">
         <span id="dashMoreLabel">전체 상태 보기</span><span id="dashMoreArrow">▾</span>
       </button>
-      <div class="card grow"><div class="ch"><span class="ct">💬 에이전트 통신 로그 <span id="badgeMirror" class="badge badge-idle">IDLE</span></span><button class="btn btn-ghost" onclick="clearLog()">초기화</button></div>
+      <div class="card grow"><div class="ch"><span class="ct">💬 에이전트 통신 로그 <span id="badgeMirror" class="badge badge-idle">IDLE</span></span><button id="clearLogBtn" class="btn btn-ghost" onclick="clearLog()">초기화</button></div>
         <div class="chat-log" id="chatLog"><div class="cm system">감시를 시작하면 장 시간(KRX 08:50~15:50, US 22:30~05:00)에 맞춰 자동 거래합니다.</div></div>
       </div>
     </div>
@@ -434,13 +402,13 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
     <!-- ── 수익률 (KPI 요약 + 자산곡선/벤치마크) ── 사장 지시 2026-05-21 -->
     <div class="tabpane" id="tab-pnl">
       <div class="kpi-grid" id="kpiGrid">
-        <div class="kpi"><div class="kl">누적 수익</div><div class="kv" id="kCum">-</div><div class="ks" id="kCumP"></div></div>
-        <div class="kpi"><div class="kl">오늘</div><div class="kv" id="kDay">-</div><div class="ks" id="kDayP"></div></div>
-        <div class="kpi"><div class="kl">이번주</div><div class="kv" id="kWeek">-</div><div class="ks" id="kWeekP"></div></div>
-        <div class="kpi"><div class="kl">이번달</div><div class="kv" id="kMonth">-</div><div class="ks" id="kMonthP"></div></div>
+        <div class="kpi"><div class="kl">평가금액 변동</div><div class="kv" id="kEqAll">-</div><div class="ks" id="kEqAllP"></div></div>
+        <div class="kpi"><div class="kl">오늘</div><div class="kv" id="kEqDay">-</div><div class="ks" id="kEqDayP"></div></div>
+        <div class="kpi"><div class="kl">이번주</div><div class="kv" id="kEqWeek">-</div><div class="ks" id="kEqWeekP"></div></div>
+        <div class="kpi"><div class="kl">이번달</div><div class="kv" id="kEqMonth">-</div><div class="ks" id="kEqMonthP"></div></div>
         <div class="kpi"><div class="kl">최대낙폭 (MDD)</div><div class="kv" id="kMdd">-</div><div class="ks">고점 대비</div></div>
         <div class="kpi"><div class="kl">승률</div><div class="kv" id="kWin">-</div><div class="ks" id="kWinSub"></div></div>
-        <div class="kpi"><div class="kl">평균 보유일</div><div class="kv" id="kHold">-</div><div class="ks">매수→매도</div></div>
+        <div class="kpi"><div class="kl">누적 수익</div><div class="kv" id="kCumR">-</div><div class="ks" id="kCumRP">체결 실현손익</div></div>
         <div class="kpi" id="kpiCur"><div class="kl">현재 평가액</div><div class="kv" id="kCur">-</div><div class="ks">실계좌 총평가</div></div>
       </div>
       <div class="card grow"><div class="ch">
@@ -468,25 +436,19 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       </div>
       <div class="card grow"><div class="ch">
           <span class="ct">📜 전체 거래 내역</span>
-          <button class="btn btn-ghost" style="margin-left:8px;padding:2px 8px;font-size:10px" onclick="clearTrades()" title="거래 내역만 비웁니다 (시스템 로그는 유지)">🗑️ 비우기</button>
+          <button id="clearTradesBtn" class="btn btn-ghost" style="margin-left:8px;padding:2px 8px;font-size:10px" onclick="clearTrades()" title="거래 내역만 비웁니다 (시스템 로그는 유지)">🗑️ 비우기</button>
           <span class="ar" id="trMeta" style="font-size:11px;color:var(--dim);margin-left:auto">-</span>
         </div>
         <div class="chat-log" id="trList"><div class="cm system" style="background:var(--s2)">거래 내역 불러오는 중...</div></div>
       </div>
     </div>
 
-    <!-- ── 뉴스 ── (사장 피드백 2026-05-15: 사이드바에서 별도 탭으로 이전; KR/US/공통 필터 추가) -->
+    <!-- ── 뉴스 ── (사장 지시 2026-06-04: KR/US/공통 시장 구분 폐지 — 단일 피드) -->
     <div class="tabpane" id="tab-news">
       <div class="card"><div class="ch">
           <span class="ct">📰 뉴스 피드</span>
-          <span style="display:inline-flex;gap:3px;margin-left:8px">
-            <button class="btn btn-ghost eq-view active" data-newsfilter="all" onclick="setNewsFilter('all')">전체</button>
-            <button class="btn btn-ghost eq-view" data-newsfilter="KR" onclick="setNewsFilter('KR')">🇰🇷 국내</button>
-            <button class="btn btn-ghost eq-view" data-newsfilter="US" onclick="setNewsFilter('US')">🇺🇸 미국</button>
-            <button class="btn btn-ghost eq-view" data-newsfilter="BOTH" onclick="setNewsFilter('BOTH')">🌐 공통</button>
-          </span>
           <span class="ar" id="newsCount" style="font-size:11px;color:var(--dim);margin-left:auto">0건</span>
-          <button class="btn btn-ghost" style="padding:2px 8px;font-size:10px;margin-left:6px" onclick="clearNewsLog()" title="뉴스 로그를 정리합니다 (최근 20건은 유지)">🗑️ 로그 정리</button>
+          <button id="clearNewsBtn" class="btn btn-ghost" style="padding:2px 8px;font-size:10px;margin-left:6px" onclick="clearNewsLog()" title="뉴스 로그를 정리합니다 (최근 20건은 유지)">🗑️ 로그 정리</button>
         </div>
         <div class="chat-log" id="nfMain" style="flex:1;min-height:300px;max-height:70vh;overflow-y:auto"><div class="cm system">뉴스 로딩 중...</div></div>
       </div>
@@ -494,37 +456,29 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
 
     <!-- ── 전략 ── -->
     <div class="tabpane" id="tab-strat">
-      <div class="strat-now" id="stratNow"><div class="nm">전략 불러오는 중...</div></div>
-      <div class="card"><div class="ch"><span class="ct">🎛️ 적용 가능 전략</span><button id="opsToggle" onclick="toggleOpsFeedback()" title="이 계정의 운용지원 피드백(전략 파라미터 자동 조정) on/off — 프로필별" style="display:none;margin-left:auto;font-size:11px;color:var(--dim);background:var(--s2);border-radius:6px;padding:3px 10px;border:1px solid var(--border);cursor:pointer">🛠 운용지원 …</button></div>
-        <div id="presetList"></div>
+      <!-- 거버넌스 2026-06-05: 토요일 운용지원실장이 제안한 정책 플래그 변경 — 사장 승인 대기 -->
+      <div class="card" id="policy-approval-box" style="display:none;border:1px solid #c0392b">
+        <div class="ch"><span class="ct">🔐 정책 변경 승인 대기</span></div>
+        <div id="policy-approval-list" style="padding:4px 2px"></div>
       </div>
-      <!-- 사장 지시 2026-05-14: 전략 커스터마이즈 — 평소엔 납작한 헤더만, 클릭 시 펼침 -->
-      <div class="card collapse-card collapsed" id="customCard">
-        <div class="ch ch-toggle" onclick="toggleCustomCard()" role="button" tabindex="0"
-             onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleCustomCard()}">
-          <span class="ct">🛠 전략 커스터마이즈</span>
-          <span class="ch-sub">한국어 라벨로 직접 입력 → 즉시 적용 또는 프리셋으로 저장</span>
-          <span class="ch-caret" aria-hidden="true">▾</span>
+      <!-- 사장 지시 2026-06-09: 프리셋 폐지 → 현재 적용 설정을 그룹별로 보여주고 그 자리에서 편집 -->
+      <div class="card">
+        <div class="ch"><span class="ct">⚙️ 현재 적용 설정</span><button id="opsToggle" onclick="toggleOpsFeedback()" title="이 계정의 운용지원 피드백(전략 파라미터 자동 조정) on/off — 프로필별" style="display:none;margin-left:auto;font-size:11px;color:var(--dim);background:var(--s2);border-radius:6px;padding:3px 10px;border:1px solid var(--border);cursor:pointer">🛠 운용지원 …</button></div>
+        <div id="stratMeta" style="font-size:10px;color:var(--dim);margin:2px 0 10px">불러오는 중...</div>
+        <div id="customLoader" style="font-size:11px;color:var(--dim);padding:8px">파라미터 불러오는 중...</div>
+        <div id="customFields" style="display:none"></div>
+        <div id="customActions" style="display:none;margin-top:14px;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn-apply" onclick="applyCustom()">▶ 변경값 적용</button>
+          <button class="btn-apply" style="background:var(--s2);border:1px solid var(--border)" onclick="loadCustomFromActive()">↺ 되돌리기</button>
         </div>
-        <div class="collapse-body">
-          <div id="customLoader" style="font-size:11px;color:var(--dim);padding:8px">파라미터 메타데이터 불러오는 중...</div>
-          <div id="customFields" style="display:none"></div>
-          <div id="customActions" style="display:none;margin-top:14px;gap:8px;align-items:center;flex-wrap:wrap">
-            <button class="btn-apply" onclick="applyCustom()">▶ 현재 값 즉시 적용</button>
-            <input type="text" id="presetSaveName" placeholder="저장할 프리셋 이름 (한글/영문)" style="flex:1;min-width:160px;padding:7px 10px;background:var(--s2);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:12px"/>
-            <input type="text" id="presetSaveLabel" placeholder="표시 라벨 (선택)" style="flex:1;min-width:160px;padding:7px 10px;background:var(--s2);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:12px"/>
-            <button class="btn-apply" style="background:#0ea5e9" onclick="saveCustomPreset()">💾 프리셋으로 저장</button>
-            <button class="btn-apply" style="background:var(--s2);border:1px solid var(--border)" onclick="loadCustomFromActive()">↺ 현재 전략값으로 채우기</button>
-          </div>
-          <div id="customMsg" style="margin-top:8px;font-size:11px;color:var(--dim);min-height:14px"></div>
-        </div>
+        <div id="customMsg" style="margin-top:8px;font-size:11px;color:var(--dim);min-height:14px"></div>
       </div>
     </div>
     <!-- 사장 지시 2026-05-22: ADMIN 탭 — 전역(전체 계정) 설정 + 회원관리 -->
     <div class="tabpane" id="tab-admin" style="overflow-y:auto;overflow-x:hidden">
       <div class="card">
         <div style="font-weight:700;margin-bottom:6px">🛡️ ADMIN — 전역 설정 (전체 계정 적용)</div>
-        <div style="font-size:11px;color:var(--dim);margin-bottom:10px">여기서 바꾼 항목은 모든 계정·전체 시스템에 적용됩니다. <b>모델 변경은 다음 재시작에 반영</b>, <b>크롤 주기는 즉시 반영</b>됩니다. 모델명은 OpenRouter에서 쓰는 정확한 이름을 입력하세요(빈칸이면 기본값).</div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:10px">여기서 바꾼 항목은 모든 계정·전체 시스템에 적용됩니다. 모델은 <b>deepseek-v4-flash</b> 또는 <b>deepseek-v4-pro</b>만 사용합니다.</div>
         <div style="font-weight:600;margin:6px 0">에이전트 · 뉴스 크롤러 모델</div>
         <div id="adminModels" style="display:flex;flex-direction:column;gap:6px"></div>
         <div style="font-weight:600;margin:14px 0 6px">뉴스 크롤 주기</div>
@@ -553,7 +507,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
     <button class="btn btn-lg btn-start" id="startBtn" onclick="startMonitor()" title="실행">▶ <span class="btn-lbl">실행</span></button>
     <button class="btn btn-lg btn-stop" id="stopBtn" onclick="stopMonitor()" disabled title="중지">⏹ <span class="btn-lbl">중지</span></button>
     <div class="control-wrap">
-      <input class="dir-in" id="ceoInput" placeholder="사장 지시: @운용전략실장 미국 기술주 비중 60%로... (@에이전트명으로 직접 호출)" onkeydown="handleKey(event)" oninput="checkMention()" />
+      <input class="dir-in" id="ceoInput" placeholder="사장 지시: @주식운용실장 미국 기술주 비중 60%로... (@에이전트명으로 직접 호출)" onkeydown="handleKey(event)" oninput="checkMention()" />
       <div class="mention-hint" id="mentionHint"></div>
       <button class="btn btn-lg btn-send" onclick="sendCeo()" title="전송">➤ <span class="btn-lbl">전송</span></button>
     </div>
@@ -580,6 +534,7 @@ let _authed=false;
 // 사장 지시 2026-05-20: 운용지원실장은 ADMIN·일반 유저 모두 사용 가능(프로필 한정 파라미터
 // 조정만 — 코드 자가수정·산하 팀장 폐지). 더 이상 사이드바/멘션에서 숨기지 않는다(빈 집합).
 let IS_ADMIN=false;
+let IS_VIEWER=false;
 const OPS_AGENT_NAMES=new Set([]);
 async function boot(){
   try{const r=await _origFetch(API+'/api/auth_status');const d=await r.json();
@@ -618,7 +573,29 @@ function setAuthMode(reg){
   document.getElementById('tabReg').style.background=reg?'#1e2636':'#141a26';
   document.getElementById('tabReg').style.color=reg?'#e8edf6':'#7a869c';
   document.getElementById('authSubmit').textContent=reg?'등록하고 시작':'로그인';
-  ['f_or','f_acct'].forEach(id=>{document.getElementById(id).required=reg;});
+  syncRegisterMode();
+}
+function syncRegisterMode(){
+  const reg=document.getElementById('loginOv').classList.contains('reg');
+  const viewer=(document.getElementById('f_account_mode')||{}).value!=='trading';
+  document.querySelectorAll('.tradeonly').forEach(el=>el.style.display=(reg&&!viewer)?'block':'none');
+  const hint=document.getElementById('viewerJoinHint');if(hint)hint.style.display=(reg&&viewer)?'block':'none';
+  ['f_ds','f_appkey','f_appsecret','f_acct'].forEach(id=>{const el=document.getElementById(id);if(el)el.required=reg&&!viewer;});
+}
+function applyViewerMode(){
+  const api=document.getElementById('apiCost');if(api)api.style.display=IS_VIEWER?'none':'';
+  // 사장 보고 2026-06-10 회귀수정: 실행/중지 버튼을 여기서 disabled=IS_VIEWER 로 일괄 설정하면 비관전
+  // 계정(IS_VIEWER=false)에서 둘 다 disabled=false 로 되돌아가 refreshStatus 의 is_running 동기화를
+  // 덮어쓴다(→ 실행 버튼이 계속 활성, 눌러도 '이미 감시 중'). 관전 계정만 강제 비활성, 비관전은 동기화 위임.
+  const ceo=document.getElementById('ceoInput');if(ceo)ceo.disabled=IS_VIEWER;
+  if(IS_VIEWER){['startBtn','stopBtn'].forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=true;});}
+  const send=document.querySelector('.btn-send');if(send)send.disabled=IS_VIEWER;
+  const clear=document.getElementById('clearLogBtn');if(clear)clear.style.display=IS_VIEWER?'none':'';
+  ['clearTradesBtn','clearNewsBtn'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display=IS_VIEWER?'none':'';});
+  const admin=document.getElementById('adminTabBtn');if(admin)admin.style.display=(!IS_VIEWER&&IS_ADMIN)?'inline-block':'none';
+  const ops=document.getElementById('opsToggle');if(ops)ops.style.display=IS_VIEWER?'none':'';
+  document.querySelectorAll('#customFields input,#customFields select').forEach(el=>el.disabled=IS_VIEWER);
+  const actions=document.getElementById('customActions');if(actions&&IS_VIEWER)actions.style.display='none';
 }
 function renderAcct(a){
   // 사장 피드백 2026-05-16: '사장님(.env 시드)' 라벨 표시 제거 → 그 자리는 프로필 버튼 고정.
@@ -629,7 +606,7 @@ let _appStarted=false;
 function startApp(){ if(_appStarted)return; _appStarted=true; replayLog(); connectWS();
   // 사장 피드백 2026-05-18: 활성 계정 ADMIN 여부 확인 → 운용지원 계열 노출/숨김 갱신.
   // (세션복원·로그인 두 경로 모두 startApp 을 거치므로 여기 한 곳이면 충분)
-  fetch(API+'/api/me').then(r=>r.json()).then(m=>{IS_ADMIN=!!(m&&m.is_admin);const ab=document.getElementById('adminTabBtn');if(ab)ab.style.display=IS_ADMIN?'inline-block':'none';renderAgentList();pfRefreshFeedbackBadge();}).catch(()=>{});
+  fetch(API+'/api/me').then(r=>r.json()).then(m=>{IS_ADMIN=!!(m&&m.is_admin);IS_VIEWER=!!(m&&m.is_viewer);applyViewerMode();renderAgentList();pfRefreshFeedbackBadge();}).catch(()=>{});
 }
 document.addEventListener('DOMContentLoaded',()=>{
   document.getElementById('tabLogin').onclick=()=>setAuthMode(false);
@@ -677,7 +654,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     }
     const btn=document.getElementById('authSubmit');btn.disabled=true;btn.textContent='확인 중…';
     const body={username,password,remember:document.getElementById('f_remember').checked};
-    if(reg){body.openrouter_key=f_or.value.trim();body.kis_app_key=f_appkey.value.trim();
+    if(reg){body.account_mode=document.getElementById('f_account_mode').value;body.deepseek_api_key=f_ds.value.trim();body.kis_app_key=f_appkey.value.trim();
       body.kis_app_secret=f_appsecret.value.trim();body.kis_account_no=f_acct.value.trim();
       body.kis_base_url=(document.getElementById('f_envmode').value==='mock'
         ?'https://openapivts.koreainvestment.com:29443'
@@ -706,8 +683,12 @@ async function openProfile(){
   {const em=document.getElementById('pf_envmode');if(em){const bu=(m.kis_base_url||'');const cur=(/vts|29443/.test(bu))?'mock':'real';em.value=cur;em.dataset.cur=cur;}}
   document.getElementById('pf_admin').style.display=m.is_admin?'inline-block':'none';
   document.getElementById('pf_admin_sec').style.display=m.is_admin?'block':'none';
+  IS_VIEWER=!!m.is_viewer;applyViewerMode();
+  document.getElementById('pf_directives_sec').style.display=IS_VIEWER?'none':'block';
+  document.getElementById('pf_cost_sec').style.display=IS_VIEWER?'none':'block';
+  document.getElementById('pf_upgrade_hint').style.display=IS_VIEWER?'block':'none';
   if(m.is_admin)loadMembers();
-  loadDirs();
+  if(!IS_VIEWER)loadDirs();
   pfRefreshFeedbackBadge();
   const cm=document.getElementById('pf_costmode');if(cm)cm.value=_lastCostMode;
   // 사장 지시 2026-05-21: 모바일 알림 4종 현재 설정 로드
@@ -730,14 +711,15 @@ async function pfChangePw(){
   document.getElementById('pf_pwmsg').textContent=r.ok?'변경됨':((d&&(d.detail||d.message))||('HTTP '+r.status));}
 async function pfSaveCreds(){
   const g=id=>document.getElementById(id).value,b={};
-  if(g('pf_or'))b.openrouter_key=g('pf_or');if(g('pf_ak'))b.kis_app_key=g('pf_ak');
+  if(IS_VIEWER&&!g('pf_ds')&&!g('pf_ak')&&!g('pf_as')&&!g('pf_acct2')){document.getElementById('pf_cmsg').textContent='업그레이드할 값을 모두 입력하세요.';return;}
+  if(g('pf_ds'))b.deepseek_api_key=g('pf_ds');if(g('pf_ak'))b.kis_app_key=g('pf_ak');
   if(g('pf_as'))b.kis_app_secret=g('pf_as');if(g('pf_acct2'))b.kis_account_no=g('pf_acct2');
   // 거래 환경이 바뀐 경우에만 Base URL 전송 (실전/모의 도메인 매핑) — 안 바꿨으면 불필요한 KIS 재검증 회피
-  {const em=document.getElementById('pf_envmode');if(em&&em.value!==em.dataset.cur){
+  {const em=document.getElementById('pf_envmode');if(em&&(IS_VIEWER||em.value!==em.dataset.cur)){
     b.kis_base_url=(em.value==='mock'?'https://openapivts.koreainvestment.com:29443':'https://openapi.koreainvestment.com:9443');}}
   const r=await fetch(API+'/api/profile/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
   const d=await r.json().catch(()=>({}));
-  document.getElementById('pf_cmsg').textContent=r.ok?'저장됨':((d&&(d.detail||d.message))||('HTTP '+r.status));}
+  document.getElementById('pf_cmsg').textContent=r.ok?(d.upgraded?'업그레이드 완료. 화면을 새로 불러옵니다.':'저장됨'):((d&&(d.detail||d.message))||('HTTP '+r.status));if(r.ok&&d.upgraded)setTimeout(()=>location.reload(),500);}
 async function loadDirs(){
   const d=((await fetch(API+'/api/profile/directives').then(r=>r.json()))||{}).directives||[];
   const box=document.getElementById('pf_dirs');box.textContent='';
@@ -785,36 +767,59 @@ async function pfDeleteAccount(){
   const r=await fetch(API+'/api/profile/delete_account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
   if(r.ok){alert('탈퇴 완료');location.reload();}else{const d=await r.json().catch(()=>({}));alert((d&&(d.detail||d.message))||('HTTP '+r.status));}}
 // ── 프로필 모달 끝 ────────────────────────────────────────────────────────────
-// 사이드바 계층화 — 운용전략실장 산하 팀장 들여쓰기. 설명은 일관된 한국어.
-// 사장 지시 2026-05-20: 산하 팀장(투자/경영/재무관리팀장) 및 코드 자가수정 폐지 — 사이드바에서 제거.
-const agents=[
-  {name:"운용전략실장",role:"총괄 전략·종목 선정 (2패스)",color:"#6366f1",level:0},
-  {name:"전략리서치팀장",role:"거시·매크로 리서치",color:"#06b6d4",level:1},
-  {name:"계량분석팀장",role:"후보 종목 정량 평가",color:"#10b981",level:1},
-  {name:"뉴스분석팀장",role:"뉴스 감성·이벤트 분석",color:"#f59e0b",level:1},
-  {name:"트레이딩팀장",role:"주문 실행·결과 보고",color:"#ef4444",level:1},
-  {name:"리스크관리실장",role:"리스크 게이트·DART 재심",color:"#8b5cf6",level:0},
-  {name:"사후관리실장",role:"보유 종목 매도 판단",color:"#f43f5e",level:0},
-  {name:"펀드기획실장",role:"진입 thesis 설정·거부권(무계획 단타 차단)",color:"#ec4899",level:0},
-  {name:"운용지원실장",role:"진단·프로필 전략 조정",color:"#14b8a6",level:0},
+// 사이드바 3구역(FRONT/MIDDLE/BACK) 재편 — 사장 지시 2026-06-09.
+// FRONT: 리서치·운용전략(주식운용실장 산하 3팀장 + 별도 채권운용실장·원자재운용실장)
+// MIDDLE: 리스크 통제·사후관리   BACK: 실행·인프라 지원(운용지원실장 산하 2팀장)
+const agentSections=[
+  {section:"FRONT", subtitle:"리서치 및 운용전략", agents:[
+    {name:"주식운용실장",role:"총괄 전략·종목 선정 (2패스)",color:"#6366f1",level:0},
+    {name:"글로벌리서치팀장",role:"거시·매크로·4분할 자산배분",color:"#06b6d4",level:1},
+    {name:"계량분석팀장",role:"후보 종목 정량 평가",color:"#10b981",level:1},
+    {name:"마켓센티먼트팀장",role:"뉴스 감성·이벤트 분석",color:"#f59e0b",level:1},
+    {name:"채권운용실장",role:"채권 ETF 매매·금리 전략",color:"#3b82f6",level:0},
+    {name:"원자재운용실장",role:"원자재 ETF 매매·실물자산",color:"#d97706",level:0},
+  ]},
+  {section:"MIDDLE", subtitle:"리스크 통제 및 사후관리", agents:[
+    {name:"리스크관리실장",role:"리스크 게이트·DART 재심",color:"#8b5cf6",level:0},
+    {name:"사후관리실장",role:"보유 종목 매도 판단",color:"#f43f5e",level:0},
+  ]},
+  {section:"BACK", subtitle:"실행 및 인프라 지원", agents:[
+    {name:"운용지원실장",role:"진단·프로필 전략 조정",color:"#14b8a6",level:0},
+    {name:"프롭트레이딩팀장",role:"주문 실행·결과 보고",color:"#ef4444",level:1},
+    {name:"포트폴리오기획팀장",role:"진입 thesis 설정·계획 관리",color:"#ec4899",level:1},
+  ]},
 ];
+// 평탄화 — @멘션 자동완성·필터 등 기존 코드가 쓰는 단일 리스트.
+const agents=agentSections.flatMap(s=>s.agents);
 const al=document.getElementById('agentList');
 // 사장 피드백 2026-05-18: 운용지원 계열은 ADMIN 에게만 렌더. IS_ADMIN 갱신 시 재호출.
 function renderAgentList(){
   al.replaceChildren();   // 안전한 DOM 비우기 (innerHTML 미사용)
-  agents.filter(a=>IS_ADMIN||!OPS_AGENT_NAMES.has(a.name)).forEach(a=>{
-    const li=document.createElement('li');
-    li.className='ai'+(a.level?' sub':'');
-    if(a.level) li.style.paddingLeft = (8 + a.level*14) + 'px';
-    const dot=document.createElement('span');dot.className='ad';dot.style.background=a.color;
-    const info=document.createElement('div');
-    const nm=document.createElement('div');nm.className='an';
-    nm.textContent = (a.level ? '└ ' : '') + a.name;
-    const rl=document.createElement('div');rl.className='ar';rl.textContent=a.role;
-    info.appendChild(nm);info.appendChild(rl);
-    li.appendChild(dot);li.appendChild(info);
-    li.onclick=()=>{document.getElementById('ceoInput').value=`@${a.name} `;document.getElementById('ceoInput').focus()};
-    al.appendChild(li);
+  agentSections.forEach(sec=>{
+    const visible=sec.agents.filter(a=>IS_ADMIN||!OPS_AGENT_NAMES.has(a.name));
+    if(!visible.length) return;   // 필터로 비면 헤더도 숨김
+    // ── 구역 헤더 (FRONT / MIDDLE / BACK) ──
+    const hdr=document.createElement('li');
+    hdr.style.listStyle='none';hdr.style.margin='12px 0 4px';hdr.style.padding='0 6px';
+    const ht=document.createElement('div');ht.textContent=sec.section;
+    ht.style.fontSize='10px';ht.style.fontWeight='700';ht.style.letterSpacing='1.5px';ht.style.color='#8a97ad';
+    const hs=document.createElement('div');hs.textContent=sec.subtitle;
+    hs.style.fontSize='10px';hs.style.color='#5d6a7e';hs.style.marginTop='1px';
+    hdr.appendChild(ht);hdr.appendChild(hs);al.appendChild(hdr);
+    visible.forEach(a=>{
+      const li=document.createElement('li');
+      li.className='ai'+(a.level?' sub':'');
+      if(a.level) li.style.paddingLeft = (8 + a.level*14) + 'px';
+      const dot=document.createElement('span');dot.className='ad';dot.style.background=a.color;
+      const info=document.createElement('div');
+      const nm=document.createElement('div');nm.className='an';
+      nm.textContent = (a.level ? '└ ' : '') + a.name;
+      const rl=document.createElement('div');rl.className='ar';rl.textContent=a.role;
+      info.appendChild(nm);info.appendChild(rl);
+      li.appendChild(dot);li.appendChild(info);
+      li.onclick=()=>{document.getElementById('ceoInput').value=`@${a.name} `;document.getElementById('ceoInput').focus()};
+      al.appendChild(li);
+    });
   });
 }
 renderAgentList();  // 초기: default-deny(운용지원 계열 숨김) — startApp 의 /api/me 후 갱신
@@ -842,7 +847,8 @@ function handleEvent(m,replay){
   if(m.type==='feedback_reply'){pfRefreshFeedbackBadge();return;}
   if(m.type==='feedback_new'){const dot=document.getElementById('adminTabDot');if(dot&&IS_ADMIN)dot.style.display='inline';const ap=document.getElementById('tab-admin');if(IS_ADMIN&&ap&&ap.classList.contains('active'))loadAdminFeedback();return;}
   const _t=m.ts; // 사장 지시 2026-05-14: 모든 메시지에 타임스탬프 우하단 표시
-  if(m.type==='status'){updateBadge(m.state);if(m.state!=='OFF_HOURS')addLog('system',`[${m.state}] ${m.message||''}`,null,null,_t)}
+  // 사장 지시 2026-06-09: 무정보 상태 하트비트('감시 중'·빈 메시지)는 배지만 갱신하고 로그엔 남기지 않는다(노이즈 제거).
+  if(m.type==='status'){updateBadge(m.state);const _sm=(m.message||'').trim();if(m.state!=='OFF_HOURS'&&_sm&&_sm!=='감시 중')addLog('system',`[${m.state}] ${_sm}`,null,null,_t)}
   else if(m.type==='news'){
     addLog('system',`📰 ${m.message||''}`,null,null,_t);
     // 사장 피드백 2026-05-15: 뉴스 피드를 별도 탭(#nfMain)으로 이동, KR/US/BOTH 분류 가능하면 표시.
@@ -851,21 +857,14 @@ function handleEvent(m,replay){
     const _normT=s=>String(s||'').replace(/^\s*[\[\(【][^\]\)】]{1,20}[\]\)】]\s*/,'').replace(/[\s\W_]+/g,'').toLowerCase();
     const _seen=new Set(Array.from(nf.querySelectorAll('[data-news-title]')).map(e=>_normT(e.dataset.newsTitle)));
     const _crawlT=m.ts?String(m.ts).replace('T',' ').slice(5,19):new Date().toLocaleTimeString('ko-KR');
-    // articles가 문자열 배열일 수도, 객체({title,market}) 배열일 수도 — 둘 다 지원.
+    // 사장 지시 2026-06-04: 시장 구분 폐지 — 제목+크롤시각만 표시.
     (m.articles||[]).forEach(a=>{
       const title = (typeof a === 'string') ? a : (a && a.title) || '';
-      const market = (typeof a === 'object' && a && a.market) ? String(a.market).toUpperCase() : 'BOTH';
       const n=_normT(title); if(!n||_seen.has(n))return; _seen.add(n);
-      const d=document.createElement('div'); d.className='ni'; d.dataset.market=market; d.dataset.newsTitle=title;
-      d.style.borderLeftColor = market==='KR' ? '#10b981' : market==='US' ? '#ef4444' : '#06b6d4';
-      const badge = document.createElement('span');
-      badge.textContent = market==='KR' ? '🇰🇷 KR ' : market==='US' ? '🇺🇸 US ' : '🌐 공통 ';
-      badge.style.cssText='font-size:9px;color:var(--dim);margin-right:4px';
+      const d=document.createElement('div'); d.className='ni'; d.dataset.newsTitle=title;
       const tt=_newsTitleEl(title,(typeof a==='object'&&a)?a.link:'');
       const tm=document.createElement('span'); tm.className='t'; tm.textContent=' 크롤 '+_crawlT;
-      d.appendChild(badge); d.appendChild(tt); d.appendChild(document.createElement('br')); d.appendChild(tm);
-      // 현재 필터에 따라 표시/숨김
-      if(_newsFilter !== 'all' && market !== _newsFilter) d.style.display='none';
+      d.appendChild(tt); d.appendChild(document.createElement('br')); d.appendChild(tm);
       nf.prepend(d);
     });
     while(nf.children.length>200) nf.removeChild(nf.lastChild);
@@ -1069,6 +1068,7 @@ function addLog(type,text,name,color,ts){const log=document.getElementById('chat
   const tsEl=document.createElement('span');tsEl.className='mts';tsEl.textContent=_formatKstTs(ts);d.appendChild(tsEl);
   log.appendChild(d);log.scrollTop=log.scrollHeight;if(log.children.length>300)log.removeChild(log.firstChild)}
 async function clearLog(){
+  if(IS_VIEWER)return;
   const log=document.getElementById('chatLog');log.replaceChildren();
   const d=document.createElement('div');d.className='cm system';d.textContent='로그 초기화 중...';log.appendChild(d);
   // 사장 피드백 2026-05-15: 뉴스 피드는 별도 탭(#nfMain)으로 이전. 사이드바 #nf는 더 이상 없음.
@@ -1077,24 +1077,11 @@ async function clearLog(){
   try{await fetch(API+'/api/events/clear',{method:'POST'});d.textContent='로그 초기화됨 (서버 누적 로그 삭제)';}
   catch(e){d.textContent='⚠️ 서버 로그 초기화 실패: '+e.message;}}
 
-// 사장 피드백 2026-05-15: 뉴스 탭 필터 (전체/KR/US/공통).
-let _newsFilter='all';
-function setNewsFilter(f){
-  _newsFilter=f;
-  document.querySelectorAll('[data-newsfilter]').forEach(b=>b.classList.toggle('active',b.dataset.newsfilter===f));
-  const nf=document.getElementById('nfMain');if(!nf)return;
-  Array.from(nf.querySelectorAll('.ni')).forEach(d=>{
-    const mk=d.dataset.market||'BOTH';
-    d.style.display=(f==='all'||mk===f)?'':'none';
-  });
-  _updateNewsCount();
-}
+// 사장 지시 2026-06-04: KR/US/공통 시장 필터 폐지 — 단일 피드.
 function _updateNewsCount(){
   const nf=document.getElementById('nfMain');const meta=document.getElementById('newsCount');
   if(!nf||!meta)return;
-  const items=Array.from(nf.querySelectorAll('.ni'));
-  const visible=items.filter(d=>d.style.display!=='none').length;
-  meta.textContent=visible+'건';
+  meta.textContent=nf.querySelectorAll('.ni').length+'건';
 }
 // ④ 모바일 대시보드 펼치기/접기 (사장 피드백 2026-05-18)
 function toggleDashMore(){
@@ -1105,6 +1092,7 @@ function toggleDashMore(){
   if(ar)ar.textContent=on?'▴':'▾';
 }
 async function clearNewsLog(){
+  if(IS_VIEWER)return;
   if(!confirm('뉴스 로그를 비웁니다. 최근 20건은 유지됩니다. 계속할까요?'))return;
   try{
     await fetch(API+'/api/news/clear',{method:'POST'});
@@ -1139,27 +1127,23 @@ async function loadNewsTab(){
     }
     arts.forEach(a=>{
       const title=(typeof a==='string')?a:(a&&(a.title||a.body||''))||'';
-      const market=(typeof a==='object'&&a&&a.market)?String(a.market).toUpperCase():'BOTH';
       if(!title)return;
-      const div=document.createElement('div');div.className='ni';div.dataset.market=market;div.dataset.newsTitle=title;
-      div.style.borderLeftColor=market==='KR'?'#10b981':market==='US'?'#ef4444':'#06b6d4';
-      const badge=document.createElement('span');
-      badge.textContent=market==='KR'?'🇰🇷 KR ':market==='US'?'🇺🇸 US ':'🌐 공통 ';
-      badge.style.cssText='font-size:9px;color:var(--dim);margin-right:4px';
+      const div=document.createElement('div');div.className='ni';div.dataset.newsTitle=title;
       const tt=_newsTitleEl(title,(a&&a.link)||'');
       const tm=document.createElement('span');tm.className='t';tm.textContent=' '+(a.time||a.published||'');
-      div.appendChild(badge);div.appendChild(tt);div.appendChild(document.createElement('br'));div.appendChild(tm);
-      if(_newsFilter!=='all'&&market!==_newsFilter)div.style.display='none';
+      div.appendChild(tt);div.appendChild(document.createElement('br'));div.appendChild(tm);
       nf.appendChild(div);
     });
     _updateNewsCount();
   }catch(e){}
 }
 
-async function startMonitor(){document.getElementById('startBtn').disabled=true;document.getElementById('stopBtn').disabled=false;
-  try{const r=await fetch(API+'/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({directive:null})});const d=await r.json();addLog('system',d.message)}catch(e){addLog('system','❌ '+e.message)}}
-async function stopMonitor(){document.getElementById('stopBtn').disabled=true;document.getElementById('startBtn').disabled=false;
-  try{const r=await fetch(API+'/api/stop',{method:'POST'});const d=await r.json();addLog('system',d.message)}catch(e){addLog('system','❌ '+e.message)}}
+async function startMonitor(){if(IS_VIEWER)return;const sb=document.getElementById('startBtn'),tb=document.getElementById('stopBtn');sb.disabled=true;
+  try{const r=await fetch(API+'/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({directive:null})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||d.message||('HTTP '+r.status));tb.disabled=false;addLog('system',d.message||'감시 시작됨')}
+  catch(e){sb.disabled=false;tb.disabled=true;addLog('system','❌ 실행 실패: '+e.message)}}
+async function stopMonitor(){if(IS_VIEWER)return;const sb=document.getElementById('startBtn'),tb=document.getElementById('stopBtn');tb.disabled=true;
+  try{const r=await fetch(API+'/api/stop',{method:'POST'});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||d.message||('HTTP '+r.status));sb.disabled=false;addLog('system',d.message||'중지됨')}
+  catch(e){tb.disabled=false;sb.disabled=true;addLog('system','❌ 중지 실패: '+e.message)}}
 
 // 사장 지시 2026-05-14: 응답이 _broadcast로 이미 들어오므로 API response 별도 addLog 제거 (중복 출력 방지)
 async function sendCeo(){const inp=document.getElementById('ceoInput');const msg=inp.value.trim();if(!msg)return;
@@ -1181,7 +1165,7 @@ async function refreshStatus(){try{const r=await fetch(API+'/api/status');const 
   document.getElementById('sTrades').textContent=d.trades_executed||0;
   document.getElementById('sNews').textContent=d.news_monitor?.total_articles||0;
   {const s=d.next_cycle_sec;document.getElementById('sNextCycle').textContent=(s==null?'-':(s<=0?'대기중':Math.floor(s/60)+'분'+(s%60>0?' '+(s%60)+'초':'')));}
-  document.getElementById('sStrat').textContent=(d.strategy?.name||'-');
+  document.getElementById('sStrat').textContent=(d.strategy?.label||d.strategy?.name||'-');
   document.getElementById('sTrading').textContent=d.is_trading?'🟢 장중':'⚪ 장외';
   // 사장 피드백 2026-05-15: 최근 사이클 API 비용 (USD 추정) — STOPPED 배지 왼쪽
   // 사장 지시 2026-05-21: 비용 표시를 프로필 선택 모드(시간/일/월/총누적)로
@@ -1192,7 +1176,7 @@ async function refreshStatus(){try{const r=await fetch(API+'/api/status');const 
     const SUF={h:'/h',d:'/일',m:'/월',total:' 누적'}, LBL={h:'최근 1시간',d:'오늘',m:'이번 달',total:'총 누적'};
     const _mob = window.matchMedia('(max-width:820px)').matches;
     apiCostEl.textContent = _mob ? `💵 $${c.toFixed(3)}${SUF[mode]||''}` : `💵 $${c.toFixed(3)}${SUF[mode]||''} (${n}콜)`;
-    apiCostEl.title = `${LBL[mode]||''} API 비용: $${c.toFixed(4)} / 호출 ${n}회 (OpenRouter usage 기반 추정) — 프로필에서 표시 단위 변경 가능 · 클릭 시 OpenRouter 크레딧 페이지`;
+    apiCostEl.title = `${LBL[mode]||''} DeepSeek API 추정 비용: $${c.toFixed(4)} / 호출 ${n}회`;
     const cmSel=document.getElementById('pf_costmode');
     if(cmSel && document.getElementById('profileOv').style.display!=='flex') cmSel.value=mode;
   }
@@ -1208,8 +1192,11 @@ async function refreshStatus(){try{const r=await fetch(API+'/api/status');const 
   }
   if(d.current_state)updateBadge(d.current_state); // keep badge in sync even when no WS status event arrives (e.g. during cooldown)
   // Sync start/stop button state with server on reconnect (bug fix item 9)
-  if(d.is_running){document.getElementById('startBtn').disabled=true;document.getElementById('stopBtn').disabled=false}
-  else if(d.current_state==='STOPPED'||d.current_state==='IDLE'){document.getElementById('startBtn').disabled=false;document.getElementById('stopBtn').disabled=true}}catch(e){}}
+  // 사장 보고 2026-06-10 회귀수정: is_running(서버 권위값 = 이 유저의 task 가 살아있나)을 단일 기준으로.
+  // 기존엔 '중지'를 current_state==STOPPED/IDLE 일 때만 반영해, 즉시중지 cancel 로 current_state 가
+  // stale(MONITORING 등)로 남으면 어느 분기도 안 타 버튼이 stale 고착됐다. is_running 만 보면 항상 정확.
+  if(!IS_VIEWER){const _run=!!d.is_running;document.getElementById('startBtn').disabled=_run;document.getElementById('stopBtn').disabled=!_run;}
+  applyViewerMode();}catch(e){}}
 
 // 운용지원실장 피드백 on/off 토글 (프로필별 — 서버가 세션 유저 본인 계정에 반영)
 async function toggleOpsFeedback(){
@@ -1233,7 +1220,7 @@ function switchTab(name){
   if(name==='pnl'){refreshEquity();refreshPerformance()}      // 수익률: KPI + 자산곡선
   if(name==='hold'){refreshBalance();refreshTrades()}         // 보유종목: 잔고 + 거래내역
   if(name==='news') loadNewsTab();
-  if(name==='strat')loadStrategy();
+  if(name==='strat'){loadStrategy();loadPolicyApprovals();}
   if(name==='admin')loadAdminTab()}
 
 // ── ADMIN 탭 (전역 설정 + 회원관리) — 사장 지시 2026-05-22 ──
@@ -1469,26 +1456,27 @@ function _setKpi(valId,subId,pnl,pct){
 function renderKpis(k){
   k=k||{};
   if(k.has_equity){
-    _setKpi('kCum','kCumP',k.cumulative_pnl,k.cumulative_pct);
-    _setKpi('kDay','kDayP',k.today_pnl,k.today_pct);
-    _setKpi('kWeek','kWeekP',k.week_pnl,k.week_pct);
-    _setKpi('kMonth','kMonthP',k.month_pnl,k.month_pct);
+    // 사장 지시 2026-06-09: 상단 4칸 = 평가금액(자산곡선) 변동액/변동률 — 미실현 포함 mark-to-market.
+    _setKpi('kEqAll','kEqAllP',k.eq_all_chg,k.eq_all_pct);
+    _setKpi('kEqDay','kEqDayP',k.eq_today_chg,k.eq_today_pct);
+    _setKpi('kEqWeek','kEqWeekP',k.eq_week_chg,k.eq_week_pct);
+    _setKpi('kEqMonth','kEqMonthP',k.eq_month_chg,k.eq_month_pct);
     const md=document.getElementById('kMdd');if(md){md.textContent=(k.mdd_pct==null?'-':k.mdd_pct.toFixed(2)+'%');md.className='kv'+(k.mdd_pct<0?' neg':'');}
   }
+  // 사장 지시 2026-06-09: '누적 수익'(체결 실현손익·비용반영) — 기존 '평균 보유일' 자리로 이동.
+  _setKpi('kCumR','kCumRP',k.cumulative_pnl,k.cumulative_pct);
   // 사장 지시 2026-05-28: 자산곡선이 비어도(백업 도구 wipe 등) '현재 평가액' 은 항상 표시 — 서버가 broker 폴백 값을 박아준다.
   // 사장 결정 2026-06-01: 실거래 '현재 평가액' = KIS 통합총자산(HTS 일치, 잔고폴링이 채운 _kisTotal 우선).
   // 모의는 display_total_asset 이 없어 곡선식 current(해외평가 포함 총평가) 폴백. (모의도 잔고 표시)
   const _cur=_kisTotal||k.current;
   const cu=document.getElementById('kCur');if(cu)cu.textContent=(_cur==null?'-':Math.round(_cur).toLocaleString()+'원');
-  const win=document.getElementById('kWin'),winSub=document.getElementById('kWinSub'),hold=document.getElementById('kHold');
+  const win=document.getElementById('kWin'),winSub=document.getElementById('kWinSub');
   if(k.has_trades){
     if(win){win.textContent=k.win_rate_pct.toFixed(0)+'%';win.className='kv'+(k.win_rate_pct>=50?' pos':' neg');}
     if(winSub)winSub.textContent=`${k.win_count}승 / ${k.sell_count}매도`;
-    if(hold)hold.textContent=(k.avg_hold_days==null?'-':k.avg_hold_days.toFixed(1)+'일');
   } else {
     if(win){win.textContent='-';win.className='kv';}
     if(winSub)winSub.textContent='매도 내역 없음';
-    if(hold)hold.textContent='-';
   }
 }
 
@@ -1505,7 +1493,7 @@ function _kstTime(ts){if(!ts)return '';const s=String(ts);
   const m=s.match(/^\d{4}-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
   return m ? `${m[1]}-${m[2]} ${m[3]}:${m[4]} KST` : s.slice(5,16);
 }
-function clearTrades(){if(!confirm('전체 거래 내역만 비웁니다 (시스템 로그는 유지). 계속하시겠습니까?'))return;
+function clearTrades(){if(IS_VIEWER)return;if(!confirm('전체 거래 내역만 비웁니다 (시스템 로그는 유지). 계속하시겠습니까?'))return;
   fetch(API+'/api/trades/clear',{method:'POST'}).then(r=>r.json()).then(d=>{addLog('system',d.message||'거래 내역 초기화');refreshTrades()}).catch(e=>addLog('system','❌ 초기화 실패: '+e.message))}
 // 사장 피드백 2026-05-15 (5차): 거래내역 클릭 펼침 — 추정 가격·FIFO 매칭·실현 손익.
 function _fmtMoney(v, cur){
@@ -1603,79 +1591,34 @@ function refreshTrades(){fetch(API+'/api/trades?limit=400').then(r=>r.json()).th
   })}).catch(()=>{})}
 
 // ── strategy tab (사장 지시 2026-05-14: 한국어 라벨 + 커스터마이즈 박스) ──
-let _stratData=null;  // cache of last /api/strategy response (meta, presets, active)
+let _stratData=null;  // cache of last /api/strategy response (meta, active)
+let _fieldsBuilt=false;  // 입력칸은 최초 1회만 빌드(폴링이 편집값 덮어쓰기 방지)
 
-// 커스터마이즈 카드 펼침/접기 (사장 지시 2026-05-14)
-function toggleCustomCard(){
-  const c=document.getElementById('customCard');
-  if(!c)return;
-  c.classList.toggle('collapsed');
-}
-
-// 단일 파라미터의 한 줄 요약 (라벨 = 값)
-function _paramOneLine(key,val,meta){
-  const m=meta&&meta[key]||{}; const t=m.type||'int';
-  const lbl=m.label||key;
-  let disp=val;
-  if(t==='pct_ratio') disp=(val==null?'?':(val*100).toFixed(0)+'%');
-  else if(t==='pct_raw') disp=(val==null?'?':val+'%');
-  else if(t==='multiplier') disp=(val==null?'?':val+'×');
-  else if(t==='bool') disp=(val?'ON':'OFF');
-  else disp=(val==null?'?':String(val));
-  return `${lbl}: ${disp}`;
-}
-// 프리셋 한 줄 요약 — 핵심 6개만
-function _ppHtml(p,meta){
-  const k=['PER_ORDER_BUDGET_RATIO','CONSERVATIVE_STOCK_RATIO','MAX_TRADES_PER_CYCLE','TAKE_PROFIT_PCT','STOP_LOSS_PCT','ALLOW_US_STOCKS'];
-  return k.map(x=>_paramOneLine(x,p[x],meta)).join(' · ');
-}
-// 사장 지시 2026-05-21: '현재 적용' 패널은 핵심 6개가 아니라 '모든' 상세설정을 보여준다
-// (운용지원실장이 파라미터를 갱신할 때마다 active.params 가 효과적 값으로 바뀌므로 전체가 자동 반영).
-function _ppFullHtml(p,meta,order){
-  const keys=(order&&order.length)?order:Object.keys(p||{});
-  return keys.filter(k=>meta[k]).map(k=>_paramOneLine(k,(p||{})[k],meta)).join(' · ');
-}
-
-function loadStrategy(){fetch(API+'/api/strategy').then(r=>r.json()).then(d=>{
+// ── 전략 탭: 현재 적용 설정 로드 (사장 지시 2026-06-09: 프리셋 폐지) ──
+function loadStrategy(){fetch(API+'/api/strategy').then(async r=>{
+  const d=await r.json();if(!r.ok)throw new Error(d.detail||d.error||('HTTP '+r.status));return d;
+}).then(d=>{
   _stratData=d; const meta=d.key_meta||{};
-  const a=d.active||{};const now=document.getElementById('stratNow');now.replaceChildren();
-  const nm=document.createElement('div');nm.className='nm';nm.textContent=`▶ 현재 적용: ${a.label||a.name||'-'}`;now.appendChild(nm);
-  const sinceMeta=document.createElement('div');sinceMeta.style.cssText='font-size:10px;color:var(--dim);margin-top:4px';
-  // 사장 지시 2026-05-21: 적용 시각 = 운용지원실장이 마지막으로 파라미터를 갱신한 시각(ops_since).
-  // 운용지원 조정이 없었으면 전략 선택 시각(since)으로 폴백.
+  const a=d.active||{};
   const _since=(a.ops_since||a.since||'').replace('T',' ').slice(0,19);
-  sinceMeta.textContent=`적용 시각: ${_since||'-'}${a.ops_since?' · 운용지원실장 조정 반영':''}`;now.appendChild(sinceMeta);
-  const pp=document.createElement('div');pp.className='pp';pp.style.marginTop='8px';pp.textContent=_ppFullHtml(a.params||{},meta,d.key_order||[]);now.appendChild(pp);
-  // presets — 빌트인 vs 사용자 구분
-  const pl=document.getElementById('presetList');pl.replaceChildren();
-  (d.presets||[]).forEach(p=>{
-    const row=document.createElement('div');
-    row.className='preset'+(p.active?' active':'')+(p.source==='user'?' user-preset':'');
-    const info=document.createElement('div');info.className='pinfo';
-    const b=document.createElement('b');b.textContent=p.label||p.name;info.appendChild(b);
-    const sb=document.createElement('span');sb.className='src-badge'+(p.source==='user'?' user':'');
-    sb.textContent=p.source==='user'?'사용자':'빌트인';b.appendChild(sb);
-    const pp2=document.createElement('div');pp2.className='pp';pp2.textContent=_ppHtml(p.params||{},meta);info.appendChild(pp2);
-    const acts=document.createElement('div');acts.className='pactions';
-    const btn=document.createElement('button');btn.className='btn-apply';btn.textContent=p.active?'적용됨':'적용';btn.disabled=!!p.active;
-    btn.onclick=()=>applyStrategy(p.name);
-    acts.appendChild(btn);
-    if(p.source==='user'){
-      const del=document.createElement('button');del.className='btn-apply';del.style.background='#dc2626';del.textContent='삭제';
-      del.onclick=()=>deleteUserPreset(p.name,p.label);acts.appendChild(del);
-    }
-    const fill=document.createElement('button');fill.className='btn-apply';fill.style.background='var(--s2)';fill.style.border='1px solid var(--border)';
-    fill.textContent='편집';fill.title='이 프리셋 값을 커스터마이즈 박스에 채워넣기';
-    fill.onclick=()=>{_fillCustomFromParams(p.params||{});document.getElementById('customMsg').textContent=`📥 "${p.label||p.name}" 값으로 채워졌습니다. 수정 후 새 이름으로 저장하세요.`;};
-    acts.appendChild(fill);
-    row.appendChild(info);row.appendChild(acts);pl.appendChild(row);
-  });
-  // 커스터마이즈 박스 빌드
-  _buildCustomFields(d.key_order||[],meta,(a.params||{}));
-}).catch(e=>{document.getElementById('customMsg').textContent='⚠️ 전략 로드 실패: '+e.message})}
+  const sm=document.getElementById('stratMeta');
+  if(sm) sm.textContent=`적용 시각: ${_since||'-'}${a.ops_since?' · 운용지원실장 조정 반영':''}`;
+  // 입력칸은 최초 1회만 빌드 — 60초 폴링이 편집 중인 값을 덮어쓰지 않게.
+  // 최신 적용값(운용지원 조정 포함)은 '↺ 되돌리기'로 다시 불러올 수 있다.
+  if(!_fieldsBuilt){
+    _buildCustomFields(d.key_order||[],meta,(a.params||{}));
+    _fieldsBuilt=true;
+  }
+}).catch(e=>{
+  _fieldsBuilt=false;
+  const loader=document.getElementById('customLoader');
+  if(loader){loader.style.display='block';loader.textContent='⚠️ 전략 파라미터를 표시하지 못했습니다. 잠시 후 다시 시도합니다.';}
+  document.getElementById('customMsg').textContent='전략 로드 실패: '+e.message;
+})}
 
 function _buildCustomFields(keyOrder,meta,activeParams){
   const cf=document.getElementById('customFields');cf.replaceChildren();
+  if(!keyOrder.length)throw new Error('전략 파라미터 목록이 비어 있습니다.');
   // 그룹별로 묶기
   const groups={};
   keyOrder.forEach(k=>{const m=meta[k]||{};const g=m.group||'기타';(groups[g]=groups[g]||[]).push(k)});
@@ -1697,6 +1640,14 @@ function _buildCustomFields(keyOrder,meta,activeParams){
         const cb=document.createElement('input');cb.type='checkbox';cb.dataset.key=k;cb.dataset.type=t;cb.checked=!!v;
         lab.appendChild(cb);const span=document.createElement('span');span.textContent='ON / OFF';lab.appendChild(span);
         inp.appendChild(lab);
+      }else if(t==='choice'){
+        const sel=document.createElement('select');sel.dataset.key=k;sel.dataset.type=t;
+        sel.style.cssText='width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:var(--s2);color:var(--txt);font-size:12px';
+        (m.choices||[]).forEach(choice=>{
+          const opt=document.createElement('option');opt.value=String(choice);opt.textContent=String(choice);
+          if(String(v)===String(choice))opt.selected=true;sel.appendChild(opt);
+        });
+        inp.appendChild(sel);
       }else{
         const i=document.createElement('input');i.type='number';i.dataset.key=k;i.dataset.type=t;
         i.min=m.min!=null?m.min:0;i.max=m.max!=null?m.max:9999;i.step=m.step||1;
@@ -1711,23 +1662,25 @@ function _buildCustomFields(keyOrder,meta,activeParams){
     cf.appendChild(wrap);
   });
   document.getElementById('customLoader').style.display='none';
-  cf.style.display='block';document.getElementById('customActions').style.display='flex';
+  cf.style.display='block';document.getElementById('customActions').style.display=IS_VIEWER?'none':'flex';applyViewerMode();
 }
 
 function _fillCustomFromParams(params){
   const cf=document.getElementById('customFields');
-  cf.querySelectorAll('input[data-key]').forEach(el=>{
+  cf.querySelectorAll('input[data-key],select[data-key]').forEach(el=>{
     const k=el.dataset.key,t=el.dataset.type;const v=params[k];
     if(t==='bool'){el.checked=!!v;}
+    else if(t==='choice'){el.value=v==null?'':String(v);}
     else{let dv=v;if(t==='pct_ratio'&&typeof v==='number')dv=+(v*100).toFixed(4);el.value=dv==null||isNaN(dv)?'':dv;}
   });
 }
 
 function _readCustomParams(){
   const out={};
-  document.querySelectorAll('#customFields input[data-key]').forEach(el=>{
+  document.querySelectorAll('#customFields input[data-key],#customFields select[data-key]').forEach(el=>{
     const k=el.dataset.key,t=el.dataset.type;
     if(t==='bool'){out[k]=!!el.checked;return}
+    if(t==='choice'){out[k]=el.value;return}
     const raw=el.value;if(raw===''||raw==null)return;  // skip empty — keep default
     let n=parseFloat(raw);if(isNaN(n))return;
     if(t==='pct_ratio')n=n/100;  // 표시 10 → 저장 0.10
@@ -1744,41 +1697,16 @@ function loadCustomFromActive(){
 }
 
 function applyCustom(){
+  if(IS_VIEWER)return;
   const params=_readCustomParams();
   document.getElementById('customMsg').textContent='⏳ 적용 중...';
-  fetch(API+'/api/strategy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'custom',params})})
+  fetch(API+'/api/strategy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({params})})
     .then(r=>r.json()).then(d=>{
-      document.getElementById('customMsg').textContent='✅ 즉시 적용됨 (사용자 지정 — 저장은 안 됨)';
-      loadStrategy();refreshStatus();addLog('system','⚙️ 전략 변경 → 사용자 지정 (즉시 적용)');
+      document.getElementById('customMsg').textContent='✅ 변경값 즉시 적용됨';
+      loadStrategy();refreshStatus();addLog('system','⚙️ 전략 설정 변경 (즉시 적용)');
     }).catch(e=>{document.getElementById('customMsg').textContent='❌ 적용 실패: '+e.message});
 }
 
-function saveCustomPreset(){
-  const name=(document.getElementById('presetSaveName').value||'').trim();
-  const label=(document.getElementById('presetSaveLabel').value||'').trim()||name;
-  if(!name){document.getElementById('customMsg').textContent='⚠️ 저장하려면 프리셋 이름이 필요합니다';return}
-  const params=_readCustomParams();
-  document.getElementById('customMsg').textContent='⏳ 저장 중...';
-  fetch(API+'/api/strategy/preset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,label,params})})
-    .then(r=>r.json().then(d=>({ok:r.ok,d}))).then(({ok,d})=>{
-      if(!ok){document.getElementById('customMsg').textContent='❌ 저장 실패: '+(d.detail||d.message||'');return}
-      document.getElementById('customMsg').textContent=`💾 프리셋 저장됨: ${label||name}`;
-      document.getElementById('presetSaveName').value='';document.getElementById('presetSaveLabel').value='';
-      loadStrategy();addLog('system',`⚙️ 사용자 프리셋 저장 — ${label||name}`);
-    }).catch(e=>{document.getElementById('customMsg').textContent='❌ 저장 실패: '+e.message});
-}
-
-function deleteUserPreset(name,label){
-  if(!confirm(`사용자 프리셋 "${label||name}" 을(를) 삭제할까요?`))return;
-  fetch(API+'/api/strategy/preset/'+encodeURIComponent(name),{method:'DELETE'})
-    .then(r=>r.json().then(d=>({ok:r.ok,d}))).then(({ok,d})=>{
-      if(!ok){addLog('system','❌ 삭제 실패: '+(d.detail||d.message||''));return}
-      loadStrategy();refreshStatus();addLog('system',`🗑 사용자 프리셋 삭제 — ${label||name}`);
-    }).catch(e=>addLog('system','❌ 삭제 실패: '+e.message));
-}
-
-function applyStrategy(name){fetch(API+'/api/strategy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})
-  .then(r=>r.json()).then(()=>{loadStrategy();refreshStatus();addLog('system',`⚙️ 전략 변경 → ${name}`)}).catch(e=>addLog('system','❌ 전략 변경 실패: '+e.message))}
 async function refreshBalance(force){
   // 한국·미국 거래시간이 아니면 잔고가 변하지 않으니 자동 폴링 스킵 (force=true이면 무시하고 즉시 갱신)
   if(_isOffHours && !force){
@@ -1823,6 +1751,33 @@ setInterval(refreshBalance,600000);refreshBalance(true);
 // 체결 재확인은 장외에도 가능하므로 거래 내역만 계속 갱신한다. 수동 토글/새로고침은 영향 없음.
 setInterval(()=>{refreshTrades();if(_isTrading){refreshEquity();refreshPerformance();}},30000);refreshEquity();refreshTrades();refreshPerformance();
 setInterval(loadStrategy,60000);loadStrategy();
+// 거버넌스 2026-06-05: 토요일 ops 가 제안한 정책 플래그 변경 — 사장 승인 대기 로드/처리
+async function loadPolicyApprovals(){
+  try{
+    const r=await fetch(API+'/api/policy_changes/pending',{credentials:'same-origin'});
+    const d=await r.json();const items=(d&&d.pending)||[];
+    const box=document.getElementById('policy-approval-box');
+    const list=document.getElementById('policy-approval-list');
+    if(!box||!list)return;
+    if(!items.length){box.style.display='none';list.innerHTML='';return;}
+    box.style.display='block';
+    list.innerHTML=items.map(it=>
+      `<div style="margin:8px 0;padding:8px;background:var(--s2);border-radius:6px">
+        <b>${it.key}</b>: ${String(it.current_value)} → <b style="color:var(--grn)">${String(it.proposed_value)}</b>
+        <div style="font-size:12px;opacity:.8;margin:4px 0">${(it.rationale||'').slice(0,300)}</div>
+        <button onclick="decidePolicy('${it.key}',true)" style="margin-right:6px">승인</button>
+        <button onclick="decidePolicy('${it.key}',false)">거부</button>
+      </div>`).join('');
+  }catch(e){}
+}
+async function decidePolicy(key,ok){
+  const url=API+(ok?'/api/policy_changes/approve':'/api/policy_changes/reject');
+  await fetch(url,{method:'POST',credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});
+  addLog('system',(ok?'✅ 정책 변경 승인 — ':'🚫 정책 변경 거부 — ')+key);
+  loadPolicyApprovals();
+}
+setInterval(loadPolicyApprovals,60000);loadPolicyApprovals();
 window.addEventListener('resize',refreshEquity);
 </script>
 </body>

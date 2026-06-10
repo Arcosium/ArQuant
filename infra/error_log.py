@@ -1,7 +1,7 @@
 """
 ArQuant — 상세 에러 로깅 (사장 지시 2026-05-19)
 
-문제: 로그에 '[운용전략실장] 예외:' 처럼 원인 불명 에러가 찍혀
+문제: 로그에 '[주식운용실장] 예외:' 처럼 원인 불명 에러가 찍혀
 운용지원실장이 어디서·왜 났는지 진단할 수 없었다 (TimeoutError 등은 str(e)='').
 
 해결: 시스템 어디서든 에러가 나면 record_error()로
@@ -23,7 +23,7 @@ def record_error(component: str, exc: Optional[BaseException] = None,
                   *, context: str = "", level: str = "error", uid=None) -> None:
     """에러를 최대한 상세히 기록한다.
 
-    component : 어디서 났는지 (예: "운용전략실장", "_run_analysis_cycle", "ops_support.llm_propose")
+    component : 어디서 났는지 (예: "주식운용실장", "_run_analysis_cycle", "ops_support.llm_propose")
     exc       : 잡은 예외 객체 (없으면 context 만 기록)
     context   : 추가 정황 (모델명, 종목, 단계 등 — 진단에 필요한 무엇이든)
     uid       : Phase 2 멀티테넌트 — 그 유저의 이벤트 로그(data/<uid>/trade_log.json)에 적는다.

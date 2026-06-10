@@ -24,7 +24,7 @@
 - **Create** `infra/data_migration.py` — one-shot boot migration (back up globals, start fresh).
 - **Create** `infra/user_paths.py` — per-uid path helper (`data/<uid>/…`).
 - **Modify** `infra/kis_broker.py` — `KISBroker.__init__(creds, token_path)`; retire `get_broker()` global singleton.
-- **Modify** `agents/base_agent.py` — inject `openrouter_key`/`base_url`/`model_overrides` instead of reading `config` globals.
+- **Modify** `agents/base_agent.py` — inject `deepseek_api_key`/`base_url`/`model_overrides` instead of reading `config` globals.
 - **Modify** `agents/specialists.py` — `create_*` factories accept and forward an injection bundle.
 - **Modify** `main_swarm.py` — `ArquantOrchestrator(ctx)`; per-uid equity/trade paths; `record_equity(ctx, …)`; broadcast via `send_to_uid`; drop `_active_actor` global lookup; per-uid cost tag.
 - **Modify** `infra/cycle_store.py` — add `uid` column + filter reads by uid.
@@ -89,11 +89,11 @@ def test_registry_isolates_two_uids(monkeypatch):
         1: {"id": 1, "username": "hh09080", "is_admin": True,
             "kis_app_key": "K1", "kis_app_secret": "S1", "kis_account_no": "111-01",
             "kis_base_url": "https://openapi.koreainvestment.com:9443",
-            "openrouter_key": "OR1", "dart_key": "", "label": "admin"},
+            "deepseek_api_key": "OR1", "dart_key": "", "label": "admin"},
         2: {"id": 2, "username": "hh0908", "is_admin": False,
             "kis_app_key": "K2", "kis_app_secret": "S2", "kis_account_no": "222-01",
             "kis_base_url": "https://openapivts.koreainvestment.com:29443",
-            "openrouter_key": "OR2", "dart_key": "", "label": "mock"},
+            "deepseek_api_key": "OR2", "dart_key": "", "label": "mock"},
     }
     monkeypatch.setattr(uc.auth_store, "get_user_credentials",
                         lambda uid: creds_by_uid.get(int(uid)))
@@ -340,14 +340,14 @@ git commit -m "feat(mt): inject creds into KISBroker, per-uid token cache, retir
 from agents.base_agent import BaseAgent
 
 
-def test_agent_uses_injected_openrouter_key():
-    inj = {"openrouter_key": "OR-INJECTED",
-           "openrouter_base_url": "https://openrouter.ai/api/v1",
-           "model_overrides": {"quant_analyst": "anthropic/claude-x"}}
+def test_agent_uses_injected_deepseek_api_key():
+    inj = {"deepseek_api_key": "OR-INJECTED",
+           "deepseek_base_url": "https://DeepSeek.ai/api/v1",
+           "model_overrides": {"quant_analyst": "deepseek-v4-pro"}}
     a = BaseAgent(name="t", role="quant_analyst", system_prompt="p",
                   model_key="quant_analyst", injection=inj)
     assert a.api_key == "OR-INJECTED"
-    assert a.model == "anthropic/claude-x"   # per-injection override wins
+    assert a.model == "deepseek-v4-pro"   # per-injection override wins
 
 
 def test_agent_falls_back_to_config_when_no_injection():
@@ -364,11 +364,11 @@ Expected: FAIL — `BaseAgent.__init__` has no `injection` param.
 
 - [ ] **Step 3: Add an `injection` bundle to `BaseAgent.__init__`** (`agents/base_agent.py:150`)
 
-Add `injection: Optional[Dict[str, Any]] = None` to the signature. Replace the body from line 158 (`from config import ...`) through line 172 (`self.base_url = OPENROUTER_BASE_URL`) with:
+Add `injection: Optional[Dict[str, Any]] = None` to the signature. Replace the body from line 158 (`from config import ...`) through line 172 (`self.base_url = DEEPSEEK_BASE_URL`) with:
 
 ```python
         from config import (MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS, ENABLE_PROMPT_CACHE,
-                            AGENT_HISTORY_TURNS, OPENROUTER_API_KEY, OPENROUTER_BASE_URL)
+                            AGENT_HISTORY_TURNS, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL)
         self.name = name
         self.role = role
         self.system_prompt = system_prompt
@@ -381,10 +381,10 @@ Add `injection: Optional[Dict[str, Any]] = None` to the signature. Replace the b
                 _ov = admin_config.get_model_override(model_key)
             except Exception:
                 _ov = ""
-        self.model = _ov or MODEL_ASSIGNMENTS.get(model_key, "deepseek/deepseek-v4-flash")
-        # Credentials: injected per-uid OpenRouter key, else config global (legacy/no-uid).
-        self.api_key = inj.get("openrouter_key") or OPENROUTER_API_KEY
-        self.base_url = inj.get("openrouter_base_url") or OPENROUTER_BASE_URL
+        self.model = _ov or MODEL_ASSIGNMENTS.get(model_key, "deepseek-v4-flash")
+        # Credentials: injected per-uid DeepSeek key, else config global (legacy/no-uid).
+        self.api_key = inj.get("deepseek_api_key") or DEEPSEEK_API_KEY
+        self.base_url = inj.get("deepseek_base_url") or DEEPSEEK_BASE_URL
 ```
 
 (Leave lines 173-180 — `self.tools`, history, max_tokens, prompt-cache — unchanged.)
@@ -410,7 +410,7 @@ Expected: PASS (2 passed).
 
 ```bash
 git add agents/base_agent.py agents/specialists.py tests/test_agent_injection.py
-git commit -m "feat(mt): inject openrouter key + per-uid model overrides into agents"
+git commit -m "feat(mt): inject DeepSeek key + per-uid model overrides into agents"
 ```
 
 ---
@@ -435,7 +435,7 @@ def _ctx(uid, mock=False):
         "kis_account_no": f"{uid}-01",
         "kis_base_url": ("https://openapivts.koreainvestment.com:29443" if mock
                          else "https://openapi.koreainvestment.com:9443"),
-        "openrouter_key": f"OR{uid}", "dart_key": "", "label": f"u{uid}",
+        "deepseek_api_key": f"OR{uid}", "dart_key": "", "label": f"u{uid}",
     })
 
 
@@ -448,7 +448,7 @@ def test_orchestrator_owns_uid_and_per_uid_paths():
     assert o1.broker.app_key == "K1" and o2.broker.app_key == "K2"
     assert str(o1.equity_path).endswith("/1/equity_curve.json")
     assert str(o2.equity_path).endswith("/2/equity_curve.json")
-    # agents got the per-uid OpenRouter key
+    # agents got the per-uid DeepSeek key
     assert o1.orchestrator.api_key == "OR1"
     assert o2.orchestrator.api_key == "OR2"
 ```
@@ -468,8 +468,8 @@ Change `def __init__(self):` → `def __init__(self, ctx):` and at the top of th
         from infra import user_paths
         self.equity_path = user_paths.equity_path(ctx.uid)
         self.trade_log_path = user_paths.trade_log_path(ctx.uid)
-        _inj = {"openrouter_key": ctx.creds.get("openrouter_key"),
-                "openrouter_base_url": None}
+        _inj = {"deepseek_api_key": ctx.creds.get("deepseek_api_key"),
+                "deepseek_base_url": None}
 ```
 Then:
 - Pass `injection=_inj` to the two inline `BaseAgent(...)` constructions (`self.orchestrator` at :1249, `self.news_curator` at :1287).
@@ -873,7 +873,7 @@ def _ctx(uid, admin):
     return UserContext({"id": uid, "username": f"u{uid}", "is_admin": admin,
         "kis_app_key": "K", "kis_app_secret": "S", "kis_account_no": "1-01",
         "kis_base_url": "https://openapivts.koreainvestment.com:29443",
-        "openrouter_key": "OR", "dart_key": "", "label": "x"})
+        "deepseek_api_key": "OR", "dart_key": "", "label": "x"})
 
 
 def test_non_admin_ops_support_cannot_modify_code(monkeypatch):
@@ -940,10 +940,10 @@ def test_second_login_does_not_hijack_first(monkeypatch):
     """The exact incident: uid=1 running, uid=2 'logs in' → uid=1 unaffected."""
     creds = {
         1: {"id": 1, "username": "hh09080", "is_admin": True, "kis_app_key": "K1",
-            "kis_app_secret": "S1", "kis_account_no": "111-01", "openrouter_key": "OR1",
+            "kis_app_secret": "S1", "kis_account_no": "111-01", "deepseek_api_key": "OR1",
             "kis_base_url": "https://openapi.koreainvestment.com:9443", "dart_key": "", "label": "a"},
         2: {"id": 2, "username": "hh0908", "is_admin": False, "kis_app_key": "K2",
-            "kis_app_secret": "S2", "kis_account_no": "222-01", "openrouter_key": "OR2",
+            "kis_app_secret": "S2", "kis_account_no": "222-01", "deepseek_api_key": "OR2",
             "kis_base_url": "https://openapivts.koreainvestment.com:29443", "dart_key": "", "label": "b"},
     }
     import infra.user_context as ucm
