@@ -3,7 +3,7 @@
 버그(root cause): swarm/broker/equity 는 uid 별로 분리됐지만 통신 로그
 (claude_response.json)만 전역으로 남아, 동시 운용되는 두 계정(uid=1 hh09080 실거래,
 uid=2 hh0908 모의)의 에이전트 메시지가 한 파일에 뒤섞였다. 대시보드가 이를 필터 없이
-돌려줘 각 계정이 상대 계정의 에이전트(운용전략실장/사후관리실장/리스크관리실장)까지 봤다.
+돌려줘 각 계정이 상대 계정의 에이전트(주식운용실장/사후관리실장/리스크관리실장)까지 봤다.
 
 수정: equity 와 동일 패턴으로 로그를 data/<uid>/trade_log.json 으로 유저별 분리한다.
 log_response_event(entry, uid)/get_recent_events(limit, uid) 가 uid 별 파일을 읽고 쓴다.
@@ -22,11 +22,11 @@ def test_events_isolated_by_uid(tmp_path, monkeypatch):
     _isolate_data_dir(tmp_path, monkeypatch)
 
     ms.log_response_event(
-        {"source": "system_event", "type": "agent_msg", "agent": "운용전략실장", "message": "u1-hi"},
+        {"source": "system_event", "type": "agent_msg", "agent": "주식운용실장", "message": "u1-hi"},
         uid=1,
     )
     ms.log_response_event(
-        {"source": "system_event", "type": "agent_msg", "agent": "운용전략실장", "message": "u2-hi"},
+        {"source": "system_event", "type": "agent_msg", "agent": "주식운용실장", "message": "u2-hi"},
         uid=2,
     )
 

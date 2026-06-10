@@ -26,7 +26,7 @@ def _bp():
 def test_low_price_buy_clamped_not_dropped():
     o = _orch()
     orders = [{"ticker": "052900", "side": "buy", "qty": 10227, "market": "KR",
-               "reason": "운용전략실장 지정 · 10227주 · 진입가:시장가"}]
+               "reason": "주식운용실장 지정 · 10227주 · 진입가:시장가"}]
     out = o._clamp_orders_to_max_qty(orders)
     assert len(out) == 1, "매수가 살아 있어야 한다 — 반려/드롭 금지"
     assert out[0]["qty"] == config.HARD_MAX_ORDER_QTY == 1000
@@ -55,7 +55,7 @@ def test_clamped_buy_passes_guardrail():
     o = _orch()
     orders = o._clamp_orders_to_max_qty(
         [{"ticker": "052900", "side": "buy", "qty": 10227, "market": "KR",
-          "reason": "운용전략실장 지정 정상 매수"}])
+          "reason": "주식운용실장 지정 정상 매수"}])
     r = validate_order_draft({"orders": orders}, buying_power=_bp(), price_map={"052900": 1873})
     assert r["results"][0]["status"] == "APPROVED"
 

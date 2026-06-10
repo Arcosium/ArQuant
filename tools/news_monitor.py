@@ -34,7 +34,7 @@ HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 # 사장 피드백 2026-05-16: 뉴스 목록을 디스크에 영속화 — 서버 재시작(코드 갱신 후 자동 재개 포함)
 # 후에도 누적 뉴스가 사라지지 않도록 한다.
 _NEWS_STATE_FILE = Path(__file__).parent.parent / "data" / "news_history.json"
-_MAX_PERSIST_ARTICLES = 600   # 최근 600건만 보관 (대시보드는 20건만 표시)
+_MAX_PERSIST_ARTICLES = 300   # 사장 지시 2026-06-10: 뉴스 피드 최대 300건만 기억, 초과분은 즉시 삭제
 _MAX_PERSIST_LINKS = 3000     # 중복 차단용 링크 캐시 상한
 
 
@@ -187,6 +187,9 @@ class NaverFinanceMonitor:
         if not art:
             return False
         self._seen_links.add(art["link"]); self._article_history.append(art)
+        # 사장 지시 2026-06-10: 300건 초과 시 즉시(append마다) 가장 오래된 기록부터 삭제
+        if len(self._article_history) > _MAX_PERSIST_ARTICLES:
+            self._article_history = self._article_history[-_MAX_PERSIST_ARTICLES:]
         out.append(art); self.total_articles_found += 1
         return True
 

@@ -39,7 +39,7 @@ def _sample_thesis(**overrides):
         "target_price": 700000.0,
         "stop_price": 620000.0,
         "planned_hold_hours": 48,
-        "entry_reason": "운용전략실장 2차전지 비중 확대 권고",
+        "entry_reason": "주식운용실장 2차전지 비중 확대 권고",
         "source_agent": "펀드기획팀장",
     }
     base.update(overrides)

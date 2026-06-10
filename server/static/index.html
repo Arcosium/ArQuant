@@ -50,7 +50,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
 .ch-bp #bpLine{flex:1 1 100%;margin-left:0!important;text-align:left;white-space:normal;
   word-break:keep-all;overflow-wrap:anywhere;line-height:1.55;margin-top:2px}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
-.stat{background:var(--s2);border-radius:7px;padding:10px}.sl{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}.sv{font-size:18px;font-weight:700}
+.stat{background:var(--s2);border-radius:7px;padding:10px}.sl{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}.sv{font-size:18px;font-weight:700}#sSession{white-space:nowrap;overflow:hidden;max-width:100%}
 .pipeline{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
 .ps{flex:1;min-width:68px;text-align:center;padding:6px 3px;border-radius:5px;background:var(--s2);font-size:9px;font-weight:600;transition:.3s}
 .ps.active{background:var(--pri);color:#fff;box-shadow:0 0 10px var(--glow)}.ps.done{background:#10b98130;color:var(--grn)}
@@ -383,11 +383,11 @@ body{font-family:var(--f);background:var(--bg);color:var(--txt);height:100vh;ove
       <div class="stats" id="dashStats">
         <div class="stat stat-extra"><div class="sl">세션</div><div class="sv" id="sSession" style="font-size:13px">-</div></div>
         <div class="stat stat-extra"><div class="sl">시간 (KST)</div><div class="sv" id="sTime" style="font-size:14px">-</div></div>
-        <div class="stat stat-extra"><div class="sl">감지 뉴스</div><div class="sv" id="sNews" style="color:var(--acc)">0</div></div>
+        <div class="stat stat-extra" style="display:none"><div class="sl">감지 뉴스</div><div class="sv" id="sNews" style="color:var(--acc)">0</div></div>
         <div class="stat stat-extra"><div class="sl">다음 사이클</div><div class="sv" id="sNextCycle" style="font-size:13px">-</div></div>
         <div class="stat"><div class="sl">완료 사이클</div><div class="sv" id="sCycles">0</div></div>
         <div class="stat"><div class="sl">실매매 체결</div><div class="sv" id="sTrades" style="color:var(--grn)">0</div></div>
-        <div class="stat stat-extra"><div class="sl">전략</div><div class="sv" id="sStrat" style="font-size:12px">-</div></div>
+        <div class="stat stat-extra" style="display:none"><div class="sl">전략</div><div class="sv" id="sStrat" style="font-size:12px">-</div></div>
         <div class="stat"><div class="sl">장 상태</div><div class="sv" id="sTrading" style="font-size:13px">-</div></div>
       </div>
       <!-- ④ 모바일 전용: 핵심 3개만 보이고, 누르면 전체 대시보드 상태 펼침 -->
@@ -584,12 +584,9 @@ function syncRegisterMode(){
 }
 function applyViewerMode(){
   const api=document.getElementById('apiCost');if(api)api.style.display=IS_VIEWER?'none':'';
-  // 사장 보고 2026-06-10 회귀수정: 실행/중지 버튼을 여기서 disabled=IS_VIEWER 로 일괄 설정하면 비관전
-  // 계정(IS_VIEWER=false)에서 둘 다 disabled=false 로 되돌아가 refreshStatus 의 is_running 동기화를
-  // 덮어쓴다(→ 실행 버튼이 계속 활성, 눌러도 '이미 감시 중'). 관전 계정만 강제 비활성, 비관전은 동기화 위임.
-  const ceo=document.getElementById('ceoInput');if(ceo)ceo.disabled=IS_VIEWER;
-  if(IS_VIEWER){['startBtn','stopBtn'].forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=true;});}
-  const send=document.querySelector('.btn-send');if(send)send.disabled=IS_VIEWER;
+  // 사장 지시 2026-06-10: 관전 전용 계정은 실행·중지·전송 UI 자체를 숨긴다(하단 컨트롤바 전체).
+  // 비관전: 컨트롤바 표시 + 실행/중지는 refreshStatus의 is_running 동기화가 제어한다(여기선 안 건드림).
+  const bar=document.querySelector('.control-bar');if(bar)bar.style.display=IS_VIEWER?'none':'';
   const clear=document.getElementById('clearLogBtn');if(clear)clear.style.display=IS_VIEWER?'none':'';
   ['clearTradesBtn','clearNewsBtn'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display=IS_VIEWER?'none':'';});
   const admin=document.getElementById('adminTabBtn');if(admin)admin.style.display=(!IS_VIEWER&&IS_ADMIN)?'inline-block':'none';
@@ -772,21 +769,21 @@ async function pfDeleteAccount(){
 // MIDDLE: 리스크 통제·사후관리   BACK: 실행·인프라 지원(운용지원실장 산하 2팀장)
 const agentSections=[
   {section:"FRONT", subtitle:"리서치 및 운용전략", agents:[
-    {name:"주식운용실장",role:"총괄 전략·종목 선정 (2패스)",color:"#6366f1",level:0},
-    {name:"글로벌리서치팀장",role:"거시·매크로·4분할 자산배분",color:"#06b6d4",level:1},
-    {name:"계량분석팀장",role:"후보 종목 정량 평가",color:"#10b981",level:1},
-    {name:"마켓센티먼트팀장",role:"뉴스 감성·이벤트 분석",color:"#f59e0b",level:1},
-    {name:"채권운용실장",role:"채권 ETF 매매·금리 전략",color:"#3b82f6",level:0},
-    {name:"원자재운용실장",role:"원자재 ETF 매매·실물자산",color:"#d97706",level:0},
+    {name:"주식운용실장",title:"전무",role:"총괄 전략·종목 선정 (2패스)",color:"#6366f1",level:0},
+    {name:"글로벌리서치팀장",title:"과장",role:"거시·매크로·4분할 자산배분",color:"#06b6d4",level:1},
+    {name:"계량분석팀장",title:"차장",role:"후보 종목 정량 평가",color:"#10b981",level:1},
+    {name:"마켓센티먼트팀장",title:"과장",role:"뉴스 감성·이벤트 분석",color:"#f59e0b",level:1},
+    {name:"채권운용실장",title:"상무",role:"채권 ETF 매매·금리 전략",color:"#3b82f6",level:0},
+    {name:"원자재운용실장",title:"상무",role:"원자재 ETF 매매·실물자산",color:"#d97706",level:0},
   ]},
   {section:"MIDDLE", subtitle:"리스크 통제 및 사후관리", agents:[
-    {name:"리스크관리실장",role:"리스크 게이트·DART 재심",color:"#8b5cf6",level:0},
-    {name:"사후관리실장",role:"보유 종목 매도 판단",color:"#f43f5e",level:0},
+    {name:"리스크관리실장",title:"부장",role:"리스크 게이트·DART 재심",color:"#8b5cf6",level:0},
+    {name:"사후관리실장",title:"상무",role:"보유 종목 매도 판단",color:"#f43f5e",level:0},
   ]},
   {section:"BACK", subtitle:"실행 및 인프라 지원", agents:[
-    {name:"운용지원실장",role:"진단·프로필 전략 조정",color:"#14b8a6",level:0},
-    {name:"프롭트레이딩팀장",role:"주문 실행·결과 보고",color:"#ef4444",level:1},
-    {name:"포트폴리오기획팀장",role:"진입 thesis 설정·계획 관리",color:"#ec4899",level:1},
+    {name:"운용지원실장",title:"전무",role:"진단·프로필 전략 조정",color:"#14b8a6",level:0},
+    {name:"프롭트레이딩팀장",title:"차장",role:"주문 실행·결과 보고",color:"#ef4444",level:1},
+    {name:"포트폴리오기획팀장",title:"과장",role:"진입 thesis 설정·계획 관리",color:"#ec4899",level:1},
   ]},
 ];
 // 평탄화 — @멘션 자동완성·필터 등 기존 코드가 쓰는 단일 리스트.
@@ -814,6 +811,8 @@ function renderAgentList(){
       const info=document.createElement('div');
       const nm=document.createElement('div');nm.className='an';
       nm.textContent = (a.level ? '└ ' : '') + a.name;
+      // 사장 지시 2026-06-10: 이름 옆 직위 배지
+      if(a.title){const tg=document.createElement('span');tg.textContent=a.title;tg.style.cssText='font-size:9px;color:#cbd5e1;background:rgba(255,255,255,.09);padding:1px 5px;border-radius:6px;margin-left:5px;font-weight:600;vertical-align:middle';nm.appendChild(tg);}
       const rl=document.createElement('div');rl.className='ar';rl.textContent=a.role;
       info.appendChild(nm);info.appendChild(rl);
       li.appendChild(dot);li.appendChild(info);
@@ -964,6 +963,16 @@ function updateBadge(s){const cls='badge badge-'+(s==='MONITORING'||s==='DATA_CO
   // 원본 배지(헤더 우측, 데스크톱) + 미러 배지(통신 로그 헤더, 모바일) 동기화
   [document.getElementById('badge'),document.getElementById('badgeMirror')].forEach(b=>{if(b){b.textContent=s;b.className=cls;}});}
 
+// 사장 지시 2026-06-10: 세션 텍스트(예: KR_AFTER_MARKET)가 모바일 상자를 넘던 문제 —
+// 박스 폭에 맞게 폰트 크기를 항상 자동 축소(13px→최소 7px). display:none(숨김)이면 스킵.
+function _fitSession(){
+  const el=document.getElementById('sSession');
+  if(!el || el.offsetParent===null) return;          // 숨김 상태면 측정 불가 → 스킵
+  let fs=13; el.style.fontSize=fs+'px';
+  let g=0;
+  while(el.scrollWidth > el.clientWidth+0.5 && fs>7 && g++<40){ fs-=0.5; el.style.fontSize=fs+'px'; }
+}
+
 // 사장 피드백 2026-05-15 모바일 #3: 마크다운 잔여물(**bold**, ## 헤더, --- 구분선, | 표, ``` 코드)을 평문으로 정리.
 // 주의: 이 함수는 시스템/뉴스/ceo 메시지용 — 에이전트 메시지는 _renderAgentContent() 사용 (표 보존).
 function _cleanLog(t){
@@ -1086,7 +1095,7 @@ function _updateNewsCount(){
 // ④ 모바일 대시보드 펼치기/접기 (사장 피드백 2026-05-18)
 function toggleDashMore(){
   const s=document.getElementById('dashStats');if(!s)return;
-  const on=s.classList.toggle('expanded');
+  const on=s.classList.toggle('expanded');if(on)setTimeout(_fitSession,0);  // 펼칠 때 세션 폰트 즉시 맞춤(보이게 된 직후 측정)
   const lab=document.getElementById('dashMoreLabel');const ar=document.getElementById('dashMoreArrow');
   if(lab)lab.textContent=on?'핵심만 보기':'전체 상태 보기';
   if(ar)ar.textContent=on?'▴':'▾';
@@ -1159,7 +1168,7 @@ let _lastCostMode='h';
 async function refreshStatus(){try{const r=await fetch(API+'/api/status');const d=await r.json();
   _isOffHours=(d.session==='OFF_HOURS');
   _isTrading=!!d.is_trading;
-  document.getElementById('sSession').textContent=d.session||'-';
+  document.getElementById('sSession').textContent=d.session||'-';_fitSession();
   document.getElementById('sTime').textContent=d.time_kst||'-';
   document.getElementById('sCycles').textContent=d.cycle_history_count||0;
   document.getElementById('sTrades').textContent=d.trades_executed||0;
@@ -1744,6 +1753,7 @@ async function refreshBalance(force){
     R.textContent=rtxt;
     R.style.color=pct>=0?'var(--grn)':'var(--red)';row.appendChild(L);row.appendChild(R);box.appendChild(row)})}catch(e){}}
 setInterval(refreshStatus,5000);refreshStatus();
+window.addEventListener('resize',_fitSession);  // 사장 지시 2026-06-10: 화면 회전·리사이즈 시 세션 폰트 재맞춤
 // 잔고/보유 종목: 10분에 한번씩 자동 갱신, 단 OFF_HOURS면 자동 폴링 스킵 (🔄 새로고침 버튼은 강제 갱신)
 setInterval(refreshBalance,600000);refreshBalance(true);
 // 사장 지시 2026-05-24: 장 시간(KR/US 정규장)이 아니면 수익률 실시간 갱신을 멈춘다.

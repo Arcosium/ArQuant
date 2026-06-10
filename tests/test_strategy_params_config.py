@@ -19,18 +19,16 @@ def test_surviving_keys_registered_tunable():
         assert k in config.STRATEGY_KEY_META and config.STRATEGY_KEY_META[k].get("label")
 
 
-def test_surviving_keys_in_all_presets():
-    for name, preset in config.STRATEGY_PRESETS.items():
-        for k in SURVIVING_KEYS:
-            assert k in preset, f"프리셋 '{name}'에 {k} 누락"
+def test_surviving_keys_in_defaults():
+    for k in SURVIVING_KEYS:
+        assert k in config.STRATEGY_DEFAULTS, f"기본값에 {k} 누락"
 
 
 def test_qw_category_weights_deprecated():
     # LLM 채점 가중치 QW_* 는 더 이상 튜너블 아님(결정론 QIW_*/DW_* 로 대체).
     for k in DEPRECATED_QW:
         assert k not in config.STRATEGY_TUNABLE_KEYS, f"{k} 가 아직 튜너블(폐기 안 됨)"
-        for name, preset in config.STRATEGY_PRESETS.items():
-            assert k not in preset, f"프리셋 '{name}'에 폐기 키 {k} 잔존"
+        assert k not in config.STRATEGY_DEFAULTS, f"기본값에 폐기 키 {k} 잔존"
 
 
 def test_catalog_text_includes_tunable_and_effect():

@@ -5,12 +5,12 @@ def test_new_columns_exist(fresh_auth):
     cols = {r[1] for r in con.execute("PRAGMA table_info(users)").fetchall()}
     con.close()
     assert {"password_hash", "kis_app_key_bidx",
-            "kis_app_secret_bidx", "openrouter_key_bidx"} <= cols
+            "kis_app_secret_bidx", "deepseek_api_key_bidx"} <= cols
 
 def test_upsert_stores_hash_and_bidx_not_plaintext(fresh_auth):
     uid = fresh_auth.upsert_user(
         username="alice", password="Sup3r$ecret!",
-        kis_app_key="AK", kis_app_secret="AS", openrouter_key="OR",
+        kis_app_key="AK", kis_app_secret="AS", deepseek_api_key="DS",
         kis_account_no="123-01", kis_base_url="", dart_key="", label="")
     import sqlite3
     con = sqlite3.connect(fresh_auth._DB_PATH); con.row_factory = sqlite3.Row
@@ -19,7 +19,7 @@ def test_upsert_stores_hash_and_bidx_not_plaintext(fresh_auth):
     assert r["password_hash"].startswith("$argon2id$")
     assert r["kis_app_key_bidx"] == fresh_auth.bidx("AK")
     assert r["kis_app_secret_bidx"] == fresh_auth.bidx("AS")
-    assert r["openrouter_key_bidx"] == fresh_auth.bidx("OR")
+    assert r["deepseek_api_key_bidx"] == fresh_auth.bidx("DS")
 
 def test_one_shot_migration_is_idempotent(fresh_auth):
     uid = fresh_auth.upsert_user("dave", "Migrate$99x", "AK", "AS", "OR",
@@ -27,7 +27,7 @@ def test_one_shot_migration_is_idempotent(fresh_auth):
     import sqlite3
     con = sqlite3.connect(fresh_auth._DB_PATH)
     con.execute("UPDATE users SET password_hash='', password_enc=?, "
-                "kis_app_key_bidx='', kis_app_secret_bidx='', openrouter_key_bidx='' "
+                "kis_app_key_bidx='', kis_app_secret_bidx='', deepseek_api_key_bidx='' "
                 "WHERE id=?", (fresh_auth.encrypt("Migrate$99x"), uid))
     con.commit(); con.close()
     s1 = fresh_auth.migrate_passwords_and_bidx()
@@ -46,7 +46,7 @@ def test_migration_skips_row_with_corrupt_enc_no_data_loss(fresh_auth):
     con = sqlite3.connect(fresh_auth._DB_PATH)
     # legacy + CORRUPT password_enc (not valid Fernet), bidx cleared
     con.execute("UPDATE users SET password_hash='', password_enc='not-a-valid-fernet-token', "
-                "kis_app_key_bidx='', kis_app_secret_bidx='', openrouter_key_bidx='' "
+                "kis_app_key_bidx='', kis_app_secret_bidx='', deepseek_api_key_bidx='' "
                 "WHERE id=?", (uid,))
     con.commit(); con.close()
     stats = fresh_auth.migrate_passwords_and_bidx()
@@ -72,3 +72,26 @@ def test_migration_propagates_fernet_key_lost(fresh_auth, monkeypatch):
     import pytest as _pt
     with _pt.raises(fresh_auth.FernetKeyLost):
         fresh_auth.migrate_passwords_and_bidx()
+
+
+def test_provider_column_migration_preserves_encrypted_key(fresh_auth, monkeypatch):
+    uid = fresh_auth.upsert_user(
+        "legacy", "Legacy$pw99", "AK", "AS", "DS-SECRET", "1-1", "", "", "")
+    old_enc = "open" + "router_key_enc"
+    old_bidx = "open" + "router_key_bidx"
+    con = sqlite3.connect(fresh_auth._DB_PATH)
+    con.execute(f"ALTER TABLE users RENAME COLUMN deepseek_api_key_enc TO {old_enc}")
+    con.execute(f"ALTER TABLE users RENAME COLUMN deepseek_api_key_bidx TO {old_bidx}")
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(fresh_auth, "_INITED", False)
+    fresh_auth.init()
+
+    con = sqlite3.connect(fresh_auth._DB_PATH)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(users)").fetchall()}
+    con.close()
+    assert "deepseek_api_key_enc" in cols
+    assert "deepseek_api_key_bidx" in cols
+    assert old_enc not in cols and old_bidx not in cols
+    assert fresh_auth.get_user_credentials(uid)["deepseek_api_key"] == "DS-SECRET"

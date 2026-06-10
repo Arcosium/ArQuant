@@ -26,10 +26,9 @@ def test_meta_and_effect_present():
         assert k in config.STRATEGY_KEY_EFFECT, f"{k} EFFECT 누락"
 
 
-def test_all_presets_define_new_keys():
-    for name, preset in config.STRATEGY_PRESETS.items():
-        for k in NEW_KEYS:
-            assert k in preset, f"프리셋 {name}에 {k} 누락"
+def test_defaults_define_new_keys():
+    for k in NEW_KEYS:
+        assert k in config.STRATEGY_DEFAULTS, f"기본값에 {k} 누락"
 
 
 def test_defaults_are_backward_safe():

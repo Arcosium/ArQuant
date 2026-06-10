@@ -1,14 +1,13 @@
 from agents.base_agent import BaseAgent
 
 
-def test_agent_uses_injected_openrouter_key():
-    inj = {"openrouter_key": "OR-INJECTED",
-           "openrouter_base_url": "https://openrouter.ai/api/v1",
-           "model_overrides": {"quant_analyst": "anthropic/claude-x"}}
+def test_agent_uses_injected_deepseek_key():
+    inj = {"deepseek_api_key": "DS-INJECTED",
+           "model_overrides": {"quant_analyst": "deepseek-v4-pro"}}
     a = BaseAgent(name="t", role="quant_analyst", system_prompt="p",
                   model_key="quant_analyst", injection=inj)
-    assert a.api_key == "OR-INJECTED"
-    assert a.model == "anthropic/claude-x"   # per-injection override wins
+    assert a.api_key == "DS-INJECTED"
+    assert a.model == "deepseek-v4-pro"
 
 
 def test_agent_falls_back_to_config_when_no_injection():

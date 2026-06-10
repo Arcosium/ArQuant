@@ -58,7 +58,7 @@ def test_not_saved_when_classified_oneshot(isolated, monkeypatch):
 def test_strips_leading_mention_before_save(isolated, monkeypatch):
     sd = isolated
     _patch_classifier(monkeypatch, True)
-    _run_persist(7, "@운용전략실장 달러 단기국채를 핵심 축으로", "반영하겠습니다")
+    _run_persist(7, "@주식운용실장 달러 단기국채를 핵심 축으로", "반영하겠습니다")
     lst = sd.load(7)
     assert len(lst) == 1 and lst[0]["text"] == "달러 단기국채를 핵심 축으로"
 
@@ -67,7 +67,7 @@ def test_error_response_not_saved(isolated, monkeypatch):
     """에이전트 에러 응답('[...에러]')이면 판단 보류 — 저장하지 않는다."""
     sd = isolated
     _patch_classifier(monkeypatch, True)   # 분류기가 STANDING 이라 해도
-    _run_persist(7, "원화 비중 최소화", "[운용전략실장 에러] API 호출 실패")
+    _run_persist(7, "원화 비중 최소화", "[주식운용실장 에러] API 호출 실패")
     assert sd.load(7) == []
 
 

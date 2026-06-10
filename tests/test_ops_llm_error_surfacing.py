@@ -13,23 +13,15 @@ import asyncio
 import infra.ops_support_worker as w
 
 
-class _BoomSession:
-    """async with 진입 시 타임아웃을 던지는 aiohttp 세션 대역."""
-    def __init__(self, *a, **k):
-        pass
-    async def __aenter__(self):
-        raise TimeoutError()
-    async def __aexit__(self, *a):
-        return False
-
-
 def _patch_boom(monkeypatch):
     calls = []
-    monkeypatch.setattr(w, "OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(w, "DEEPSEEK_API_KEY", "test-key")
     # raising=False — RED 단계(아직 record_error 미도입)에서도 attribute 생성 허용.
     monkeypatch.setattr(w, "record_error",
                         lambda *a, **k: calls.append((a, k)), raising=False)
-    monkeypatch.setattr(w.aiohttp, "ClientSession", lambda *a, **k: _BoomSession())
+    async def boom(**kwargs):
+        raise TimeoutError()
+    monkeypatch.setattr(w, "chat_completion", boom)
     return calls
 
 

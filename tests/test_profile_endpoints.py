@@ -113,7 +113,7 @@ async def _stub_validate_kis_ok(app_key, app_secret, base_url):
     return True, "ok"
 
 
-async def _stub_validate_openrouter_ok(api_key):
+async def _stub_validate_deepseek_ok(api_key):
     return True, "ok"
 
 
@@ -125,7 +125,7 @@ def test_credentials_partial_update_does_not_clobber_other_creds(client, monkeyp
     """POST only kis_account_no — other credential fields must be unchanged."""
     import server.app as app_mod
     monkeypatch.setattr(app_mod, "_validate_kis", _stub_validate_kis_ok)
-    monkeypatch.setattr(app_mod, "_validate_openrouter", _stub_validate_openrouter_ok)
+    monkeypatch.setattr(app_mod, "_validate_deepseek", _stub_validate_deepseek_ok)
     c, a, uid = client
     resp = c.post("/api/profile/credentials", json={"kis_account_no": "NEW123"})
     assert resp.status_code == 200, resp.text
@@ -133,14 +133,14 @@ def test_credentials_partial_update_does_not_clobber_other_creds(client, monkeyp
     assert stored["kis_account_no"] == "NEW123"
     assert stored["kis_app_key"] == "AK"
     assert stored["kis_app_secret"] == "AS"
-    assert stored["openrouter_key"] == "OR"
+    assert stored["deepseek_api_key"] == "OR"
 
 
 def test_credentials_validation_failure_blocks_save(client, monkeypatch):
     """If _validate_kis returns failure, no save should occur."""
     import server.app as app_mod
     monkeypatch.setattr(app_mod, "_validate_kis", _stub_validate_kis_fail)
-    monkeypatch.setattr(app_mod, "_validate_openrouter", _stub_validate_openrouter_ok)
+    monkeypatch.setattr(app_mod, "_validate_deepseek", _stub_validate_deepseek_ok)
     c, a, uid = client
     resp = c.post("/api/profile/credentials", json={"kis_app_key": "X"})
     assert resp.status_code == 400, resp.text
@@ -152,7 +152,7 @@ def test_credentials_strips_whitespace(client, monkeypatch):
     """Whitespace around credential fields must be stripped before saving."""
     import server.app as app_mod
     monkeypatch.setattr(app_mod, "_validate_kis", _stub_validate_kis_ok)
-    monkeypatch.setattr(app_mod, "_validate_openrouter", _stub_validate_openrouter_ok)
+    monkeypatch.setattr(app_mod, "_validate_deepseek", _stub_validate_deepseek_ok)
     c, a, uid = client
     resp = c.post("/api/profile/credentials", json={"kis_account_no": "  PADDED  "})
     assert resp.status_code == 200, resp.text

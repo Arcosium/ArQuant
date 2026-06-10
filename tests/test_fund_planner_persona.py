@@ -13,7 +13,7 @@ from agents.specialists import create_fund_planner, parse_fund_plan, format_thes
 
 def test_persona_can_be_created():
     a = create_fund_planner(injection={"uid": 1})
-    assert a.name == "펀드기획실장"  # 사장 승진 2026-05-29 (팀장 → 실장)
+    assert a.name == "포트폴리오기획팀장"  # 사장 승진 2026-05-29 (팀장 → 실장)
     assert a.role == "fund_planner"
     assert "목표가" in a.system_prompt
     assert "손절가" in a.system_prompt
@@ -27,7 +27,7 @@ def test_parse_fund_plan_extracts_four_fields():
 목표가: 700000
 손절가: 620000
 계획 보유기간: 48h
-진입 사유 요약: 전략리서치팀장 2차전지 비중 확대 + 정배열 ADX 25
+진입 사유 요약: 글로벌리서치팀장 2차전지 비중 확대 + 정배열 ADX 25
 """
     out = parse_fund_plan(text)
     assert out["target_price"] == 700000.0
@@ -72,7 +72,7 @@ def test_format_reminder_lists_holdings_with_thesis():
     }
     holdings = [{"code": "006400", "name": "삼성SDI", "qty": 1, "cur_price": 678000.0}]
     out = format_thesis_reminder(theses, holdings, now_iso="2026-05-29 09:00:00")
-    assert "펀드기획실장" in out  # 사장 승진 2026-05-29
+    assert "포트폴리오기획팀장" in out  # 사장 승진 2026-05-29
     assert "삼성SDI" in out or "006400" in out
     assert "655" in out          # entry price 표시
     assert "700" in out          # target

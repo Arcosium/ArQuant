@@ -25,25 +25,25 @@ def cost(tmp_path, monkeypatch):
 
 def test_record_updates_total_and_buckets(cost):
     ba = cost
-    ba._record_api_call("deepseek/deepseek-v4-flash", "tester", 1_000_000, 1_000_000)
-    # flash 단가 (0.10 in, 0.30 out) → 0.10 + 0.30 = 0.40 USD
+    ba._record_api_call("deepseek-v4-flash", "tester", 1_000_000, 1_000_000)
+    # flash 단가 (0.14 in, 0.28 out) → 0.42 USD
     s = ba.cost_summary()
-    assert s["total"]["usd"] == pytest.approx(0.40, abs=1e-6)
+    assert s["total"]["usd"] == pytest.approx(0.42, abs=1e-6)
     assert s["total"]["calls"] == 1
-    assert s["d"]["usd"] == pytest.approx(0.40, abs=1e-6)
-    assert s["m"]["usd"] == pytest.approx(0.40, abs=1e-6)
+    assert s["d"]["usd"] == pytest.approx(0.42, abs=1e-6)
+    assert s["m"]["usd"] == pytest.approx(0.42, abs=1e-6)
     assert s["h"]["calls"] == 1
 
 
 def test_rollup_persists_across_reload(cost, tmp_path, monkeypatch):
     ba = cost
-    ba._record_api_call("deepseek/deepseek-v4-pro", "tester", 1_000_000, 0)  # 0.50 in
+    ba._record_api_call("deepseek-v4-pro", "tester", 1_000_000, 0)
     # 인메모리 캐시를 비우고 파일에서 다시 읽어도 누적/일/월은 유지돼야 한다
     if hasattr(ba, "_reset_cost_rollup"):
         ba._reset_cost_rollup()
     ba.reset_api_cost_log()  # 회전식(/h) 만 비움
     s = ba.cost_summary()
-    assert s["total"]["usd"] == pytest.approx(0.50, abs=1e-6)
+    assert s["total"]["usd"] == pytest.approx(0.435, abs=1e-6)
     assert s["total"]["calls"] == 1
     # /h 는 회전식이라 리셋 후 0
     assert s["h"]["calls"] == 0

@@ -15,8 +15,8 @@ def _reset():
 
 def test_model_override_roundtrip():
     _reset()
-    ac.set_config(model_overrides={"quant_analyst": "anthropic/claude-x"})
-    assert ac.get_model_override("quant_analyst") == "anthropic/claude-x"
+    ac.set_config(model_overrides={"quant_analyst": "deepseek-v4-pro"})
+    assert ac.get_model_override("quant_analyst") == "deepseek-v4-pro"
     assert ac.get_model_override("macro_analyst") == ""  # 미설정
     _reset()
 
@@ -39,10 +39,16 @@ def test_crawl_interval_default_and_override():
 
 def test_base_agent_uses_override():
     _reset()
-    ac.set_config(model_overrides={"quant_analyst": "anthropic/claude-test"})
+    ac.set_config(model_overrides={"quant_analyst": "deepseek-v4-pro"})
     from agents.base_agent import BaseAgent
     a = BaseAgent(name="t", role="quant_analyst", model_key="quant_analyst", system_prompt="x")
-    assert a.model == "anthropic/claude-test"
+    assert a.model == "deepseek-v4-pro"
     _reset()
     b = BaseAgent(name="t2", role="quant_analyst", model_key="quant_analyst", system_prompt="x")
-    assert b.model != "anthropic/claude-test"  # 기본값으로 복귀
+    assert b.model != "deepseek-v4-pro"  # 기본값으로 복귀
+
+
+def test_foreign_model_override_is_rejected():
+    _reset()
+    ac.set_config(model_overrides={"quant_analyst": "foreign-model"})
+    assert ac.get_model_override("quant_analyst") == ""
