@@ -37,7 +37,7 @@ MODEL_ASSIGNMENTS = {
     # (유휴)'를 정체로 오독한 것(ops 워커가 사이클 완료 직후 spawn된 게 완료 증거). → pro 유지.
     # pro 동시성(500) hold 리스크는 deepseek_client 백오프 재시도로 방어한다.
     "chief_orchestrator": "deepseek-v4-pro",
-    "macro_analyst": "deepseek-v4-flash",
+    "macro_analyst": "deepseek-v4-pro",  # 사장 지시 2026-06-10: 글로벌리서치팀장 자산배분 권고='결정'→pro(추론품질). Search(macro_researcher)는 flash 유지.
     "quant_analyst": "deepseek-v4-flash",
     "news_analyst": "deepseek-v4-flash",
     "news_curator": "deepseek-v4-flash",
@@ -86,8 +86,8 @@ AGENT_MAX_TOKENS = {
     "post_manager":      12000,   # deepseek-v4-pro(2026-05-24 교체) — chief_orchestrator와 동일 모델·동일 토큰 한도
     "ops_support":        8000,   # 코드 변경 JSON + 근거 설명 (사장 지시 2026-05-14 — 토큰 한도 상향)
     "fund_planner":       1200,   # 사장 지시 2026-05-28 — 4줄(목표가/손절가/계획 보유/사유) 정형 출력 + 한 단락 보강
-    "bond_manager":       2000,   # 사장 지시 2026-06-08 — 채권운용실장. 종목별 금리뷰 줄글 + 채권결정 한 줄
-    "commodity_manager":  2000,   # 사장 지시 2026-06-09 — 원자재운용실장. 종목별 실물자산 매크로뷰 + 원자재결정 한 줄
+    "bond_manager":       5000,   # 채권운용실장. 2026-06-10 pro 전환 후 2000→5000: pro=reasoning은 max_tokens에 CoT 포함이라 2000이면 본문이 잘림(391자 관측). CoT+결정문 여유 확보.
+    "commodity_manager":  5000,   # 원자재운용실장. 동일 사유(pro reasoning CoT 토큰 소모) → 5000.
 }
 ENABLE_PROMPT_CACHE = False
 AGENT_HISTORY_TURNS = 3               # trailing history messages to resend (was 10)

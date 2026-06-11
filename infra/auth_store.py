@@ -3,14 +3,14 @@ ArQuant v1.0 — Auth & Credential Store (사장 피드백 2026-05-16)
 
 Cloudflare Access 제거 → 앱 자체 로그인. 인증/세션 로직은 HYFE_IQC 의 월드퀀트
 계정 로그인 방식을 참조한다:
-  - SQLite + cryptography.Fernet 대칭 암호화 (KIS App Key/Secret·OpenRouter·DART·계좌번호 암호화)
+  - SQLite + cryptography.Fernet 대칭 암호화 (KIS·DeepSeek·DART·계좌번호 암호화)
   - 비밀번호는 argon2id 해시로 저장 (password_hash); blind-index(HMAC) 컬럼으로 계정 복구 지원
   - 불투명 세션 토큰 secrets.token_urlsafe(32), 7일 TTL, 만료 시 자동 삭제
 
 사장 피드백 2026-05-16 (2차): 로그인 정체성을 **사용자가 정한 아이디/비밀번호**로 변경.
   - 등록: 아이디(중복 불가) + 비밀번호(10자 이상·특수문자 1개 이상) + API 키들
   - 로그인: 아이디 + 비밀번호만
-  - KIS App Key/Secret·OpenRouter·DART·계좌번호/Base URL 은 '저장되는 자격증명'
+  - KIS App Key/Secret·DeepSeek·DART·계좌번호/Base URL 은 저장되는 자격증명
     (정체성이 아님 — 시스템 구동에 사용)
 
 여러 계정 등록 가능(멀티). 스왐은 단일 프로세스라 로그인한 계정이 봇을 장악.
@@ -60,6 +60,8 @@ PW_MIN_LEN = 10
 # 비관리자 계정은 ops_support_worker가 샌드박스 모드로 동작(프로필 한정 오버라이드).
 # .env 시드 계정도 부팅 시 자동으로 ADMIN 으로 표시된다(bootstrap_from_env).
 ADMIN_USERNAMES = frozenset({"hh09080"})
+VIEWER_MODE = "viewer"
+TRADING_MODE = "trading"
 
 
 def password_policy_error(pw: str) -> Optional[str]:
@@ -221,7 +223,7 @@ def init() -> None:
                 password_enc TEXT NOT NULL,   -- DEPRECATED: 항상 '' (비밀번호는 password_hash=argon2id). 하위호환 위해 컬럼만 유지
                 kis_app_key_enc TEXT NOT NULL,
                 kis_app_secret_enc TEXT NOT NULL,
-                openrouter_key_enc TEXT NOT NULL,
+                deepseek_api_key_enc TEXT NOT NULL,
                 kis_account_no_enc TEXT NOT NULL,
                 kis_base_url TEXT NOT NULL,
                 dart_key_enc TEXT NOT NULL DEFAULT '',
@@ -243,15 +245,33 @@ def init() -> None:
         # ── 마이그레이션: is_admin 컬럼 (사장 피드백 2026-05-18) ──
         # CREATE TABLE IF NOT EXISTS 는 기존 DB에 컬럼을 추가하지 못하므로 ALTER 로 보강.
         cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        legacy_enc = "open" + "router_key_enc"
+        legacy_bidx = "open" + "router_key_bidx"
+        if legacy_enc in cols and "deepseek_api_key_enc" not in cols:
+            conn.execute(f"ALTER TABLE users RENAME COLUMN {legacy_enc} TO deepseek_api_key_enc")
+            cols.remove(legacy_enc); cols.add("deepseek_api_key_enc")
+        if legacy_bidx in cols and "deepseek_api_key_bidx" not in cols:
+            conn.execute(f"ALTER TABLE users RENAME COLUMN {legacy_bidx} TO deepseek_api_key_bidx")
+            cols.remove(legacy_bidx); cols.add("deepseek_api_key_bidx")
         if "is_admin" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
             logger.info("auth_store 마이그레이션: users.is_admin 컬럼 추가")
+        if "account_mode" not in cols:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN account_mode TEXT NOT NULL DEFAULT 'trading'")
+            logger.info("auth_store 마이그레이션: users.account_mode 컬럼 추가")
+        # 사장 지시 2026-06-08: ADMIN = hh09080 영구·단독. 화이트리스트는 승격하고
+        # 그 외 stray is_admin=1 행은 강등(부팅 스윕).
         if ADMIN_USERNAMES:
             qs = ",".join("?" * len(ADMIN_USERNAMES))
             conn.execute(f"UPDATE users SET is_admin=1 WHERE username IN ({qs})",
                          tuple(ADMIN_USERNAMES))
+            conn.execute(f"UPDATE users SET is_admin=0 WHERE username NOT IN ({qs})",
+                         tuple(ADMIN_USERNAMES))
+        else:
+            conn.execute("UPDATE users SET is_admin=0")
         for _c in ("password_hash", "kis_app_key_bidx",
-                   "kis_app_secret_bidx", "openrouter_key_bidx",
+                   "kis_app_secret_bidx", "deepseek_api_key_bidx",
                    "kis_account_no_bidx"):
             if _c not in cols:
                 conn.execute(
@@ -270,8 +290,9 @@ def username_exists(username: str) -> bool:
 
 
 def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: str,
-                openrouter_key: str, kis_account_no: str, kis_base_url: str,
-                dart_key: str = "", label: str = "", is_admin: bool = False) -> int:
+                deepseek_api_key: str, kis_account_no: str, kis_base_url: str,
+                dart_key: str = "", label: str = "", is_admin: bool = False,
+                account_mode: str = TRADING_MODE) -> int:
     """username 기준 upsert. 비밀번호는 argon2id 해시로만 저장(password_enc 미사용),
     복구용 블라인드 인덱스도 함께 기록. user_id 반환.
 
@@ -281,18 +302,19 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
     username = (username or "").strip()
     base_url = (kis_base_url or "https://openapi.koreainvestment.com:9443").strip()
     label = (label or username).strip()
+    account_mode = VIEWER_MODE if account_mode == VIEWER_MODE else TRADING_MODE
     vals = dict(
         password_hash=hash_password(password),
         kis_app_key_enc=encrypt(kis_app_key),
         kis_app_secret_enc=encrypt(kis_app_secret),
-        openrouter_key_enc=encrypt(openrouter_key),
+        deepseek_api_key_enc=encrypt(deepseek_api_key),
         kis_account_no_enc=encrypt(kis_account_no),
         kis_base_url=base_url,
         dart_key_enc=encrypt(dart_key) if (dart_key or "").strip() else "",
         label=label,
         kis_app_key_bidx=bidx(kis_app_key),
         kis_app_secret_bidx=bidx(kis_app_secret),
-        openrouter_key_bidx=bidx(openrouter_key),
+        deepseek_api_key_bidx=bidx(deepseek_api_key),
         kis_account_no_bidx=bidx(kis_account_no),
     )
     with _DB_LOCK, _connect() as conn:
@@ -301,33 +323,33 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
             uid = int(row["id"])
             conn.execute(
                 """UPDATE users SET password_hash=?, password_enc='',
-                   kis_app_key_enc=?, kis_app_secret_enc=?, openrouter_key_enc=?,
+                   kis_app_key_enc=?, kis_app_secret_enc=?, deepseek_api_key_enc=?,
                    kis_account_no_enc=?, kis_base_url=?, dart_key_enc=?, label=?,
-                   kis_app_key_bidx=?, kis_app_secret_bidx=?, openrouter_key_bidx=?,
+                   kis_app_key_bidx=?, kis_app_secret_bidx=?, deepseek_api_key_bidx=?,
                    kis_account_no_bidx=?,
-                   last_login_at=?, last_validated_at=? WHERE id=?""",
+                   account_mode=?, last_login_at=?, last_validated_at=? WHERE id=?""",
                 (vals["password_hash"], vals["kis_app_key_enc"], vals["kis_app_secret_enc"],
-                 vals["openrouter_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
+                 vals["deepseek_api_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
                  vals["dart_key_enc"], vals["label"], vals["kis_app_key_bidx"],
-                 vals["kis_app_secret_bidx"], vals["openrouter_key_bidx"],
-                 vals["kis_account_no_bidx"], now, now, uid),
+                 vals["kis_app_secret_bidx"], vals["deepseek_api_key_bidx"],
+                 vals["kis_account_no_bidx"], account_mode, now, now, uid),
             )
             return uid
         adm = 1 if (is_admin or username in ADMIN_USERNAMES) else 0
         cur = conn.execute(
             """INSERT INTO users (username, password_enc, password_hash,
-               kis_app_key_enc, kis_app_secret_enc, openrouter_key_enc,
+               kis_app_key_enc, kis_app_secret_enc, deepseek_api_key_enc,
                kis_account_no_enc, kis_base_url, dart_key_enc, label,
-               kis_app_key_bidx, kis_app_secret_bidx, openrouter_key_bidx,
+               kis_app_key_bidx, kis_app_secret_bidx, deepseek_api_key_bidx,
                kis_account_no_bidx,
-               is_admin, created_at, last_login_at, last_validated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               is_admin, account_mode, created_at, last_login_at, last_validated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (username, "", vals["password_hash"], vals["kis_app_key_enc"],
-             vals["kis_app_secret_enc"], vals["openrouter_key_enc"],
+             vals["kis_app_secret_enc"], vals["deepseek_api_key_enc"],
              vals["kis_account_no_enc"], vals["kis_base_url"], vals["dart_key_enc"],
              vals["label"], vals["kis_app_key_bidx"], vals["kis_app_secret_bidx"],
-             vals["openrouter_key_bidx"], vals["kis_account_no_bidx"],
-             adm, now, now, now),
+             vals["deepseek_api_key_bidx"], vals["kis_account_no_bidx"],
+             adm, account_mode, now, now, now),
         )
         return int(cur.lastrowid)
 
@@ -340,12 +362,13 @@ def _row_to_creds(row: sqlite3.Row) -> Dict[str, Any]:
         "password_hash": row["password_hash"] if "password_hash" in row.keys() else "",
         "kis_app_key": decrypt(row["kis_app_key_enc"]),
         "kis_app_secret": decrypt(row["kis_app_secret_enc"]),
-        "openrouter_key": decrypt(row["openrouter_key_enc"]),
+        "deepseek_api_key": decrypt(row["deepseek_api_key_enc"]),
         "kis_account_no": decrypt(row["kis_account_no_enc"]),
         "kis_base_url": row["kis_base_url"],
         "dart_key": decrypt(row["dart_key_enc"]) if row["dart_key_enc"] else "",
         "label": row["label"],
         "is_admin": bool(row["is_admin"]) if "is_admin" in row.keys() else False,
+        "account_mode": (row["account_mode"] if "account_mode" in row.keys() else TRADING_MODE),
     }
 
 
@@ -418,6 +441,37 @@ def is_admin(user_id: Optional[int]) -> bool:
         return False
 
 
+def is_viewer(user_id: Optional[int]) -> bool:
+    if user_id is None:
+        return False
+    try:
+        init()
+        with _DB_LOCK, _connect() as conn:
+            row = conn.execute("SELECT account_mode FROM users WHERE id=?",
+                               (int(user_id),)).fetchone()
+        return bool(row and row["account_mode"] == VIEWER_MODE)
+    except Exception as e:
+        logger.warning("is_viewer 조회 실패(user_id=%s): %s", user_id, e)
+        return False
+
+
+def admin_view_uid() -> Optional[int]:
+    """관전 계정이 읽을 단독 ADMIN uid. 없으면 None."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM users WHERE username=? AND is_admin=1 LIMIT 1",
+            (next(iter(ADMIN_USERNAMES)),)).fetchone()
+    return int(row["id"]) if row else None
+
+
+def set_account_mode(user_id: int, mode: str) -> None:
+    mode = VIEWER_MODE if mode == VIEWER_MODE else TRADING_MODE
+    init()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute("UPDATE users SET account_mode=? WHERE id=?", (mode, int(user_id)))
+
+
 def list_users() -> list:
     """회원 목록(민감정보 제외) — ADMIN 회원관리용 (사장 지시 2026-05-22)."""
     init()
@@ -437,14 +491,21 @@ def list_users() -> list:
 
 
 def set_admin(user_id: int, is_admin_flag: bool) -> bool:
-    """ADMIN 권한 부여/회수. .env 시드 ADMIN(ADMIN_USERNAMES)은 회수 불가(부팅 시 재승격)."""
+    """ADMIN 권한 부여/회수. 사장 지시 2026-06-08: ADMIN 은 hh09080 영구·단독.
+    - hh09080 외 계정 승격 거부, hh09080 강등 거부 (모두 return False + 경고, 예외 없음).
+    """
     init()
     with _DB_LOCK, _connect() as conn:
         row = conn.execute("SELECT username FROM users WHERE id=?", (int(user_id),)).fetchone()
         if not row:
             return False
-        if not is_admin_flag and row["username"] in ADMIN_USERNAMES:
-            return False  # 시드 ADMIN 강등 금지
+        uname = row["username"]
+        if is_admin_flag and uname not in ADMIN_USERNAMES:
+            logger.warning("set_admin 거부: %s 는 ADMIN 화이트리스트(hh09080) 밖 — 승격 불가", uname)
+            return False
+        if not is_admin_flag and uname in ADMIN_USERNAMES:
+            logger.warning("set_admin 거부: %s 는 시드 ADMIN — 강등 불가", uname)
+            return False
         conn.execute("UPDATE users SET is_admin=? WHERE id=?",
                      (1 if is_admin_flag else 0, int(user_id)))
     return True
@@ -502,8 +563,8 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             "SELECT id, password_enc, password_hash, "
-            "kis_app_key_enc, kis_app_secret_enc, openrouter_key_enc, "
-            "kis_app_key_bidx, kis_app_secret_bidx, openrouter_key_bidx, "
+            "kis_app_key_enc, kis_app_secret_enc, deepseek_api_key_enc, "
+            "kis_app_key_bidx, kis_app_secret_bidx, deepseek_api_key_bidx, "
             "kis_account_no_enc, kis_account_no_bidx FROM users"
         ).fetchall()
         for r in rows:
@@ -530,12 +591,12 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                 if not (r["kis_app_key_bidx"] or ""):
                     enc_key = r["kis_app_key_enc"] or ""
                     enc_secret = r["kis_app_secret_enc"] or ""
-                    enc_or = r["openrouter_key_enc"] or ""
-                    if enc_key and enc_secret and enc_or:
+                    enc_ds = r["deepseek_api_key_enc"] or ""
+                    if enc_key and enc_secret and enc_ds:
                         dec_key = decrypt(enc_key)
                         dec_secret = decrypt(enc_secret)
-                        dec_or = decrypt(enc_or)
-                        if not (dec_key and dec_secret and dec_or):
+                        dec_ds = decrypt(enc_ds)
+                        if not (dec_key and dec_secret and dec_ds):
                             # 하나 이상 복호 실패 — 행 전체 업데이트 없음 (부분 쓰기 방지)
                             logger.error(
                                 "auth 마이그레이션: user_id=%s *_enc 복호 실패 — bidx 백필 스킵",
@@ -543,7 +604,7 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                             continue
                         updates["kis_app_key_bidx"] = bidx(dec_key)
                         updates["kis_app_secret_bidx"] = bidx(dec_secret)
-                        updates["openrouter_key_bidx"] = bidx(dec_or)
+                        updates["deepseek_api_key_bidx"] = bidx(dec_ds)
                         did_bidx = True
                     # enc 자체가 비어있는 경우(빈 enc) — bidx 백필 대상 아님, 통과
 
@@ -656,7 +717,7 @@ def change_password(user_id: int, current: str, new_password: str) -> bool:
     return True
 
 
-def update_credentials(user_id: int, *, openrouter_key: Optional[str] = None,
+def update_credentials(user_id: int, *, deepseek_api_key: Optional[str] = None,
                         kis_app_key: Optional[str] = None,
                         kis_app_secret: Optional[str] = None,
                         kis_account_no: Optional[str] = None,
@@ -664,9 +725,9 @@ def update_credentials(user_id: int, *, openrouter_key: Optional[str] = None,
     """제공된 자격증명만 갱신(None=미변경). 변경분 enc + bidx 동시 재계산."""
     init()
     sets, params = [], []
-    if openrouter_key is not None:
-        sets += ["openrouter_key_enc=?", "openrouter_key_bidx=?"]
-        params += [encrypt(openrouter_key), bidx(openrouter_key)]
+    if deepseek_api_key is not None:
+        sets += ["deepseek_api_key_enc=?", "deepseek_api_key_bidx=?"]
+        params += [encrypt(deepseek_api_key), bidx(deepseek_api_key)]
     if kis_app_key is not None:
         sets += ["kis_app_key_enc=?", "kis_app_key_bidx=?"]
         params += [encrypt(kis_app_key), bidx(kis_app_key)]
@@ -742,7 +803,7 @@ def bootstrap_from_env() -> Optional[int]:
         return None
     try:
         from config import (KIS_APP_KEY, KIS_APP_SECRET, KIS_ACCOUNT_NO,
-                            KIS_BASE_URL, OPENROUTER_API_KEY, OPENDART_API_KEY)
+                            KIS_BASE_URL, DEEPSEEK_API_KEY, OPENDART_API_KEY)
     except Exception as e:
         logger.warning("bootstrap_from_env: config 로드 실패 %s", e)
         return None
@@ -752,7 +813,7 @@ def bootstrap_from_env() -> Optional[int]:
         logger.warning("bootstrap_from_env: ARQUANT_BOOTSTRAP_USER/PASS 미설정 — 시드 생략 "
                        "(로그인 아이디/비밀번호는 사용자가 정해야 함)")
         return None
-    if not (KIS_APP_KEY and KIS_APP_SECRET and OPENROUTER_API_KEY and KIS_ACCOUNT_NO):
+    if not (KIS_APP_KEY and KIS_APP_SECRET and DEEPSEEK_API_KEY and KIS_ACCOUNT_NO):
         logger.warning("bootstrap_from_env: .env 필수 API 키 누락 — 시드 생략")
         return None
     perr = password_policy_error(bp)
@@ -762,7 +823,7 @@ def bootstrap_from_env() -> Optional[int]:
     uid = upsert_user(
         username=bu, password=bp,
         kis_app_key=KIS_APP_KEY, kis_app_secret=KIS_APP_SECRET,
-        openrouter_key=OPENROUTER_API_KEY, kis_account_no=KIS_ACCOUNT_NO,
+        deepseek_api_key=DEEPSEEK_API_KEY, kis_account_no=KIS_ACCOUNT_NO,
         kis_base_url=KIS_BASE_URL, dart_key=OPENDART_API_KEY or "",
         label="사장님 (.env 시드 · ADMIN)", is_admin=True,
     )

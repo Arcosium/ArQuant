@@ -3,17 +3,36 @@
 사장 지시 2026-05-26: 운용지원실장은 ADMIN·일반 유저 모두 파라미터 튜닝이 역할이므로,
 비관리자에게 '코드 변경 불가' 거부 메시지나 ADMIN 아이디(hh09080)를 출력하지 않는다.
 
-These tests must stay OFFLINE/deterministic: no real OpenRouter key is present.
+These tests stay offline and deterministic.
 """
 import asyncio
+import pytest
+import main_swarm
+from main_swarm import ArquantOrchestrator
 from infra.user_context import UserContext
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_live(monkeypatch):
+    """이 테스트는 실제 uid 에 바인딩된 오케스트레이터로 ceo_directive 를 호출하므로, 라이브 부작용
+    (워커 subprocess spawn·LLM 호출·param_overrides 변경·대시보드 broadcast·응답로그 기록)을 반드시
+    차단한다. 검증 대상은 ceo_directive 의 '동기 반환(라우팅·문구)'뿐이다.
+    회귀 2026-06-09: 이 격리가 없어 pytest 실행이 운영 데이터(uid 3 TAKE_PROFIT_PCT 등)를 오염시켰다."""
+    async def _noop_broadcast(*a, **k):
+        return None
+    monkeypatch.setattr(main_swarm, "_broadcast", _noop_broadcast)
+    monkeypatch.setattr(ArquantOrchestrator, "_spawn_ops_support_worker",
+                        lambda self, *a, **k: None)
+    async def _noop_persist(self, *a, **k):
+        return None
+    monkeypatch.setattr(ArquantOrchestrator, "_auto_persist_directive", _noop_persist)
 
 
 def _ctx(uid, admin):
     return UserContext({"id": uid, "username": f"u{uid}", "is_admin": admin,
         "kis_app_key": "K", "kis_app_secret": "S", "kis_account_no": "1-01",
         "kis_base_url": "https://openapivts.koreainvestment.com:29443",
-        "openrouter_key": "OR", "dart_key": "", "label": "x"})
+        "deepseek_api_key": "DS", "dart_key": "", "label": "x"})
 
 
 def test_non_admin_ops_support_not_refused_and_no_admin_id_leak():

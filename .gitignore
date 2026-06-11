@@ -159,3 +159,12 @@ build.log
 
 # QEMU 빌드 코어 덤프
 *.core
+data/1/equity_curve.json
+data/1/overseas_krw_cache.json
+data/1/trade_log.json
+data/2/equity_curve.json
+data/2/trade_log.json
+data/3/trade_log.json
+data/4/trade_log.json
+data/strategy_state.json
+data/nxt_untradable.json

@@ -106,7 +106,7 @@ Expected: FAIL — `kis_account_no_bidx` 컬럼/통계 키 없음.
 `infra/auth_store.py` `init()` 의 컬럼 루프를 수정:
 ```python
         for _c in ("password_hash", "kis_app_key_bidx",
-                   "kis_app_secret_bidx", "openrouter_key_bidx",
+                   "kis_app_secret_bidx", "deepseek_api_key_bidx",
                    "kis_account_no_bidx"):
             if _c not in cols:
                 conn.execute(
@@ -116,14 +116,14 @@ Expected: FAIL — `kis_account_no_bidx` 컬럼/통계 키 없음.
 
 - [ ] **Step 4: 구현 — upsert_user 가 account bidx 기록**
 
-`vals = dict(...)` 의 `openrouter_key_bidx=bidx(openrouter_key),` 다음 줄 추가:
+`vals = dict(...)` 의 `deepseek_api_key_bidx=bidx(deepseek_api_key),` 다음 줄 추가:
 ```python
         kis_account_no_bidx=bidx(kis_account_no),
 ```
-UPDATE SET 절에 `kis_account_no_bidx=?` 추가, 값 튜플의 `vals["openrouter_key_bidx"]`
+UPDATE SET 절에 `kis_account_no_bidx=?` 추가, 값 튜플의 `vals["deepseek_api_key_bidx"]`
 뒤에 `vals["kis_account_no_bidx"]` 추가. INSERT 컬럼리스트에
 `kis_account_no_bidx` 추가, VALUES `?` 1개 추가, 값 튜플의
-`vals["openrouter_key_bidx"]` 뒤(`adm` 앞)에 `vals["kis_account_no_bidx"]` 추가.
+`vals["deepseek_api_key_bidx"]` 뒤(`adm` 앞)에 `vals["kis_account_no_bidx"]` 추가.
 
 - [ ] **Step 5: 구현 — 마이그레이션 백필**
 
@@ -268,7 +268,7 @@ def reset_password_by_factors(username: str, kis_account_no: str,
 
 `tests/test_auth_recovery.py` 내 `find_username_by_factors`/
 `reset_password_by_factors` 호출을 2인자(`kis_account_no, kis_app_secret`)로
-수정(app_key/openrouter 인자 제거, 계좌번호 사용). 파일 내 모든 해당 호출.
+수정(app_key/DeepSeek 인자 제거, 계좌번호 사용). 파일 내 모든 해당 호출.
 
 - [ ] **Step 5: 통과 확인**
 
@@ -411,7 +411,7 @@ def change_password(user_id: int, current: str, new_password: str) -> bool:
     return True
 
 
-def update_credentials(user_id: int, *, openrouter_key: Optional[str] = None,
+def update_credentials(user_id: int, *, deepseek_api_key: Optional[str] = None,
                         kis_app_key: Optional[str] = None,
                         kis_app_secret: Optional[str] = None,
                         kis_account_no: Optional[str] = None,
@@ -419,9 +419,9 @@ def update_credentials(user_id: int, *, openrouter_key: Optional[str] = None,
     """제공된 자격증명만 갱신(None=미변경). 변경분 enc + bidx 동시 재계산."""
     init()
     sets, params = [], []
-    if openrouter_key is not None:
-        sets += ["openrouter_key_enc=?", "openrouter_key_bidx=?"]
-        params += [encrypt(openrouter_key), bidx(openrouter_key)]
+    if deepseek_api_key is not None:
+        sets += ["deepseek_api_key_enc=?", "deepseek_api_key_bidx=?"]
+        params += [encrypt(deepseek_api_key), bidx(deepseek_api_key)]
     if kis_app_key is not None:
         sets += ["kis_app_key_enc=?", "kis_app_key_bidx=?"]
         params += [encrypt(kis_app_key), bidx(kis_app_key)]
@@ -607,7 +607,7 @@ class PwChangeReq(BaseModel):
     new: str
 
 class CredsReq(BaseModel):
-    openrouter_key: Optional[str] = None
+    deepseek_api_key: Optional[str] = None
     kis_app_key: Optional[str] = None
     kis_app_secret: Optional[str] = None
     kis_account_no: Optional[str] = None
@@ -639,12 +639,12 @@ async def profile_credentials(req: CredsReq, request: Request):
         ok, msg = await _validate_kis(ak, as_, bu)
         if not ok:
             raise HTTPException(400, msg)
-    if req.openrouter_key is not None:
-        ok, msg = await _validate_openrouter(req.openrouter_key)
+    if req.deepseek_api_key is not None:
+        ok, msg = await _validate_deepseek(req.deepseek_api_key)
         if not ok:
             raise HTTPException(400, msg)
     auth_store.update_credentials(
-        uid, openrouter_key=req.openrouter_key, kis_app_key=req.kis_app_key,
+        uid, deepseek_api_key=req.deepseek_api_key, kis_app_key=req.kis_app_key,
         kis_app_secret=req.kis_app_secret, kis_account_no=req.kis_account_no,
         kis_base_url=req.kis_base_url)
     if creds_layer.current().get("user_id") == uid:
@@ -835,7 +835,7 @@ CSS 추가: `.pf-sec{border-top:1px solid #232c3b;padding:12px 0}.pf-sec input{w
     </div>
     <div class="pf-sec"><button class="btn" onclick="pfLogout()">로그아웃</button></div>
     <div class="pf-sec"><b>비밀번호 변경</b><input id="pf_cur" type="password" placeholder="현재 비밀번호"><input id="pf_new" type="password" placeholder="새 비밀번호(10자+특수문자)"><button class="btn" onclick="pfChangePw()">변경</button> <span id="pf_pwmsg"></span></div>
-    <div class="pf-sec"><b>정보 변경</b><input id="pf_or" placeholder="OpenRouter Key(미입력=유지)"><input id="pf_ak" placeholder="KIS App Key"><input id="pf_as" placeholder="KIS App Secret"><input id="pf_acct2" placeholder="한국투자증권 계좌번호"><input id="pf_url" placeholder="KIS Base URL"><button class="btn" onclick="pfSaveCreds()">저장</button> <span id="pf_cmsg"></span></div>
+    <div class="pf-sec"><b>정보 변경</b><input id="pf_or" placeholder="DeepSeek Key(미입력=유지)"><input id="pf_ak" placeholder="KIS App Key"><input id="pf_as" placeholder="KIS App Secret"><input id="pf_acct2" placeholder="한국투자증권 계좌번호"><input id="pf_url" placeholder="KIS Base URL"><button class="btn" onclick="pfSaveCreds()">저장</button> <span id="pf_cmsg"></span></div>
     <div class="pf-sec"><b>사장님 상시 지시사항</b><div id="pf_dirs"></div><input id="pf_dir" placeholder="새 지시사항"><button class="btn" onclick="pfAddDir()">추가</button></div>
     <div class="pf-sec" id="pf_admin_sec" style="display:none"><b>회원 관리 (ADMIN)</b><div id="pf_members"></div></div>
     <div class="pf-sec"><button class="btn" style="color:#fca5a5" onclick="pfDeleteAccount()">회원 탈퇴</button></div>
@@ -865,7 +865,7 @@ async function pfChangePw(){
   document.getElementById('pf_pwmsg').textContent=r.ok?'변경됨':((await r.json()).detail||'실패');}
 async function pfSaveCreds(){
   const g=id=>document.getElementById(id).value,b={};
-  if(g('pf_or'))b.openrouter_key=g('pf_or');if(g('pf_ak'))b.kis_app_key=g('pf_ak');
+  if(g('pf_or'))b.deepseek_api_key=g('pf_or');if(g('pf_ak'))b.kis_app_key=g('pf_ak');
   if(g('pf_as'))b.kis_app_secret=g('pf_as');if(g('pf_acct2'))b.kis_account_no=g('pf_acct2');
   if(g('pf_url'))b.kis_base_url=g('pf_url');
   const r=await fetch(API+'/api/profile/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
@@ -906,7 +906,7 @@ async function pfDeleteAccount(){
 - [ ] **Step 4: 복구 패널 2필드로**
 
 `#recoverPanel`(line ~265~) 입력을 **한국투자증권 계좌번호 + 한국투자증권
-App Secret** 2개로 교체(기존 App Key/OpenRouter 입력 제거). 복구 호출 JS body:
+App Secret** 2개로 교체(기존 App Key/DeepSeek 입력 제거). 복구 호출 JS body:
 아이디 찾기 `{kis_account_no, kis_app_secret}`, 비번 재설정
 `{username, kis_account_no, kis_app_secret, new_password}`. 응답 메시지는
 `textContent` 로만 표시(innerHTML 금지).
@@ -934,7 +934,7 @@ git commit -m "feat(spa): 배지 이동 + 프로필 모달(XSS-safe) + ADMIN 회
 `ArQuantApi.kt`: `RecoverIdRequest` → `kisAccountNo`(`@SerialName("kis_account_no")`),
 `kisAppSecret`(`@SerialName("kis_app_secret")`). `RecoverPwRequest` →
 `username`, `kisAccountNo`, `kisAppSecret`, `newPassword`. 기존
-kisAppKey/openrouterKey 필드 제거.
+kisAppKey/deepseekApiKey 필드 제거.
 
 - [ ] **Step 2: ViewModel/Repository 시그니처 2인자**
 
@@ -944,7 +944,7 @@ kisAppKey/openrouterKey 필드 제거.
 - [ ] **Step 3: LoginScreen 복구 폼 2필드**
 
 `LoginScreen.kt` `RecoverIdForm`/`RecoverPwForm` 입력을 "한국투자증권
-계좌번호" + "한국투자증권 App Secret" 2개로 교체(App Key/OpenRouter 제거).
+계좌번호" + "한국투자증권 App Secret" 2개로 교체(App Key/DeepSeek 제거).
 
 - [ ] **Step 4: APK 재빌드**
 ```bash

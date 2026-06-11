@@ -15,6 +15,7 @@ from agents.specialists import (create_macro_analyst, create_quant_analyst, crea
 from agents.guardrails import create_risk_guard, validate_order_draft
 from infra.kis_broker import OrderDraft, PriceType, compute_nxt_limit_price
 from infra import cycle_store, notifier, metrics, admin_config
+from infra import nxt_blacklist, trade_ledger
 from infra.error_log import record_error
 from infra.market_intel import get_intel_store
 from tools.news_monitor import get_monitor
@@ -339,7 +340,8 @@ def _detect_external_flow(prev: Optional[Dict], curr: Dict) -> float:
     return 0.0
 
 def record_equity(equity_path, bp: dict, source: str = "poll", holdings: Optional[List[Dict]] = None,
-                  kospi: Optional[float] = None, nasdaq: Optional[float] = None):
+                  kospi: Optional[float] = None, nasdaq: Optional[float] = None,
+                  ledger_eval: Optional[float] = None):
     """Append a {ts,total_eval,cash,pnl_ratio,holdings,external_flow_cum,kospi,nasdaq} point — at most one per 60s.
     Caps at 2000 points. `holdings` (optional list of {code,qty}) is used to detect external cashflow
     (deposits/withdrawals) vs trade-driven changes — see _detect_external_flow().
@@ -384,6 +386,13 @@ def record_equity(equity_path, bp: dict, source: str = "poll", holdings: Optiona
                  "cash": float(bp.get("cash") or 0.0),
                  "pnl_ratio": float(bp.get("pnl_ratio") or 0.0),
                  "src": source}
+        # 사장 지시 2026-06-11: 실거래 원장 평가(KIS 집계 TR 비의존). 이 값이 있는 포인트가
+        # 곡선·KPI 의 1순위 시리즈가 된다 (_equity_points 참조).
+        try:
+            if ledger_eval is not None and float(ledger_eval) > 0:
+                entry["ledger_eval"] = float(ledger_eval)
+        except (TypeError, ValueError):
+            pass
         if holdings_snap:
             entry["holdings"] = holdings_snap
         # 사장 지시 2026-05-21: 잔고와 함께 수집한 지수 현재값을 같이 저장 (벤치마크 일중 오버레이)
@@ -455,9 +464,30 @@ def is_market_session_now(dt: Optional[datetime] = None) -> bool:
 def _equity_points(raw_equity, *, glitch_pct: float = 0.10):
     """정렬된 [(dt, adj_total, point)] — 입출금 보정(adj) 적용 + 결제 글리치 carry-forward.
 
+    사장 지시 2026-06-11(수익률 환각 수정): 실거래 원장 평가(ledger_eval)가 기록된 포인트가
+    하나라도 있으면 '그 시리즈만' 사용한다. KIS 집계 TR(총평가)은 3종 TR 자기불일치·USD 결제
+    과도기·해외평가 증발(외화예수금 미포함)로 가짜 -43%류 수익률을 만들었다 — 원장 평가는
+    우리 체결만으로 굴러가 결정론적이다. (원장 포인트가 없으면 기존 KIS 곡선 로직 유지.)
+
     사장 지시 2026-05-22: 보유 종목 변동이 없는데 총평가가 비정상 급변(>glitch_pct)하면 KIS
     결제 과도기 글리치로 보고 직전 값을 유지(carry-forward)해, 누적수익·MDD·그래프에 가짜
     스파이크가 끼지 않게 한다. (보유가 실제로 바뀐 시점은 정상 변동이라 그대로 둔다.)"""
+    ledger_pts = []
+    for p in (raw_equity or []):
+        if not isinstance(p, dict):
+            continue
+        try:
+            lv = float(p.get("ledger_eval") or 0.0)
+        except (TypeError, ValueError):
+            lv = 0.0
+        if lv <= 0:
+            continue
+        dt = _ts_to_kst(p.get("ts", ""))
+        if dt:
+            ledger_pts.append((dt, lv, {**p, "adj_total_eval": lv}))
+    if ledger_pts:
+        ledger_pts.sort(key=lambda x: x[0])
+        return ledger_pts
     enriched = []
     for p in (raw_equity or []):
         if not isinstance(p, dict) or not p.get("total_eval"):
@@ -2606,6 +2636,12 @@ class _ExecutionMixin:
             res = await self.broker.place_order(od)
             badge = "⏱ 분봉 진입 매수 발동" if triggered else "⌛ 3시간 타임아웃 매수"
             accepted = all(bad not in res for bad in ("실패", "에러", "거부", "예외", "REJECT"))
+            # 사장 지시 2026-06-11: NXT 미상장 거부 학습 (전 계정 공유) — 메인 실행 경로와 동일.
+            if getattr(od, "exchange", "") == "NXT" and nxt_blacklist.looks_nxt_unsupported(res):
+                try:
+                    nxt_blacklist.record(ticker, note=res[:120])
+                except Exception as _ne:
+                    logger.warning(f"NXT 블랙리스트 기록 실패({ticker}): {_ne}")
             # 즉시 체결 확인 (KR 2초 후 보유 재조회 / US 는 즉시 확인 불가 → 폴링)
             filled = False; fill_note = ""; fill_price = None; avg_cost = None
             if accepted and is_kr:
@@ -2633,6 +2669,13 @@ class _ExecutionMixin:
                                         "qty": qty, "result": res, "filled": True, "ok": True, "watch": True,
                                         "fill_price": fill_price, "avg_cost": avg_cost,
                                         "fill_currency": "KRW"})
+                # 사장 지시 2026-06-11: 실거래 원장에 체결 반영.
+                try:
+                    trade_ledger.apply_fill(self.uid, ticker=ticker, side="buy", qty=qty,
+                                            price=fill_price, ccy="KRW", avg_cost=avg_cost,
+                                            note="entry_watch")
+                except Exception as _le:
+                    logger.warning(f"[원장 uid={self.uid}] 진입감시 체결 반영 실패 {ticker}: {_le}")
             # 모바일 알림 ①: 체결 신청(접수)
             if accepted:
                 await self._emit({"type": "order_submitted", "agent": "프롭트레이딩팀장",
@@ -2667,6 +2710,11 @@ class _ExecutionMixin:
         od.exchange = kr_exchange_for_session(session)
         if not is_kr_extended_hours(session):
             return od, None
+        # 사장 지시 2026-06-11: 과거 NXT 거부('종목정보가 없습니다')로 학습된 종목은 주문 시도
+        # 자체를 생략한다 (전 계정 공유 블랙리스트). 153130 매도가 4사이클 연속 거부된 사례 방지.
+        if nxt_blacklist.is_blocked(od.ticker):
+            return od, (f"{od.ticker} NXT 거래불가 학습 종목 — 시간외 주문 생략 "
+                        f"(정규장에서 재시도)")
         # NXT 전용 시세가 있어야 NXT 주문을 낸다. KRX(J) 시세로 폴백하면 NXT 미상장
         # ETF도 가격 산정에 성공해 거래소에서 반복 거부된다.
         try:
@@ -2774,10 +2822,22 @@ class _ExecutionMixin:
                                                 "fill_note": "5분 폴링 후 체결 확인",
                                                 "fill_price": fill_price, "avg_cost": avg_cost,
                                                 "fill_currency": ("KRW" if is_kr_tk else "USD")})
+                        # 사장 지시 2026-06-11: 실거래 원장에 체결 반영 — KIS 집계 비의존 자산평가의 근거.
+                        try:
+                            trade_ledger.apply_fill(self.uid, ticker=tk, side=side, qty=qty,
+                                                    price=fill_price, ccy=("KRW" if is_kr_tk else "USD"),
+                                                    avg_cost=avg_cost, note="poll_confirm")
+                        except Exception as _le:
+                            logger.warning(f"[원장 uid={self.uid}] 폴링 체결 반영 실패 {tk}: {_le}")
+                        # 사장 지시 2026-06-11(수익률 환각 수정): 영속 이벤트에도 체결가·평단·통화를 싣는다.
+                        # 기존엔 in-memory _trade_log 에만 있어 — US(폴링 확정 전용)는 영속 trade_log 에
+                        # 가격/원가가 전부 None 으로 남아 실현손익 KPI 가 0 으로 날조(미상)됐다.
                         await self._emit({"type": "trade_executed", "agent": "프롭트레이딩팀장",
                             "message": (f"✅ {tk} {('매수' if side == 'buy' else '매도')} {qty}주 체결 확인됨 — "
                                         f"보유 {before_qty}→{after_qty}주 (누적 체결 {self._trades_executed}건)"),
                             "ticker": tk, "side": side, "qty": qty, "filled": True,
+                            "fill_price": fill_price, "avg_cost": avg_cost,
+                            "fill_currency": ("KRW" if is_kr_tk else "USD"),
                             "trades_total": self._trades_executed})
                         # 사장 지시 2026-05-29(KR/US 비대칭 버그 수정): US 비동기 매수도 체결 확정 시점에
                         # 펀드기획팀장 thesis 를 기록한다. 기존엔 동기 실행부 `if filled:` 에서만 기록돼
@@ -2947,7 +3007,10 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
         사장 피드백 2026-05-16: **마켓센티먼트팀장이 짚은 포인트 + 실제 검증 지수**를 검색 쿼리에
         주입해, 정적 질문이 아니라 '오늘 실제로 움직인 것'을 출발점으로 심층 검색하게 한다.
         세션 캐시(30분)지만 뉴스/지수 컨텍스트가 바뀌면 캐시를 무시하고 새로 검색.
-        실패 시 빈 문자열 — fail-open (최종 작성은 deepseek-v4-flash = macro_analyst)."""
+        실패 시 빈 문자열 — fail-open.
+        모델 분담(사장 확인 2026-06-11): 이 search 단계 = macro_researcher(deepseek-v4-flash,
+        Hermes 도구 tool-calling 필수라 pro 불가) → 최종 매크로 리포트·자산배분 '결정' =
+        macro_analyst(글로벌리서치팀장, deepseek-v4-pro)가 작성한다."""
         cache_key = "KR" if is_kr_session(session) else ("US" if session == "US_TRADING" else "OFF")
         # 컨텍스트 시그니처 — 뉴스/지수가 실질적으로 바뀌면 캐시 무효화
         _ctx_sig = str(hash((cache_key, (news_digest or "")[:1500], (index_digest or "")[:600])))
@@ -3184,8 +3247,28 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                         _q = await self.broker.us_last_price("QQQ")
                         nasdaq = _q if (_q and _q > 0) else None
                     except Exception: nasdaq = None
+                    # 사장 지시 2026-06-11: 실거래 원장 평가 — KIS 집계 TR 대신 자체 체결 원장 M2M.
+                    # (최초 1회 KIS 보유/예수금으로 시드 후, 이후엔 우리 체결만으로 진화.)
+                    led_val = None
+                    try:
+                        led_val = await trade_ledger.ensure_value(
+                            self.uid, self.broker, snap, fx=get_usdkrw(USDKRW_FALLBACK))
+                    except Exception as _le:
+                        logger.warning(f"[원장 uid={self.uid}] 평가 실패(이번 포인트는 KIS 곡선만): {_le}")
                     record_equity(self.equity_path, bp, "poll", holdings=snap.get("holdings") or [],
-                                  kospi=kospi, nasdaq=nasdaq)
+                                  kospi=kospi, nasdaq=nasdaq, ledger_eval=led_val)
+                    # 원장-KIS 보유수량 대조 — 수동거래/입출금/체결누락 조기탐지 (30분에 1회).
+                    try:
+                        self._ledger_recon_tick = getattr(self, "_ledger_recon_tick", 0) + 1
+                        if self._ledger_recon_tick % 6 == 1:
+                            _diffs = trade_ledger.reconcile(self.uid, snap.get("holdings") or [])
+                            if _diffs:
+                                logger.warning(f"[원장대조 uid={self.uid}] 보유수량 괴리: {'; '.join(_diffs)}")
+                                notifier.alert("WARN", "원장-KIS 보유 괴리",
+                                               f"uid={self.uid} {'; '.join(_diffs[:5])} — 수동거래/입출금 시 /api/ledger/reseed 필요",
+                                               dedup_key=f"ledger_recon:{self.uid}")
+                    except Exception:
+                        pass
                     # 사장 지시 2026-06-01: KIS 실현손익(TTTC8494R) 감사 대조 — 실전·약 30분마다 1회
                     # 로깅(주문·표시 무영향). 우리 체결기반 수익률 KPI 와 교차검증해 드리프트 조기탐지.
                     try:
@@ -3753,6 +3836,14 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 candidate_codes = [c for c in candidate_codes if not (_is_kr_code(c))]
             elif is_kr_tradable(session):
                 candidate_codes = [c for c in candidate_codes if _is_kr_code(c)]
+            # 사장 지시 2026-06-11: 시간외(NXT) 세션에선 NXT 거래불가 학습 종목을 매수 후보에서
+            # 선제 제외한다 (전 계정 공유) — 주문 단계 보류 메시지가 매 사이클 반복되는 것 방지.
+            if is_kr_extended_hours(session) and candidate_codes:
+                _nxt_drop = [c for c in candidate_codes if nxt_blacklist.is_blocked(c)]
+                if _nxt_drop:
+                    candidate_codes = [c for c in candidate_codes if c not in _nxt_drop]
+                    await self._emit({"type": "agent_msg", "agent": "시스템",
+                        "message": f"🚫 NXT 거래불가 학습 종목 후보 제외: {', '.join(_nxt_drop)} (정규장에서만 거래)"})
             candidate_codes = candidate_codes[:5]
             # C (사장 지시 2026-05-28): 후보 해석이 0건인데 뉴스 신호가 있으면 뉴스 괄호표기 종목으로 보강 —
             # '뉴스만 있고 후보 0'으로 사이클이 낭비되는 것 방지(uid2 cycle24 MU/NVDA 무시 사례).
@@ -4705,6 +4796,31 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     # 매도는 avg_price가 안 변하므로 주문 직전 cur_price를 시장가 매도 체결가로 사용 (KIS 시장가 = 직전체결가 근사).
                     before_qty = next((h.get("qty") for h in (holdings or []) if h.get("code") == tk), 0) or 0
                     before_avg = next((h.get("avg_price") for h in (holdings or []) if h.get("code") == tk), 0) or 0
+                    # 사장 지시 2026-06-11(라이브 진단): KR 매도는 보유수량이 아닌 '매도가능수량
+                    # (ord_psbl_qty)' 기준 — 미체결 매도 주문이 물량을 잠그면 hldg_qty>0 인데
+                    # 매도가능 0 이라 'KIS 잔고내역이 없습니다'로 반복 거부된다(uid2 041830 사례).
+                    # 0 이면 사유와 함께 보류(조용한 누락 아님 — 다음 사이클 재시도), 부족하면 클램프.
+                    if _side == "sell" and is_kr:
+                        _sellable = next((h.get("sellable_qty") for h in (holdings or [])
+                                          if h.get("code") == tk and h.get("sellable_qty") is not None), None)
+                        if _sellable is not None and before_qty > 0:
+                            if _sellable <= 0:
+                                _lock_msg = (f"{tk} 매도 보류 — 보유 {before_qty}주 중 매도가능 0주 "
+                                             f"(미체결 매도 주문 잠금 추정 — 체결·자동취소 후 재시도)")
+                                await self._emit({"type": "trade_failed", "message": f"⛔ {_lock_msg}",
+                                                  "ticker": tk, "side": "sell", "qty": qty, "filled": False})
+                                exec_results.append({"ticker": tk, "side": _side, "qty": qty,
+                                                     "result": _lock_msg, "accepted": False, "filled": False,
+                                                     "fill_note": "매도가능수량 0", "ok": False,
+                                                     "fill_price": None, "fill_currency": "KRW",
+                                                     "avg_cost": float(before_avg or 0.0)})
+                                self.cycle_log.log("EXEC", "시스템", f"{tk} sell x{qty} → {_lock_msg}")
+                                continue
+                            if qty > _sellable:
+                                await self._emit({"type": "agent_msg", "agent": "시스템",
+                                    "message": f"✂️ {tk} 매도수량 클램프 {qty}→{_sellable}주 (매도가능수량 기준 — 잔여는 미체결 주문 잠금)"})
+                                qty = int(_sellable)
+                                od.qty = qty
                     sell_ref_price = 0.0
                     if _side == "sell":
                         if is_kr:
@@ -4738,6 +4854,16 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                         if not any(x in res for x in ("초당", "거래건수", "EGW", "유량", "TPS")):
                             break
                     accepted = all(bad not in res for bad in ("실패", "에러", "거부", "예외", "REJECT", "초당", "거래건수"))
+                    # 사장 지시 2026-06-11: NXT 미상장 거부('종목정보가 없습니다…')는 영속 학습 —
+                    # 이후 전 계정이 시간외(NXT) 세션에서 이 종목의 주문/매수 후보 자체를 건너뛴다.
+                    if getattr(od, "exchange", "") == "NXT" and nxt_blacklist.looks_nxt_unsupported(res):
+                        try:
+                            if nxt_blacklist.record(od.ticker, note=res[:120]):
+                                await self._emit({"type": "agent_msg", "agent": "시스템",
+                                    "message": f"🚫 {od.ticker} NXT 거래불가 종목으로 학습(전 계정 공유) — "
+                                               f"이후 시간외(NXT) 주문·매수 시도 제외, 정규장은 영향 없음"})
+                        except Exception as _ne:
+                            logger.warning(f"NXT 블랙리스트 기록 실패({od.ticker}): {_ne}")
                     # Fill confirmation — "주문 전송 완료" only means *accepted*, not *filled*. Re-read holdings.
                     filled = False; fill_note = ""; fill_price: Optional[float] = None
                     after_avg = 0.0  # KR 체결 확인 시 갱신 — 매수 후 블렌딩 평단
@@ -4791,6 +4917,14 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     if ok:
                         self._trades_executed += 1
                         self._trade_log.append({"ts": _now_kst_iso(), **rec})
+                        # 사장 지시 2026-06-11: 실거래 원장에 체결 반영 (KIS 집계 비의존 자산평가).
+                        try:
+                            trade_ledger.apply_fill(self.uid, ticker=tk,
+                                                    side=("sell" if od.side == "sell" else "buy"), qty=qty,
+                                                    price=fill_price, ccy=("USD" if is_us else "KRW"),
+                                                    avg_cost=avg_cost, note="exec_immediate")
+                        except Exception as _le:
+                            logger.warning(f"[원장 uid={self.uid}] 체결 반영 실패 {tk}: {_le}")
                         # 사장 지시 2026-05-28(우선순위 3): 매수 체결 직후 펀드기획팀장이 진입 thesis 작성·영속.
                         # fire-and-forget — LLM 호출이라 사이클 다음 단계를 막지 않게 background task.
                         if od.side == "buy":

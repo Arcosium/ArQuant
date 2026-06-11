@@ -21,6 +21,10 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(sd, "_DATA_DIR", tmp_path)  # tombstone 격리 — 실 data/ 오염 방지
     import server.app as app_mod
     monkeypatch.setattr(app_mod, "_PROFILES_DIR", tmp_path / "profiles")  # rmtree 격리 — 실 profiles/<uid> 삭제 방지
+    # 2026-06-11 참사 재발 방지: 탈퇴 라우트의 _decommission_uid 가 user_paths.user_dir(uid) 를
+    # rmtree 한다 — tmp 격리 없이는 '실' data/<uid>(=data/1)가 통째로 삭제됐다.
+    from infra import user_paths
+    monkeypatch.setattr(user_paths, "_DATA_DIR", tmp_path / "data")
     c = TestClient(app_mod.app)
     c.headers.update({"X-Session": tok})
     return c, a, uid
@@ -83,6 +87,10 @@ def admin_client(tmp_path, monkeypatch):
     monkeypatch.setattr(sd, "_DATA_DIR", tmp_path)  # tombstone 격리 — 실 data/ 오염 방지
     import server.app as app_mod
     monkeypatch.setattr(app_mod, "_PROFILES_DIR", tmp_path / "profiles")  # rmtree 격리 — 실 profiles/<uid> 삭제 방지
+    # 2026-06-11 참사 재발 방지: 탈퇴 라우트의 _decommission_uid 가 user_paths.user_dir(uid) 를
+    # rmtree 한다 — tmp 격리 없이는 '실' data/<uid>(=data/1)가 통째로 삭제됐다.
+    from infra import user_paths
+    monkeypatch.setattr(user_paths, "_DATA_DIR", tmp_path / "data")
     c = TestClient(app_mod.app)
     c.headers.update({"X-Session": tok})
     return c, a, uid

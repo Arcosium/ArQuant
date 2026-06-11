@@ -152,7 +152,10 @@ async def _supervised_loop(ctx, directive):
 async def _stop_uid(uid: int) -> None:
     ctx = REGISTRY.get(uid)
     from infra import user_paths
-    user_paths.running_marker(uid).unlink(missing_ok=True)
+    _marker = user_paths.running_marker(uid)
+    # pytest 가드 — 테스트가 실 .running 을 지워 재시작 자동재개를 끊지 않게 (2026-06-11).
+    if not _pytest_live_path(_marker):
+        _marker.unlink(missing_ok=True)
     if not ctx:
         return
     ctx.swarm.stop()
@@ -161,19 +164,44 @@ async def _stop_uid(uid: int) -> None:
     ctx.task = None
 
 
+def _pytest_live_path(path) -> bool:
+    """pytest 실행 중인데 path 가 라이브 저장소 하위인가 — 삭제류 호출 차단용.
+    (테스트가 tmp 로 monkeypatch 한 경로는 False → 정상 동작.)"""
+    import os
+    from pathlib import Path as _P
+    try:
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            return False
+        live_root = _P(__file__).resolve().parent.parent
+        return str(_P(path).resolve()).startswith(str(live_root))
+    except Exception:
+        return False
+
+
+def _rmtree_pytest_guarded(path) -> None:
+    """rmtree 전 pytest-라이브 가드 — 운영호스트에서 pytest 가 실 data/<uid>·profiles/<uid> 를
+    지우는 참사 차단 (2026-06-11 확정: test_admin_members 멤버삭제 테스트가 tmp 격리 없이
+    _decommission_uid 를 태워 실 data/1·data/2 가 전부 삭제됐고, 과거 '거래기록 소실'
+    사건들의 근본 원인이었다). 테스트는 tmp 경로로 monkeypatch 하면 정상 삭제된다."""
+    import shutil
+    if _pytest_live_path(path):
+        logging.getLogger("AUTH").error("pytest 가드 — 라이브 경로 삭제 차단: %s", path)
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
 async def _decommission_uid(uid: int) -> None:
     """유저 삭제/탈퇴 시 실행 주체를 완전히 종료한다 — 매매 루프 정지 → 컨텍스트 제거 →
     프로필·데이터 디렉터리 정리. 루프를 '먼저' 멈춰야, rmtree 후 살아있는 루프가
     profiles/<uid> 를 재생성(고아 부활)하거나 삭제된 유저 명의로 실주문을 내는 것을 막는다."""
-    import shutil
     from infra import user_paths
     await _stop_uid(uid)
     try:
         REGISTRY.drop(uid)
     except Exception:
         pass
-    shutil.rmtree(_PROFILES_DIR / str(uid), ignore_errors=True)
-    shutil.rmtree(user_paths.user_dir(uid), ignore_errors=True)
+    _rmtree_pytest_guarded(_PROFILES_DIR / str(uid))
+    _rmtree_pytest_guarded(user_paths.user_dir(uid))
 
 # 사장 지시 2026-05-21: 모바일 푸시 알림 4종 ↔ 프로필 알림설정 키 매핑.
 # 모바일(네이티브 WsManager) 연결은 이 4종 이벤트만, 그것도 프로필 설정이 ON 인 것만 받는다.
@@ -1074,7 +1102,16 @@ async def balance(request: Request):
         #  쌓여 수익률 KPI 가 장외에도 갱신됐다. 주말 밤 US 시간대 오인 방지 위해 요일·휴장까지 본다.)
         if not auth_store.is_viewer(auth_uid) and is_market_session_now():
             try:
-                record_equity(ctx.swarm.equity_path, snap["buying_power"], "poll")
+                # 사장 지시 2026-06-11: 실거래 원장 평가도 같이 기록 (시드 전이면 None — 폴러가 시드).
+                _led_val = None
+                try:
+                    from infra import trade_ledger
+                    from tools.market_data import get_usdkrw
+                    _led_val = trade_ledger.value_from_snap(uid, snap, fx=get_usdkrw(1510.0))
+                except Exception as _le:
+                    logger.warning(f"[balance] 원장 평가 실패(uid={uid}): {_le}")
+                record_equity(ctx.swarm.equity_path, snap["buying_power"], "poll",
+                              holdings=snap.get("holdings") or [], ledger_eval=_led_val)
             except Exception as e:
                 logger.warning(f"[balance] equity 기록 실패(uid={uid}): {e}")
         # 사장 지시 2026-06-01: 모의계정은 KIS 모의서버가 해외평가를 미지원해 잔고(총평가)가 부정확하므로,
@@ -1206,6 +1243,25 @@ async def trades(request: Request, limit: int = 500):
     uid = _read_uid(request)
     from main_swarm import get_trade_history
     return {"trades": get_trade_history(limit, uid=uid)}
+
+@app.post("/api/ledger/reseed")
+async def ledger_reseed(request: Request):
+    """실거래 원장 재시드 (사장 지시 2026-06-11) — 입출금·수동거래로 원장-KIS 괴리가 생겼을 때
+    현재 KIS 보유/예수금 기준으로 원장을 새로 굽는다. (자산곡선의 과거 ledger 포인트는 보존.)"""
+    from infra import trade_ledger
+    uid = _require_trading(request)
+    ctx = REGISTRY.get_or_create(uid)
+    trade_ledger.reset(uid)
+    try:
+        snap = await ctx.broker.portfolio_holdings()
+        led = await trade_ledger.seed(uid, ctx.broker, snap)
+    except Exception as e:
+        return {"ok": False, "message": f"재시드 실패: {e}"}
+    if led is None:
+        return {"ok": False, "message": "재시드 실패 — KIS 잔고 조회가 정상일 때 다시 시도하세요"}
+    return {"ok": True, "message": f"원장 재시드 완료 — KRW {led['cash_krw']:,.0f} / USD {led['cash_usd']:,.2f} / 종목 {len(led['positions'])}개",
+            "ledger": {k: led[k] for k in ("seeded_at", "seed_source", "cash_krw", "cash_usd")},
+            "positions": led["positions"]}
 
 @app.post("/api/trades/clear")
 async def trades_clear(request: Request):

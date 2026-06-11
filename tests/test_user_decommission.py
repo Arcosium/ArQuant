@@ -70,3 +70,24 @@ def test_decommission_removes_profile_and_data_dirs(monkeypatch, tmp_path):
     asyncio.run(app._decommission_uid(7))
     assert not (profiles / "7").exists(), "profiles/<uid> 정리돼야 한다"
     assert not (data / "7").exists(), "data/<uid> 정리돼야 한다"
+
+
+def test_rmtree_guard_blocks_live_paths_under_pytest(tmp_path):
+    """2026-06-11 참사 재발 방지 — pytest 중 라이브 저장소 하위 경로 rmtree 는 차단돼야 한다.
+    (test_admin_members 가 tmp 격리 없이 _decommission_uid 를 태워 실 data/1·data/2 가
+    통째로 삭제됐고, 과거 '거래기록 소실' 사건들의 근본 원인이었다.)"""
+    import server.app as app
+    live_dir = pathlib.Path(__file__).resolve().parent / ".guard_probe_tmp"
+    live_dir.mkdir(exist_ok=True)
+    (live_dir / "x.txt").write_text("probe", encoding="utf-8")
+    try:
+        app._rmtree_pytest_guarded(live_dir)
+        assert live_dir.exists(), "pytest 중 라이브 경로는 삭제되면 안 된다"
+    finally:
+        import shutil
+        shutil.rmtree(live_dir, ignore_errors=True)
+    # tmp 경로(저장소 밖)는 정상 삭제
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    app._rmtree_pytest_guarded(victim)
+    assert not victim.exists(), "tmp(저장소 밖) 경로는 정상 삭제돼야 한다"

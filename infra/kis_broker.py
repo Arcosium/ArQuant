@@ -665,7 +665,11 @@ class KISBroker:
                 continue
             holdings.append({"code": (h.get("pdno") or "").strip(), "name": (h.get("prdt_name") or "").strip(), "qty": q,
                              "avg_price": _f(h.get("pchs_avg_pric")), "cur_price": _f(h.get("prpr")),
-                             "pnl_amt": _f(h.get("evlu_pfls_amt")), "pnl_pct": _f(h.get("evlu_pfls_rt"))})
+                             "pnl_amt": _f(h.get("evlu_pfls_amt")), "pnl_pct": _f(h.get("evlu_pfls_rt")),
+                             # 사장 지시 2026-06-11(라이브 진단): 매도가능수량 — 미체결 매도 주문이
+                             # 물량을 잠그면 hldg_qty>0 인데 ord_psbl_qty=0 이 되어, 보유수량 기준
+                             # 매도가 '잔고내역이 없습니다'로 반복 거부된다(uid2 041830 사례).
+                             "sellable_qty": _i(h.get("ord_psbl_qty"))})
         snap = {"buying_power": {"cash": cash, "total_eval": total, "pnl_ratio": pnl_ratio, "ok": bool(d.get("ok"))},
                 "holdings": holdings, "ok": bool(d.get("ok")), "ts": now}
         # Keep last-good holdings if this read succeeded structurally but came back empty while
@@ -982,6 +986,43 @@ class KISBroker:
         return {"ok": True, "krw": self._num(o.get("frcr_cblc_wcrc_evlu_amt_smtl")),
                 "tot_asst_amt2": self._num(o.get("tot_asst_amt2"))}
 
+    async def overseas_fills(self, start_ymd: str, end_ymd: str) -> List[Dict]:
+        """해외주식 기간 체결내역 (TTTS3035R inquire-ccnl, 실전 전용 — 모의 미지원 → 빈 목록).
+        사장 지시 2026-06-11: 실거래 원장의 '미결제 USD 매도대금' 시드와 실현손익 backfill 의
+        권위 소스 — 결제 과도기엔 통합총자산/외화예수금 TR 이 전부 0 을 줘(라이브 확인:
+        6504·6010 모두 0, 6548 만 포함) 체결내역이 유일하게 신뢰 가능한 per-trade 기록이다.
+        반환: [{date(YYYYMMDD), ticker, side, qty, price, amount, ccy}] — 체결 수량 있는 행만."""
+        if self.is_mock:
+            return []
+        try:
+            c, p = self._acnt()
+            d = await self._paged_get("/uapi/overseas-stock/v1/trading/inquire-ccnl", "TTTS3035R",
+                {"CANO": c, "ACNT_PRDT_CD": p, "PDNO": "%",
+                 "ORD_STRT_DT": str(start_ymd), "ORD_END_DT": str(end_ymd),
+                 "SLL_BUY_DVSN": "00", "CCLD_NCCS_DVSN": "01",
+                 "OVRS_EXCG_CD": "%", "SORT_SQN": "DS", "ORD_DT": "",
+                 "ORD_GNO_BRNO": "", "ODNO": "",
+                 "CTX_AREA_NK200": "", "CTX_AREA_FK200": ""},
+                fk_key="CTX_AREA_FK200", nk_key="CTX_AREA_NK200", out_keys=("output",))
+            if not d.get("ok"):
+                return []
+            rows: List[Dict] = []
+            for r in d.get("output") or []:
+                qty = self._num(r.get("ft_ccld_qty"))
+                if qty <= 0:
+                    continue
+                name = str(r.get("sll_buy_dvsn_cd_name") or "")
+                side = "sell" if ("매도" in name or str(r.get("sll_buy_dvsn_cd")) == "01") else "buy"
+                price = self._num(r.get("ft_ccld_unpr3"))
+                rows.append({"date": str(r.get("ord_dt") or ""), "ticker": str(r.get("pdno") or "").strip(),
+                             "side": side, "qty": int(qty), "price": price,
+                             "amount": self._num(r.get("ft_ccld_amt3")) or (qty * price),
+                             "ccy": str(r.get("tr_crcy_cd") or "USD")})
+            return rows
+        except Exception as e:
+            logger.warning(f"[해외체결내역] TTTS3035R 실패: {e}")
+            return []
+
     async def kr_realized_pnl_audit(self) -> Dict:
         """국내 실현손익(TTTC8494R, 비용반영 COST_ICLD_YN='Y') — 우리 체결기반 실현손익 KPI 교차검증용
         (주문 무영향). 모의 미지원 가능 → skip. output1 의 rlzt_pfls 합산."""
@@ -1177,6 +1218,12 @@ class KISBroker:
         krw = None
         if pk["ok"] and pk["krw_value"] > 0:
             krw = pk["krw_value"]                         # 조회 성공 + 평가 있음 = 권위값
+            # 사장 지시 2026-06-10: 모의서버 해외 데이터는 평가·기준환율뿐 아니라 보유 가격·수량까지
+            # garbage 다(라이브 확인: exrt 224, US종목 평가 145M인데 모의 계좌는 100M짜리 — 물리적 불가).
+            # 가격×수량×환율 재계산도 입력이 전부 오염돼 무의미하므로, exrt 비정상(<500)이면 해외평가를
+            # 신뢰 불가로 0 처리(제외)한다 → 모의 equity = 국내+현금만(안정·정직). 실거래(exrt~1500)는 영향 없음.
+            if pk.get("exrt") and pk["exrt"] < 500:
+                krw = 0.0
             self._set_overseas_cache(krw, _now, stock=pk.get("stock_value"), exrt=pk.get("exrt"))
             # 사장 지시 2026-06-01: 기준환율 sanity 가드 — 모의서버가 비정상 환율(221.9 등)을 주면
             # 전역 FX 캐시(예산·리스크 환산)가 오염돼 실전 계정까지 망가진다. USD/KRW 는 역사적으로 500↑.
