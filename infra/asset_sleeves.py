@@ -130,6 +130,27 @@ def split_sleeve_holdings(holdings, sleeve_codes_set):
     return stocks, sleeve
 
 
+def format_sleeve_holdings_block(sleeve_holdings) -> str:
+    """슬리브 매니저(채권/원자재) 프롬프트용 현재 보유 정형 블록.
+    버그 2026-06-12: 매니저 LLM 에 현재 보유·가격을 안 줘서 보유분을 '미보유'로 단정하고
+    가격을 달러로 날조하던 환각(hh0908 137610·$가격) 차단용. 가격은 KRW(달러 표기 금지)."""
+    rows = sleeve_holdings or []
+    if not rows:
+        return "현재 이 슬리브 보유 없음."
+    lines = []
+    for h in rows:
+        code = str(h.get("code", "")).strip()
+        name = (h.get("name") or code).strip()
+        qty = int(float(h.get("qty") or 0))
+        cur = float(h.get("cur_price") or 0.0)
+        pnl = h.get("pnl_pct")
+        bit = f"- {name}({code}): 보유 {qty:,}주 · 현재가 {cur:,.0f}원"
+        if pnl is not None:
+            bit += f" · 평가손익 {float(pnl):+.1f}%"
+        lines.append(bit)
+    return "\n".join(lines)
+
+
 def current_sleeve_weight(holdings, total_eval_krw: float, pool_codes,
                           usdkrw: float = 1.0) -> float:
     """보유 중 슬리브 풀에 속한 것의 평가액 합 ÷ 총평가액. US ETF는 USDKRW 환산.
@@ -164,6 +185,26 @@ def size_sleeve_action(rec_pct, cur_pct: float, total_eval_krw: float,
         return ("hold", 0.0)
     notional = abs(diff) * float(total_eval_krw or 0.0)
     return ("buy" if diff > 0 else "sell", notional)
+
+
+def should_execute_sleeve_buy(action, has_buy_directive: bool, has_sell_directive: bool):
+    """매수 레그를 집행할지 결정한다(사장 지시 2026-06-12, Q4 — 비중 유지 회전 허용).
+
+    데드존은 슬리브 '순(net)비중 drift' churn 을 막는 장치이지 '구성 교체(회전)'를 막는 게
+    아니다. 종전엔 순비중이 밴드 안/위면 action=hold/sell → 매수 레그가 무조건 차단돼,
+    'GLD 팔고 132030 사는' 순중립 회전조차 매수가 반려됐다(원자재 08시 사례).
+
+    규칙:
+      - action=='buy'(부족분): 매수 directive 가 있으면 평소대로 부족분 매수(회전 아님).
+      - action in ('hold','sell','skip') + 매수 directive + 매도 directive 동시: **비중 유지 회전**
+        → 매수 허용(순비중은 매도로 상쇄). 매수 예산은 호출부가 사이클 전용 예산까지 부여(Option B).
+      - 그 외(매수 의견만/매도 의견만): 매수 집행 안 함.
+    반환 (execute_buy: bool, is_rotation: bool)."""
+    if action == "buy":
+        return (bool(has_buy_directive), False)
+    if has_buy_directive and has_sell_directive:
+        return (True, True)
+    return (False, False)
 
 
 def cap_sleeve_buy_notional(notional_krw: float, total_eval_krw: float, cash_krw: float,

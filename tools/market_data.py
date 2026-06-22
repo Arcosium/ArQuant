@@ -6,7 +6,9 @@ Adapted from KRX Quant Simulator CrawlerUtil:
   - 분봉 데이터는 KIS API 사용 (kis_broker.kr_minute_chart)
 """
 import os, csv, re, json, logging, time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+KST = timezone(timedelta(hours=9))
 from pathlib import Path
 from typing import List, Dict, Optional
 import requests
@@ -198,6 +200,18 @@ def get_stock_name(code: str) -> str:
     return name
 
 
+def canonical_name(code: str, fallback: str = "", resolver=get_stock_name) -> str:
+    """코드의 **권위(정본) 종목명**. 버그 2026-06-12: 뉴스/센티(LLM)와 계량(데이터제공자)이
+    코드→이름을 따로 만들어 불일치(241520=PKC vs DSC인베스트먼트). 결정·thesis 기록엔
+    코드 기준 정본 이름을 쓴다. resolver 실패('')면 fallback(보통 LLM 이름)으로 폴백.
+    resolver 는 테스트 주입용(기본 get_stock_name)."""
+    try:
+        nm = (resolver(code) or "").strip()
+    except Exception:
+        nm = ""
+    return nm or (fallback or "").strip()
+
+
 _CODE_CACHE: Dict[str, str] = {}
 def resolve_kr_stock_code(name: str) -> str:
     """종목명 → 6자리 KR 코드 (네이버 금융 검색). 실패 시 ''.
@@ -287,7 +301,9 @@ def fetch_stock_daily(code: str, years: int = 3) -> pd.DataFrame:
                     if not date_text:
                         continue
                     date = pd.to_datetime(date_text)
-                    if stop_date and date <= stop_date:
+                    # '<=' → '<' : 최신 날짜(당일 포함)는 다시 수집해 _append_csv upsert 로 갱신한다
+                    # (당일 봉이 첫 조회값에 고정되던 버그 2026-06-15 수정).
+                    if stop_date and date < stop_date:
                         break
                     if date < target_limit:
                         break
@@ -416,9 +432,12 @@ def crawl_company_full(code: str, kis_broker=None) -> str:
     # Build quant summary if data exists
     if total_daily > 0:
         try:
-            df = pd.read_csv(csv_daily).sort_values('date')
+            df = pd.read_csv(csv_daily).sort_values('date').reset_index(drop=True)
+            df = _strip_trailing_zero_volume(df)   # 프리마켓 진행 중(거래량 0) 행 제거 → '장 마감' 오인 방지
+            df = _strip_provisional_today(df, datetime.now(KST).strftime('%Y-%m-%d'))  # 당일 미완성봉 제외
             latest = df.iloc[-1]
-            summary += f"\n  최근({latest['date']}): 종가 {latest.get('close','-')} | 거래량 {latest.get('volume','-')}"
+            summary += (f"\n  최근(완성봉 {latest['date']}): 종가 {latest.get('close','-')} | "
+                        f"거래량 {latest.get('volume','-')} · ⓘ 당일봉은 장중 미완성이라 비교 제외")
         except Exception:
             pass
     else:
@@ -426,6 +445,34 @@ def crawl_company_full(code: str, kis_broker=None) -> str:
 
     summary += f"\n  CSV: {csv_daily.name}, {csv_inv.name}"
     return summary
+
+
+def _strip_trailing_zero_volume(df: pd.DataFrame) -> pd.DataFrame:
+    """말미의 거래량 0 행(프리마켓 등 '장 시작 전' 진행 중 placeholder)을 제거한다.
+
+    프리마켓 사이클이 당일 거래량 0 행을 CSV 에 누적하면 퀀트가 '장 마감'으로 오인하고
+    지표가 하루 stale 해진다(2026-06-15). 말미(trailing)만 떼고 중간 거래정지(0거래량) 행은
+    보존하며, 전부 0이면 최소 1행을 남긴다(fail-open)."""
+    if df is None or df.empty or 'volume' not in df.columns:
+        return df
+    vol = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+    keep = len(df)
+    while keep > 1 and vol.iloc[keep - 1] <= 0:
+        keep -= 1
+    return df.iloc[:keep].reset_index(drop=True) if keep < len(df) else df
+
+
+def _strip_provisional_today(df: pd.DataFrame, today_str: str) -> pd.DataFrame:
+    """당일(미완성) 봉을 시계열에서 제외 — 장중 부분 거래량을 전일 '전체'와 비교해 '거래량 98%
+    급감'으로 오독하는 것을 막는다(2026-06-15). 현재가 사이징은 라이브 호가(kr_last_price)를
+    쓰므로 영향 없음. 말미 기준 당일(또는 그 이후) 행만 떼고 전부 당일이면 최소 1행 유지."""
+    if df is None or df.empty or 'date' not in df.columns:
+        return df
+    d = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+    keep = len(df)
+    while keep > 1 and d.iloc[keep - 1] >= today_str:
+        keep -= 1
+    return df.iloc[:keep].reset_index(drop=True) if keep < len(df) else df
 
 
 def load_daily_csv(code: str) -> Optional[pd.DataFrame]:
@@ -442,7 +489,10 @@ def load_daily_csv(code: str) -> Optional[pd.DataFrame]:
         if df.empty:
             return None
         df['date'] = pd.to_datetime(df['date'])
-        return df.sort_values('date').reset_index(drop=True)
+        df = df.sort_values('date').reset_index(drop=True)
+        df = _strip_trailing_zero_volume(df)
+        # 당일 미완성 봉 제외 — 완성된 봉으로만 지표·거래량 비교(2026-06-15).
+        return _strip_provisional_today(df, datetime.now(KST).strftime('%Y-%m-%d'))
     except Exception:
         return None
 
@@ -732,20 +782,37 @@ def _get_csv_latest_date(path: Path) -> Optional[pd.Timestamp]:
 
 
 def _append_csv(path: Path, rows: List[Dict], columns: List[str]):
-    """CSV에 중복 없이 추가"""
+    """CSV upsert — 키(columns[0], 보통 date/datetime)가 같은 행은 **덮어쓴다**.
+    당일 봉이 첫 조회값에 고정되던 버그(2026-06-15) 수정: 같은 날짜를 스킵하지 않고 갱신해
+    장중 거래량·종가가 최신화되고, 장 마감 후 완성봉으로 확정된다. 겹침이 없으면 기존처럼 append."""
+    if not rows:
+        return
+    key = columns[0]
+    new_keys = {str(r.get(key, '')) for r in rows if str(r.get(key, '')) != ''}
+    existing = None
     seen = set()
     if path.exists():
         try:
             existing = pd.read_csv(path)
-            seen = set(existing['date'].astype(str))
-        except:
-            pass
-    new_rows = [r for r in rows if str(r.get('date', '')) not in seen]
-    if not new_rows:
+            seen = set(existing[key].astype(str))
+        except Exception:
+            existing = None
+    overlap = new_keys & seen
+    if not overlap:
+        # 빠른 경로 — 겹치는 날짜 없음 → 신규 행만 append
+        fresh = [r for r in rows if str(r.get(key, '')) != '' and str(r.get(key, '')) not in seen]
+        if not fresh:
+            return
+        exists = path.exists()
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=columns)
+            if not exists:
+                w.writeheader()
+            w.writerows(fresh)
         return
-    exists = path.exists()
-    with open(path, 'a', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=columns)
-        if not exists:
-            w.writeheader()
-        w.writerows(new_rows)
+    # 겹침 → 동일 키 덮어쓰기 (read-modify-write)
+    new_df = pd.DataFrame(rows)[columns].drop_duplicates(subset=[key], keep='last')
+    base = existing[~existing[key].astype(str).isin(new_keys)] if existing is not None else None
+    merged = pd.concat([base, new_df], ignore_index=True) if base is not None else new_df
+    merged = merged.sort_values(key).reset_index(drop=True)
+    merged.to_csv(path, index=False, columns=columns)

@@ -33,6 +33,8 @@ async def test_deep_research_uses_deepseek_with_web_tools_only(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_deep_research_without_key_fails_open(monkeypatch):
+    # 기본 macro_researcher 모델은 qwen(OpenRouter) — 활성 백엔드 키가 없으면 fail-open.
+    monkeypatch.setattr("config.OPENROUTER_API_KEY", "")
     monkeypatch.setattr("config.DEEPSEEK_API_KEY", "")
     called = False
 

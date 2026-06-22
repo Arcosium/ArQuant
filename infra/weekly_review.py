@@ -87,6 +87,25 @@ def _run_current_backtest(uid=None) -> Dict[str, Any]:
         return {"available": False, "reason": str(e)}
 
 
+def _run_walkforward(uid=None) -> Dict[str, Any]:
+    """현재 설정으로 롤링 아웃오브샘플(워크포워드) — 단일 백테스트가 '한 시기의 운'인지 본다.
+    반환 집계(구간 일관성·최악 구간). 2026-06-15 ROI#1."""
+    try:
+        import config
+        import runtime
+        from backtest.engine import load_prices
+        from backtest.walkforward import walk_forward
+        prices = load_prices()
+        if not prices:
+            return {"available": False, "reason": "no_daily_csv"}
+        params = {k: runtime.get(k, uid=uid) for k in config.STRATEGY_TUNABLE_KEYS}
+        agg = walk_forward(params, prices, test_days=20, warmup_days=40)["aggregate"]
+        agg["available"] = agg.get("n_windows", 0) > 0
+        return agg
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+
 def build_review_summary(uid=None) -> Dict[str, Any]:
     """지난 7일 데이터 집계 — cycles, trades, equity. **per-uid** (Phase 2 멀티테넌트).
 
@@ -156,6 +175,7 @@ def build_review_summary(uid=None) -> Dict[str, Any]:
         "equity_first": eq_first, "equity_last": eq_last,
         "equity_return_pct_adj": equity_return,
         "backtest": _run_current_backtest(uid=uid),
+        "walkforward": _run_walkforward(uid=uid),   # ROI#1 — 롤링 아웃오브샘플 성과 안정성
         # 사장 지시 2026-06-09 #7: 평일 사이클에서 회부된 weekly-tier 제안(점수엔진·구조 파라미터) —
         # 토요일 워커가 백테스트와 함께 재평가해 적용 여부 결정.
         "deferred_weekly_proposals": _list_deferred(uid),
@@ -194,6 +214,12 @@ def build_review_message(summary: Dict[str, Any]) -> str:
             f"매매 {bt.get('trades', 0)}건 · 승률 {bt.get('win_rate_pct', 0):.0f}%")
     else:
         lines.append("• 현재 설정 백테스트: 데이터 부족(일봉 CSV 없음)")
+    wf = summary.get("walkforward") or {}
+    if wf.get("available"):
+        lines.append(
+            f"• 워크포워드({wf.get('n_windows', 0)}구간 아웃오브샘플): 평균 {wf.get('mean_return_pct', 0):+.1f}% · "
+            f"양(+)구간 {wf.get('pct_positive', 0)*100:.0f}% · 최악구간 {wf.get('worst_return_pct', 0):+.1f}%/"
+            f"MDD {wf.get('worst_mdd_pct', 0):.1f}% — 일관성↓면 과적합 의심")
     lines.append("→ 운용지원실장이 위 통계로 전략 파라미터 조정안을 분석 중입니다. "
                  "실제 적용 내역은 이어지는 🛠 OPS 메시지로 직접 보고됩니다.")
     return "\n".join(lines)

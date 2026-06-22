@@ -16,6 +16,44 @@ def test_protected_keys_defined():
             "ENABLE_CHEAP_FALLBACK", "DETERMINISTIC_SCORING"} <= prot
 
 
+def test_nxt_toggles_protected():
+    # 사장 지시 2026-06-11: NXT 시간외 매매 마스터/구간 토글은 사장 전용 정책 플래그.
+    # ops 자율 사이클이 NXT 를 꺼 profiles/1 override(우선순위 ①)가 사장 전략탭 설정(②)을
+    # 가려 '재시작마다 OFF 로 복귀'하던 사고 재발 방지(2026-06-11).
+    prot = set(getattr(config, "OPS_PROTECTED_KEYS", ()))
+    assert {"ENABLE_NXT_EXTENDED_HOURS", "ENABLE_NXT_PRE_MARKET",
+            "ENABLE_NXT_AFTER_MARKET"} <= prot
+
+
+def test_macro_stock_gate_protected():
+    # 사장 지시 2026-06-12: 매크로 주식비중 매수게이트는 사장 방어 설정.
+    # ops 자율 사이클이 게이트를 꺼(MACRO_STOCK_GATE_ENABLED=False) 매크로 '주식 0%'
+    # 권고에도 1·2·3시 후보선정이 돌던 사고(uid1 cyc305 OFF→cyc312 ON) 재발 방지.
+    prot = set(getattr(config, "OPS_PROTECTED_KEYS", ()))
+    assert "MACRO_STOCK_GATE_ENABLED" in prot
+
+
+def test_cycle_drops_macro_gate_toggle():
+    kept, review, notes = partition_protected(
+        {"MACRO_STOCK_GATE_ENABLED": False, "MIN_QUANT_SCORE": 5}, trigger="cycle")
+    assert kept == {"MIN_QUANT_SCORE": 5}
+    assert any("MACRO_STOCK_GATE_ENABLED" in n for n in notes)
+
+
+def test_cycle_drops_nxt_toggle():
+    kept, review, notes = partition_protected(
+        {"ENABLE_NXT_EXTENDED_HOURS": False, "MIN_QUANT_SCORE": 5}, trigger="cycle")
+    assert kept == {"MIN_QUANT_SCORE": 5}
+    assert any("ENABLE_NXT_EXTENDED_HOURS" in n for n in notes)
+
+
+def test_weekly_routes_nxt_toggle_to_review():
+    kept, review, notes = partition_protected(
+        {"ENABLE_NXT_AFTER_MARKET": False, "STOP_LOSS_PCT": 4.0}, trigger="weekly")
+    assert kept == {"STOP_LOSS_PCT": 4.0}
+    assert review == {"ENABLE_NXT_AFTER_MARKET": False}
+
+
 def test_manual_keeps_all():
     kept, review, notes = partition_protected(
         {"ALLOW_US_STOCKS": True, "STOP_LOSS_PCT": 4.0}, trigger="manual")

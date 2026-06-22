@@ -43,3 +43,13 @@ def test_watch_orders_ignored():
 
 def test_empty_no_warning():
     assert cycle_health_warnings([]) == []
+
+
+def test_warning_includes_actual_reason():
+    """사장 피드백 2026-06-16: '사유 점검 필요'로 떠넘기지 말고 실제 사유를 경고에 직접 담는다."""
+    rows = [{"ticker": "005930", "side": "buy", "qty": 1, "accepted": True, "filled": True},
+            {"ticker": "375500", "side": "sell", "qty": 63, "accepted": False, "filled": False,
+             "fill_note": "매도가능수량 0", "result": "375500 매도 보류 — 결제/제도 잠금 추정"}]
+    reject_warn = next(w for w in cycle_health_warnings(rows) if "375500" in w)
+    assert "매도가능수량 0" in reject_warn     # 실제 사유가 메시지에 직접 보인다
+    assert "사유 점검 필요" not in reject_warn  # 더 이상 책임 떠넘기기 문구 없음
