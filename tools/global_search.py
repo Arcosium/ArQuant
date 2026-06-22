@@ -1,4 +1,4 @@
-"""Macro research through Hermes Agent with DeepSeek and web-only tools."""
+"""Macro research through Hermes Agent backed by the local LLM and web-only tools."""
 from __future__ import annotations
 
 import asyncio
@@ -21,16 +21,17 @@ async def deep_research(
     timeout_sec: int = 180,
     api_key: Optional[str] = None,
 ) -> str:
-    """Let DeepSeek use Hermes' web_search/web_extract tools for macro research."""
-    from config import DEEPSEEK_API_KEY
-    from infra.admin_config import resolve_model
+    """Let the active LLM use Hermes' web_search/web_extract tools for macro research.
 
-    key = (api_key or DEEPSEEK_API_KEY or "").strip()
-    if not key:
-        logger.error("DEEPSEEK_API_KEY 없음 — Hermes 리서치 호출 불가")
-        return ""
-    # web 도구는 tool-calling 지원 모델 필요 — flash 고정(pro=reasoning은 도구 미장착, 2026-06-10).
-    selected_model = model or resolve_model("macro_researcher", "deepseek-v4-flash")
+    Hermes에는 로컬 OpenAI 호환 서버를 공급자로 전달한다. web 도구(tool-calling)를 써야 하므로
+    reasoning OFF 평문 모델명을 전달한다. ``api_key``는 이전 호출부 호환용이며 무시한다."""
+    from config import LOCAL_LLM_BASE_URL, LOCAL_LLM_MODEL
+    from infra.admin_config import resolve_model
+    from infra.deepseek_client import split_thinking
+
+    selected_model = model or resolve_model("macro_researcher", LOCAL_LLM_MODEL)
+    real_model, _ = split_thinking(selected_model)   # hermes 엔 평문 슬러그 전달
+    provider = "openai"
     prompt = (
         "당신은 금융시장 리서치 전문가입니다. web_search와 web_extract를 사용해 "
         "최신 근거를 확인한 뒤 한국어로 답하세요. 출처의 기관/매체와 날짜를 명시하고, "
@@ -38,12 +39,13 @@ async def deep_research(
     )
     argv = [
         HERMES_BIN, "-p", HERMES_PROFILE, "chat", "-q", prompt, "-Q",
-        "--provider", "deepseek", "--model", selected_model,
+        "--provider", provider, "--model", real_model,
         "--toolsets", "web", "--max-turns", "12", "--ignore-rules",
         "--source", "tool",
     ]
     env = os.environ.copy()
-    env["DEEPSEEK_API_KEY"] = key
+    env["OPENAI_BASE_URL"] = LOCAL_LLM_BASE_URL
+    env["OPENAI_API_KEY"] = ""
     env["HERMES_MAX_TOKENS"] = str(max(512, int(max_tokens)))
     try:
         proc = await asyncio.create_subprocess_exec(

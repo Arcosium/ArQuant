@@ -79,7 +79,7 @@ async def app_auth(request: Request, call_next):
     return await call_next(request)
 
 
-# ─── 자격증명 검증 (등록 시 — HYFE가 WQB/Gemini를 검증하던 것과 동치) ──────────
+# ─── 자격증명 검증 ────────────────────────────────────────────────────────────
 async def _validate_kis(app_key: str, app_secret: str, base_url: str) -> tuple[bool, str]:
     base_url = (base_url or DEFAULT_KIS_BASE_URL).rstrip("/")
     if base_url not in ALLOWED_KIS_BASE_URLS:
@@ -95,19 +95,6 @@ async def _validate_kis(app_key: str, app_secret: str, base_url: str) -> tuple[b
         return False, f"KIS 인증 실패: {(d or {}).get('error_description') or (d or {}).get('msg1') or '응답에 access_token 없음'}"
     except Exception as e:
         return False, f"KIS 연결 실패: {e}"
-
-
-async def _validate_deepseek(api_key: str) -> tuple[bool, str]:
-    try:
-        from infra.deepseek_client import chat_completion
-        await chat_completion(
-            api_key=api_key, model="deepseek-v4-flash",
-            messages=[{"role": "user", "content": "Reply only OK."}],
-            max_tokens=4, temperature=0.0, timeout_sec=15, thinking=False,
-        )
-        return True, "ok"
-    except Exception as e:
-        return False, f"DeepSeek 연결 실패: {e}"
 
 
 def _issue_session(uid: int, remember: bool) -> JSONResponse:
@@ -291,7 +278,6 @@ class RegisterReq(BaseModel):
     username: str                   # 사용자가 정하는 아이디 (중복 불가)
     password: str                   # 10자 이상 + 특수문자 1개 이상
     account_mode: str = "trading"
-    deepseek_api_key: str = ""
     kis_app_key: str = ""
     kis_app_secret: str = ""
     kis_account_no: str = ""
@@ -354,7 +340,7 @@ async def check_username(u: str = ""):
 
 @app.post("/api/register")
 async def register(req: RegisterReq, request: Request):
-    """최초 등록 — 아이디(중복 불가) + 비밀번호(정책) + API 자격증명(실검증) 후 저장·활성화."""
+    """최초 등록 — 아이디·비밀번호와 KIS 거래 자격증명을 검증 후 저장·활성화."""
     ip = _client_ip(request)
     _throttle(_rl_recover, f"register:{ip}")
     username = (req.username or "").strip()
@@ -368,19 +354,15 @@ async def register(req: RegisterReq, request: Request):
     mode = auth_store.VIEWER_MODE if req.account_mode == auth_store.VIEWER_MODE else auth_store.TRADING_MODE
     kis_base_url = (req.kis_base_url or DEFAULT_KIS_BASE_URL).strip().rstrip("/")
     if mode == auth_store.TRADING_MODE:
-        if not all((req.deepseek_api_key.strip(), req.kis_app_key.strip(),
-                    req.kis_app_secret.strip(), req.kis_account_no.strip())):
-            raise HTTPException(400, "거래 계정은 DeepSeek와 KIS 정보를 모두 입력해야 합니다.")
+        if not all((req.kis_app_key.strip(), req.kis_app_secret.strip(), req.kis_account_no.strip())):
+            raise HTTPException(400, "거래 계정은 KIS 정보를 모두 입력해야 합니다.")
         ok, msg = await _validate_kis(req.kis_app_key, req.kis_app_secret, kis_base_url)
-        if not ok:
-            raise HTTPException(400, msg)
-        ok, msg = await _validate_deepseek(req.deepseek_api_key)
         if not ok:
             raise HTTPException(400, msg)
     uid = auth_store.upsert_user(
         username=username, password=req.password,
         kis_app_key=req.kis_app_key.strip(), kis_app_secret=req.kis_app_secret.strip(),
-        deepseek_api_key=req.deepseek_api_key.strip(), kis_account_no=req.kis_account_no.strip(),
+        deepseek_api_key="", kis_account_no=req.kis_account_no.strip(),
         kis_base_url=kis_base_url, account_mode=mode)
     auth_store.audit("register", username=username, ip=ip, outcome="ok", detail="")
     # Phase 2: 전역 활성화 폐지 — 세션만 발급한다. 유저 컨텍스트(브로커/스왐)는
@@ -460,7 +442,6 @@ class PwChangeReq(BaseModel):
     new: str
 
 class CredsReq(BaseModel):
-    deepseek_api_key: Optional[str] = None
     kis_app_key: Optional[str] = None
     kis_app_secret: Optional[str] = None
     kis_account_no: Optional[str] = None
@@ -498,7 +479,6 @@ async def profile_credentials(req: CredsReq, request: Request):
     # Fix 2 — strip whitespace on provided fields (mirrors register handler)
     ak = req.kis_app_key.strip() if req.kis_app_key is not None else None
     as_ = req.kis_app_secret.strip() if req.kis_app_secret is not None else None
-    ds_key = req.deepseek_api_key.strip() if req.deepseek_api_key is not None else None
     an = req.kis_account_no.strip() if req.kis_account_no is not None else None
     bu = req.kis_base_url.strip().rstrip("/") if req.kis_base_url is not None else None
     # Resolve effective values for KIS validation (fall back to stored values when not provided)
@@ -506,23 +486,17 @@ async def profile_credentials(req: CredsReq, request: Request):
     eff_as = as_ if as_ is not None else cur.get("kis_app_secret")
     eff_bu = bu if bu is not None else cur.get("kis_base_url")
     if upgrading_viewer:
-        if not all((ak, as_, ds_key, an, bu)):
+        if not all((ak, as_, an, bu)):
             raise HTTPException(
-                400, "관전 모드 업그레이드는 DeepSeek, KIS App Key/Secret, 계좌번호, 거래 환경을 모두 입력해야 합니다.")
+                400, "관전 모드 업그레이드는 KIS App Key/Secret, 계좌번호, 거래 환경을 모두 입력해야 합니다.")
     if ak is not None or as_ is not None or bu is not None:
         ok, msg = await _validate_kis(eff_ak, eff_as, eff_bu)
         if not ok:
             auth_store.audit("profile_credentials", username=uname_cr, ip=ip,
                              outcome="fail", detail="validate")
             raise HTTPException(400, msg)
-    if ds_key is not None:
-        ok, msg = await _validate_deepseek(ds_key)
-        if not ok:
-            auth_store.audit("profile_credentials", username=uname_cr, ip=ip,
-                             outcome="fail", detail="validate")
-            raise HTTPException(400, msg)
     auth_store.update_credentials(
-        uid, deepseek_api_key=ds_key, kis_app_key=ak,
+        uid, kis_app_key=ak,
         kis_app_secret=as_, kis_account_no=an,
         kis_base_url=bu)
     if upgrading_viewer:
@@ -924,7 +898,8 @@ async def admin_config_get(request: Request):
             "news_crawl_interval_default": int(_crawl_def),
             "model_defaults": MODEL_ASSIGNMENTS,
             "model_labels": _labels,
-            "model_keys": list(MODEL_ASSIGNMENTS.keys())}
+            "model_keys": list(MODEL_ASSIGNMENTS.keys()),
+            "model_choices": _ac.model_choices()}
 
 
 @app.post("/api/admin/config")
@@ -1111,7 +1086,8 @@ async def balance(request: Request):
                 except Exception as _le:
                     logger.warning(f"[balance] 원장 평가 실패(uid={uid}): {_le}")
                 record_equity(ctx.swarm.equity_path, snap["buying_power"], "poll",
-                              holdings=snap.get("holdings") or [], ledger_eval=_led_val)
+                              holdings=snap.get("holdings") or [], ledger_eval=_led_val,
+                              is_mock=bool(getattr(ctx.broker, "is_mock", False)))
             except Exception as e:
                 logger.warning(f"[balance] equity 기록 실패(uid={uid}): {e}")
         # 사장 지시 2026-06-01: 모의계정은 KIS 모의서버가 해외평가를 미지원해 잔고(총평가)가 부정확하므로,
@@ -1225,7 +1201,8 @@ async def benchmark(request: Request, view: str = "daily"):
         return {"benchmarks": []}
 
     out = []
-    for name, key in (("KOSPI", "kospi"), ("NASDAQ", "nasdaq")):
+    # 사장 지시 2026-06-16: nasdaq 값은 실제 지수가 아니라 QQQ 현재가 프록시이므로 라벨을 명확히 한다.
+    for name, key in (("KOSPI", "kospi"), ("NASDAQ(QQQ)", "nasdaq")):
         # 지수값이 있는 첫 포인트에 리베이스 (오해를 주는 +0.00 평탄선 회피 — 값 없으면 생략)
         base_idx = next((p[key] for p in series if p.get(key)), None)
         if not base_idx:
@@ -1259,7 +1236,12 @@ async def ledger_reseed(request: Request):
         return {"ok": False, "message": f"재시드 실패: {e}"}
     if led is None:
         return {"ok": False, "message": "재시드 실패 — KIS 잔고 조회가 정상일 때 다시 시도하세요"}
-    return {"ok": True, "message": f"원장 재시드 완료 — KRW {led['cash_krw']:,.0f} / USD {led['cash_usd']:,.2f} / 종목 {len(led['positions'])}개",
+    # 사장 지시 2026-06-16: 결제 과도기(US/해외 매수 D+2 미결제) 중 재시드하면 예수금(미차감)과
+    # 보유(추가)가 이중계상되어 평가액이 일시 과대해질 수 있다(uid1 9.66M 사례). 추측으로 차감하면
+    # 정상 결제 시 과소로 틀어지므로, 주의 안내만 덧붙이고 정확한 정정은 결제(D+2) 후 재시드로 유도한다.
+    _settle_caution = (" · ⚠ 최근 해외(US) 매수가 미결제(D+2) 상태면 평가액이 일시 과대할 수 있습니다 — "
+                       "결제 완료 후 한 번 더 재시드하면 정확해집니다")
+    return {"ok": True, "message": f"원장 재시드 완료 — KRW {led['cash_krw']:,.0f} / USD {led['cash_usd']:,.2f} / 종목 {len(led['positions'])}개{_settle_caution}",
             "ledger": {k: led[k] for k in ("seeded_at", "seed_source", "cash_krw", "cash_usd")},
             "positions": led["positions"]}
 

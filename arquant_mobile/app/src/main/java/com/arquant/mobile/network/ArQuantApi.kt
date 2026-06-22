@@ -201,7 +201,7 @@ data class StartRequest(val directive: String? = null)
 data class StrategySetRequest(val name: String)
 
 // ─── Auth (사장 피드백 2026-05-16: CF Access 제거 → 앱 자체 로그인) ───────────
-// 거래 계정 등록: KIS 자격증명 + DeepSeek API 키
+// 거래 계정 등록: KIS 자격증명 (LLM은 서버의 로컬 모델을 공용 사용)
 @Serializable
 data class LoginRequest(
     val username: String,
@@ -214,7 +214,6 @@ data class RegisterRequest(
     val username: String,
     val password: String,
     @SerialName("account_mode") val accountMode: String = "viewer",
-    @SerialName("deepseek_api_key") val deepseekApiKey: String = "",
     @SerialName("kis_app_key") val kisAppKey: String = "",
     @SerialName("kis_app_secret") val kisAppSecret: String = "",
     @SerialName("kis_account_no") val kisAccountNo: String = "",

@@ -121,7 +121,6 @@ fun LoginScreen(
     val register = state.phase == AuthPhase.NEED_REGISTER
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
-    var deepseekApiKey by remember { mutableStateOf("") }
     var appKey by remember { mutableStateOf("") }
     var appSecret by remember { mutableStateOf("") }
     var accountNo by remember { mutableStateOf("") }
@@ -192,7 +191,6 @@ fun LoginScreen(
                         color = AqColors.TextDim, fontSize = 11.sp,
                         modifier = Modifier.padding(top = 6.dp))
                 } else {
-                    Field("DeepSeek API Key (필수)", deepseekApiKey, { deepseekApiKey = it })
                     Field("한국투자증권 App Key", appKey, { appKey = it })
                     Field("한국투자증권 App Secret", appSecret, { appSecret = it }, isPassword = true)
                     Field("한국투자증권 계좌번호 (예: 12345678-01)", accountNo, { accountNo = it })
@@ -228,15 +226,15 @@ fun LoginScreen(
                         RegisterRequest(
                             username = username.trim(), password = password,
                             accountMode = if (viewer) "viewer" else "trading",
-                            deepseekApiKey = deepseekApiKey.trim(), kisAppKey = appKey.trim(),
+                            kisAppKey = appKey.trim(),
                             kisAppSecret = appSecret.trim(), kisAccountNo = accountNo.trim(),
                             kisBaseUrl = baseUrl.trim(), remember = remember7,
                         )
                     ) else onLogin(username, password, remember7)
                 },
                 enabled = !state.busy && username.trim().length >= 3 && password.isNotBlank()
-                    && (!register || (pwErr == null && (viewer || (deepseekApiKey.isNotBlank()
-                        && appKey.isNotBlank() && appSecret.isNotBlank() && accountNo.isNotBlank())))),
+                    && (!register || (pwErr == null && (viewer || (appKey.isNotBlank()
+                        && appSecret.isNotBlank() && accountNo.isNotBlank())))),
                 modifier = Modifier.fillMaxWidth().height(46.dp),
                 shape = RoundedCornerShape(9.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = AqColors.Primary),

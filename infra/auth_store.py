@@ -793,7 +793,7 @@ def purge_expired_sessions() -> int:
 
 # ─── Bootstrap from .env (사장 피드백 2026-05-16) ───────────────────────────────
 def bootstrap_from_env() -> Optional[int]:
-    """등록 계정이 없고 .env 에 API 키 + ARQUANT_BOOTSTRAP_USER/PASS 가 있으면
+    """등록 계정이 없고 .env 에 KIS 정보 + ARQUANT_BOOTSTRAP_USER/PASS 가 있으면
     사장님 프로필 1개를 생성. 비밀번호는 .env(=gitignore)에만 두어 소스/깃에 노출 안 함.
     이미 계정이 있으면 None."""
     init()
@@ -802,8 +802,7 @@ def bootstrap_from_env() -> Optional[int]:
     if n:
         return None
     try:
-        from config import (KIS_APP_KEY, KIS_APP_SECRET, KIS_ACCOUNT_NO,
-                            KIS_BASE_URL, DEEPSEEK_API_KEY, OPENDART_API_KEY)
+        from config import KIS_APP_KEY, KIS_APP_SECRET, KIS_ACCOUNT_NO, KIS_BASE_URL, OPENDART_API_KEY
     except Exception as e:
         logger.warning("bootstrap_from_env: config 로드 실패 %s", e)
         return None
@@ -813,8 +812,8 @@ def bootstrap_from_env() -> Optional[int]:
         logger.warning("bootstrap_from_env: ARQUANT_BOOTSTRAP_USER/PASS 미설정 — 시드 생략 "
                        "(로그인 아이디/비밀번호는 사용자가 정해야 함)")
         return None
-    if not (KIS_APP_KEY and KIS_APP_SECRET and DEEPSEEK_API_KEY and KIS_ACCOUNT_NO):
-        logger.warning("bootstrap_from_env: .env 필수 API 키 누락 — 시드 생략")
+    if not (KIS_APP_KEY and KIS_APP_SECRET and KIS_ACCOUNT_NO):
+        logger.warning("bootstrap_from_env: .env 필수 KIS 정보 누락 — 시드 생략")
         return None
     perr = password_policy_error(bp)
     if perr:
@@ -823,7 +822,7 @@ def bootstrap_from_env() -> Optional[int]:
     uid = upsert_user(
         username=bu, password=bp,
         kis_app_key=KIS_APP_KEY, kis_app_secret=KIS_APP_SECRET,
-        deepseek_api_key=DEEPSEEK_API_KEY, kis_account_no=KIS_ACCOUNT_NO,
+        deepseek_api_key="", kis_account_no=KIS_ACCOUNT_NO,
         kis_base_url=KIS_BASE_URL, dart_key=OPENDART_API_KEY or "",
         label="사장님 (.env 시드 · ADMIN)", is_admin=True,
     )

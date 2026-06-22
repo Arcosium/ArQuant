@@ -14,12 +14,9 @@ from infra.error_log import record_error  # 사장 지시 2026-05-19 — 상세 
 logger = logging.getLogger("AGENT")
 KST = timezone(timedelta(hours=9))
 
-# DeepSeek 공식 가격표 기준 cache-miss 입력/출력 USD per 1M tokens.
-_MODEL_PRICING = {
-    "deepseek-v4-flash": (0.14, 0.28),
-    "deepseek-v4-pro": (0.435, 0.87),
-}
-_DEFAULT_PRICING = (0.435, 0.87)
+# 로컬 GGUF 서버는 호출당 외부 API 비용이 없다.
+_MODEL_PRICING: Dict[str, tuple[float, float]] = {}
+_DEFAULT_PRICING = (0.0, 0.0)
 
 _API_CALL_LOG: List[Dict] = []   # {ts, model, prompt_tokens, completion_tokens, cost_usd, agent}
 _API_LOG_CAP = 500
@@ -150,8 +147,7 @@ class BaseAgent:
         tools: Optional[List[Dict[str, Any]]] = None,
         injection: Optional[Dict[str, Any]] = None,
     ):
-        from config import (MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS,
-                            AGENT_HISTORY_TURNS, DEEPSEEK_API_KEY)
+        from config import MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS, AGENT_HISTORY_TURNS
         self.name = name
         self.role = role
         self.system_prompt = system_prompt
@@ -165,8 +161,9 @@ class BaseAgent:
                 _ov = admin_config.get_model_override(model_key)
             except Exception:
                 _ov = ""
-        self.model = _ov or MODEL_ASSIGNMENTS.get(model_key, "deepseek-v4-flash")
-        self.api_key = inj.get("deepseek_api_key") or DEEPSEEK_API_KEY
+        self.model = _ov or MODEL_ASSIGNMENTS.get(model_key, "")
+        # Local server is unauthenticated. Keep the attribute for call-site compatibility.
+        self.api_key = ""
         self.tools = tools or []
         self.conversation_history: List[Dict[str, str]] = []
         self._tool_functions: Dict[str, Callable] = {}
