@@ -3,13 +3,13 @@
 > **https://arquant.ai-ve.uk** — 자체 로그인(아이디/비밀번호), 멀티테넌트
 
 **LLM 멀티에이전트 "스웜"이 한국·미국 주식과 채권·원자재 ETF를 자동 매매하는 시스템.**
-10명의 AI 에이전트(DeepSeek v4)가 매시 정각 시장 감시 사이클을 돌며 뉴스·매크로·퀀트·리스크를
+10명의 AI 에이전트(로컬 LLM 구동)가 매시 정각 시장 감시 사이클을 돌며 뉴스·매크로·퀀트·리스크를
 분담 분석하고, 한국투자증권(KIS) OpenAPI로 실주문을 낸다. 계정(uid)별로 독립된 매매 루프·전략·
 데이터를 가지며 실전투자와 모의투자를 모두 지원한다.
 
 - 웹 대시보드: FastAPI + WebSocket (port **8500**, cloudflared 터널)
 - 모바일: Android 네이티브 셸(WebView + 푸시 알림 + 위젯) `arquant_mobile/`
-- AI: **DeepSeek 공식 API** (`deepseek-v4-pro` / `deepseek-v4-flash`)
+- AI: **로컬 LLM** — OpenAI 호환 서버(llama.cpp 등)에서 `Qwen3.6-35B-A3B` GGUF 구동, 외부 API 키 불필요
 - 증권: **KIS OpenAPI** — KRX 정규장 + **NXT 시간외(프리/애프터마켓)** + 미국주식
 - 성과 평가: KIS 집계 TR에 의존하지 않는 **자체 실거래 원장(trade ledger)** 기반
 
@@ -24,7 +24,7 @@ ArQuant/
 ├── runtime.py               # 라이브 파라미터 오버라이드 — 재시작 없이 반영 (전략 탭)
 ├── agents/
 │   ├── specialists.py       # 에이전트 페르소나 10종 (시스템 프롬프트 + 대화 흐름 규칙)
-│   ├── base_agent.py        # DeepSeek 호출 공통 + 모델 단가 + API 비용 추적
+│   ├── base_agent.py        # LLM 호출 공통 + 토큰/비용 추적 (로컬 모델 단가 0)
 │   └── guardrails.py        # 결정론 리스크 게이트 (주문 초안 검증)
 ├── infra/
 │   ├── kis_broker.py        # KIS API — 국내(kr_*)·해외(us_*/_overseas_*) 별도 경로, NXT 주문
@@ -59,7 +59,7 @@ ArQuant/
 
 **FRONT (리서치·운용전략)** / **MIDDLE (리스크 통제·사후관리)** / **BACK (실행·인프라 지원)**
 
-| 페르소나 | 역할(코드) | 모델 | 담당 |
+| 페르소나 | 역할(코드) | 티어 | 담당 |
 |---|---|---|---|
 | **주식운용실장** | chief_orchestrator | pro | 총괄 — 매크로/퀀트/뉴스 종합, 2패스 종목 선정(후보→최종), 사장 지시 처리 |
 | **글로벌리서치팀장** | macro_analyst | pro | 거시경제 분석 → **4분할 자산배분 권고** (주식/채권/원자재/현금, 합 100%) |
@@ -73,8 +73,10 @@ ArQuant/
 | **프롭트레이딩팀장** | trader | flash | 체결 결과 보고 (결정론 템플릿 — 사실만) |
 | **운용지원실장** | ops_support | pro | 사이클 진단 + **내 계정 전략 파라미터 조정** (WHAT-not-HOW, 코드 수정 불가) |
 
-- 매크로 **웹 검색 단계**(macro_researcher)는 Hermes 도구 호출이 필요해 **flash 고정**
-  (DeepSeek 공식 API의 reasoning(pro) 모델은 function-calling 미지원), **결정·작성 단계는 pro**.
+- 두 **티어는 같은 로컬 모델**을 추론(thinking) ON/OFF로 굴린다: '결정' 에이전트는
+  **thinking ON = pro**, 분석·리서치·도구 에이전트는 **thinking OFF = flash**.
+- 매크로 **웹 검색 단계**(macro_researcher)는 Hermes 도구 호출(tool-calling) 안정성을 위해
+  **thinking OFF 유지**.
 - 한글 페르소나 이름이 곧 @멘션 라우팅 키다 (`@사후관리실장 보유 점검`).
 - 대화 흐름 규칙: 팀 회의처럼 누적 — 직전 발언 재서술 금지, 자기 관점만 추가.
 - 모델 오버라이드: `data/admin_config.json`의 `model_overrides` (ADMIN 탭, 재시작 반영).
@@ -196,9 +198,10 @@ KIS 통합총자산 TR 3종은 서로 불일치하고(자기모순), USD 결제 
 
 - 단일 프로세스 + per-uid asyncio 루프. `UserContext`가 계정별 브로커·스웜을 격리하고,
   데이터는 전부 `data/<uid>/` (equity_curve, trade_log, ledger, KIS 토큰, thesis...).
-- 가입: 아이디 + 비밀번호(argon2id) + DeepSeek API Key + KIS App Key/Secret·계좌번호 +
-  거래환경(실전/모의 — Base URL 자동, 입력값 실호출 검증). **관전(viewer) 모드**는 키 없이
-  가입 가능 — ADMIN 계정 데이터를 읽기 전용 관전.
+- 가입: 아이디 + 비밀번호(argon2id) + KIS App Key/Secret·계좌번호 +
+  거래환경(실전/모의 — Base URL 자동, 입력값 실호출 검증). **LLM은 서버의 로컬 모델을 전 계정이
+  공용**하므로 사용자 LLM API 키 입력은 없다. **관전(viewer) 모드**는 KIS 키 없이 가입 가능 —
+  ADMIN 계정 데이터를 읽기 전용 관전.
 - 계정 복구(이메일·SMS 없음): 블라인드 인덱스(HMAC) 2인자 — 계좌번호 + App Secret.
 - ADMIN(영구·단독): 회원 관리, 전역 설정(모델 오버라이드·크롤 주기), 피드백 답글,
   Coresight 승인 인박스. ADMIN 아이디는 사용자 대면에 노출 금지, 탈퇴·삭제 보호.
@@ -270,13 +273,21 @@ python3.11 -m pytest tests/test_x.py
 
 ## 💵 모델 · 비용
 
-| 모델 | 입력 $/1M | 출력 $/1M | 사용처 |
-|---|---|---|---|
-| deepseek-v4-flash | 0.14 | 0.28 | 뉴스·퀀트 해설·트레이더·thesis·매크로 웹검색(도구 호출) |
-| deepseek-v4-pro | 0.435 | 0.87 | 오케스트레이터·매크로 결정·사후관리·슬리브 매니저·운용지원 |
+LLM은 **로컬 OpenAI 호환 서버**(llama.cpp 등)에서 GGUF 모델을 구동한다 — 외부 클라우드 API·키
+없이 동작하므로 **호출당 외부 API 비용은 0**이다. 모든 LLM 호출은 `LOCAL_LLM_BASE_URL`로 간다.
 
-비용 추적: 호출마다 `data/api_cost_rollup.json`에 시간/일/월/누적 롤업 — 대시보드 💵 배지
-(표시 단위는 프로필에서 선택). DART 키는 서버 소유 단일 env(전 계정 공통, 사용자 입력 불필요).
+| 티어 | 모델 (기본값) | 추론(thinking) | 사용처 |
+|---|---|---|---|
+| flash | `Qwen3.6-35B-A3B` (GGUF Q8_0) | OFF | 뉴스·퀀트 해설·트레이더·thesis·매크로 웹검색(도구 호출) |
+| pro | 〃 (`+thinking` 변종) | ON | 오케스트레이터·매크로 결정·사후관리·슬리브 매니저·운용지원 |
+
+- 서버 주소·모델은 env로 지정: `LOCAL_LLM_BASE_URL`(기본 `http://127.0.0.1:8080/v1`) ·
+  `LOCAL_LLM_MODEL`(기본 `Qwen3.6-35B-A3B-...-Q8_0.gguf`). thinking ON/OFF는 `+thinking` 가상
+  접미사로 표현하고 전송 직전 `chat_template_kwargs.enable_thinking` / `reasoning.enabled` 로
+  변환한다(`infra/deepseek_client.py` — 파일명은 유지, 내용은 로컬 클라이언트).
+- 비용 추적 인프라(토큰 롤업 `data/api_cost_rollup.json` · 대시보드 💵 배지)는 유지되나 로컬
+  모델 단가가 0이라 표시는 항상 $0.00 이다. ADMIN 탭에서 역할별 모델·추론 토글 오버라이드 가능(재시작 반영).
+- DART 키는 서버 소유 단일 env(전 계정 공통, 사용자 입력 불필요).
 
 ---
 
@@ -299,4 +310,4 @@ python3.11 -m pytest tests/test_x.py
 ArQuant는 실제 자금으로 실거래를 수행한다. 손실 가능성이 있으며 모든 투자 책임은
 사용자에게 있다. AI 분석은 외부 모델·데이터에 의존하므로 오류·지연·중단이 발생할 수 있다.
 
-*최종 업데이트: 2026-06-11*
+*최종 업데이트: 2026-06-23 (branch `local-llm-no-api-keys` — 로컬 LLM 전환)*
