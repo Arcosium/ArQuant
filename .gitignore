@@ -168,3 +168,6 @@ data/3/trade_log.json
 data/4/trade_log.json
 data/strategy_state.json
 data/nxt_untradable.json
+
+# 계좌 equity·trade_log·전략상태 등 운영/금융 데이터 전체 — 절대 추적 금지(2026-06-26 히스토리 purge)
+data/
