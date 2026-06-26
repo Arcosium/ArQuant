@@ -2295,7 +2295,20 @@ def cycle_health_warnings(exec_results: List[Dict]) -> List[str]:
     if not real:
         return []
     warnings: List[str] = []
-    rejected = [e for e in real if not e.get("accepted")]
+    # 사장 보고 2026-06-26: 시간외(NXT) '사전 보류'는 '거부'가 아니라 정규장에서 재시도 예정인
+    # 정상 보류다(NXT 미상장/시세없음/블랙리스트 → _finalize_kr_order_for_session 의도된 deferral).
+    # 이를 거부로 묶어 '전건 미접수 → 자격증명·잔고 점검' 경보를 띄우면 거짓경보가 된다(밤사이 3회 발생).
+    # 따라서 시간외 사전 보류는 별도 정보성 경고로만 가시화하고, 자격증명·잔고 경보에선 제외한다.
+    def _is_ext_hours_defer(e):
+        return str(e.get("fill_note") or "").strip() == "시간외 주문 사전 보류"
+    unaccepted = [e for e in real if not e.get("accepted")]
+    deferred = [e for e in unaccepted if _is_ext_hours_defer(e)]
+    rejected = [e for e in unaccepted if not _is_ext_hours_defer(e)]
+    if deferred:
+        # 정상 시간외 보류는 경보가 아니다(자격증명·잔고 무관) — 실행부에서 이미 종목별 trade_failed
+        # 로 발화됐다. 여기선 디버그 로깅만 남기고 운영자 경보(자기검증 WARN)는 띄우지 않는다.
+        _dp = "; ".join(str(e.get("ticker") or "?") for e in deferred)
+        logger.debug(f"[자기검증] 시간외(NXT) 주문 {len(deferred)}건 정규장 재시도 보류 — {_dp}")
     if rejected:
         # 사장 피드백 2026-06-16: '사유 점검 필요'로 떠넘기지 말고 exec_result 의 실제 사유를
         # 경고에 직접 담는다(fill_note > result 순). 종목별로 무엇이 왜 막혔는지 한 줄에 보인다.
@@ -2304,7 +2317,9 @@ def cycle_health_warnings(exec_results: List[Dict]) -> List[str]:
             return str(w).strip().splitlines()[0][:80]
         _parts = "; ".join(f"{str(e.get('ticker') or '?')}({_why(e)})" for e in rejected)
         warnings.append(f"주문 거부·보류 {len(rejected)}건 — {_parts}")
-    if not any(e.get("accepted") for e in real):
+    # '전건 미접수' 경보는 *실거부*가 있을 때만. 정상 시간외 보류만으로는 자격증명·잔고 점검을 띄우지 않는다
+    # (사장 보고 2026-06-26: NXT 보류만으로 '자격증명·잔고 점검' 거짓경보가 밤사이 3회 발생).
+    if rejected and not any(e.get("accepted") for e in real):
         warnings.append("이번 사이클 주문 전건 미접수(거부) — 실행 경로·자격증명·잔고 점검 필요")
     return warnings
 
@@ -3930,6 +3945,19 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                                             f"({_aud.get('realized_rt', 0):.2f}%) — 체결기반 KPI 교차검증")
                     except Exception:
                         pass
+                    # 사장 보고 2026-06-26: 유휴 USD → KRW 자동 역환전 점검(주기 스윕, 약 30분마다).
+                    # KRW→USD 정방향은 통합증거금이 자동 처리하지만 역방향은 KIS 공개 환전 TR 부재로
+                    # 자동 경로가 없었다(KR/US 비대칭) → 유휴 USD 감지 시 (기본) 수동 환전 알림으로 환기.
+                    # 실환전은 LIVE_TRADING + AUTO_USD_TO_KRW_RECONVERT + KIS_FX_EXCHANGE_TR 가 모두
+                    # 있을 때만(dry-run/모의/미설정이면 안전 no-op + 알림). KRW 한도/USD 평가 분리 유지.
+                    try:
+                        if not self.broker.is_mock and self._audit_tick % 6 == 1:
+                            from infra import fx_reconvert
+                            await fx_reconvert.maybe_reconvert_idle_usd(
+                                self.broker, dry_run=(not LIVE_TRADING), uid=self.uid,
+                                notifier=notifier)
+                    except Exception as _fxe:
+                        logger.warning(f"[USD역환전] 점검 실패(무시): {_fxe}")
             except Exception as e:
                 logger.warning(f"[equity_poller] {e}")
             # 5분 슬립 — 60초 게이트와 결합해 잔고가 자주 안 흔들리는 한 가벼움

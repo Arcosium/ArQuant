@@ -31,7 +31,10 @@ async def deep_research(
 
     selected_model = model or resolve_model("macro_researcher", LOCAL_LLM_MODEL)
     real_model, _ = split_thinking(selected_model)   # hermes 엔 평문 슬러그 전달
-    provider = "openai"
+    # hermes 엔 빌트인 'openai' provider 가 없다 — 로컬LLM(ollama)은 config.yaml 의
+    # custom_providers(name: localllm) 로 등록하고 'custom:localllm' 으로 호출한다.
+    # (2026-06-24: 기존 'openai' 는 Unknown provider 로 web 리서치가 조용히 실패했다.)
+    provider = os.getenv("ARQUANT_HERMES_PROVIDER", "custom:localllm")
     prompt = (
         "당신은 금융시장 리서치 전문가입니다. web_search와 web_extract를 사용해 "
         "최신 근거를 확인한 뒤 한국어로 답하세요. 출처의 기관/매체와 날짜를 명시하고, "

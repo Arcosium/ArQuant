@@ -128,6 +128,19 @@ MATERIAL_NEWS_KEYWORDS = [
 LIVE_TRADING         = True           # actually place KIS orders in the EXECUTION step
 MAX_TRADES_PER_CYCLE = 2              # at most this many real orders executed per analysis cycle (sells prioritized)
 
+# ─── 유휴 USD → KRW 자동 역환전 (사장 보고 2026-06-26) ────────────────────────────
+# 배경(KR/US 비대칭): US 매수의 KRW→USD 환전은 KIS '통합증거금'이 결제 시 자동 처리한다(명시 환전
+# API 호출이 없다). 그러나 역방향(USD→KRW)은 KIS OpenAPI 에 공개 '환전' TR 이 존재하지 않아
+# 자동 경로가 애초에 배선된 적이 없다 — 그래서 US 매도 후 남는 USD 예수금이 놀고, 사장이 매번
+# MTS 에서 수동 환전해 왔다(2026-06-26 라이브 로그: 유휴 USD ≈₩1,424,204).
+# 본 기능은 유휴 USD 를 주기적으로 감지해 (1) 자동 실행이 켜져 있고 실환전 경로가 있으면 실행,
+# (2) 아니면(기본) 운영자에게 '환전 필요' 알림(중복억제)을 띄워 수동 환전을 자동 환기한다.
+# KIS 가 환전 TR 을 공개/계약 제공하면 KIS_FX_EXCHANGE_TR 에 TR 을 넣고 broker.us_to_krw_exchange
+# 한 곳만 실행 경로로 배선하면 된다(엔드포인트 발명 금지).
+AUTO_USD_TO_KRW_RECONVERT = False     # True 라도 KIS_FX_EXCHANGE_TR 미설정이면 실주문 대신 알림만(안전 기본)
+USD_RECONVERT_MIN_USD     = 100.0     # 이 미만(잔돈)은 무시 — 환전 알림/시도 안 함
+KIS_FX_EXCHANGE_TR        = ""         # KIS 공개 환전 TR 없음 → 빈 값 = 수동 환전 알림 모드(미검증 엔드포인트 호출 금지)
+
 # Sell / rebalance rules (BUY-only was too restrictive — now we also take profit / cut loss / trim).
 ENABLE_SELL_REBALANCE = True
 TAKE_PROFIT_PCT       = 12.0          # holding P&L ≥ +12%  → sell the position

@@ -41,6 +41,17 @@ def _clean_kis_msg(msg: str) -> str:
     return s.strip()
 
 
+def _sanitize_overseas(krw, stock, exrt, *, min_valid_exrt: float = 500.0):
+    """모의서버 비정상 기준환율(exrt < min_valid_exrt) 시 해외 평가(krw)·주식분(stock)을
+    함께 0 으로 — garbage 전파 차단. krw 는 총평가 합산용, stock 은 매크로 비중계산
+    (_overseas_stock_krw)용. 기존엔 krw 만 0 처리하고 stock 은 오염값을 캐시에 흘려보내
+    주식비중이 100% 로 부풀어 매수가 영구 차단되던 버그(uid2). exrt 0/None(미상)은
+    건드리지 않는다(조회 실패와 비정상 환율을 구분 — 보수적). 정상 환율이면 입력 그대로."""
+    if exrt and float(exrt) < min_valid_exrt:
+        return 0.0, 0.0
+    return krw, stock
+
+
 def kr_net_valuation(scts_eval: float, cash_d2: float, cash_d1: float,
                      prev_settled: Optional[float] = None):
     """현재 평가액(국내 구성) = 국내 유가증권평가액 + D+2 예수금. (해외 외화평가총액은 호출부에서 더한다)
@@ -109,13 +120,27 @@ def round_to_tick(price: float) -> int:
     return int(round(p / t) * t)
 
 
-def compute_nxt_limit_price(last_price: float, *, side: str, slippage_pct: float) -> int:
-    """시간외 지정가 = 현재가 ± 슬리피지 밴드, 호가단위 반올림. last_price<=0 이면 0(주문 보류 신호)."""
+def compute_nxt_limit_price(last_price: float, *, side: str, slippage_pct: float,
+                            ref_price: float = None, max_premium_pct: float = None) -> int:
+    """시간외 지정가 = NXT시세 ± 슬리피지 밴드, 호가단위 반올림. last_price<=0 이면 0(주문 보류 신호).
+
+    ref_price(정규 전일종가)·max_premium_pct 가 주어지면 **정규가 대비 프리미엄을 캡**한다:
+    매수는 ref×(1+캡)을 넘지 못하고, 매도는 ref×(1−캡) 아래로 내려가지 못한다. 얇은 NXT
+    프리마켓이 큰 프리미엄/디스카운트를 호가해도 그걸 추종해 과지불/과소매도하지 않게 한다
+    (2026-06-15: 003490 을 정규 26,600 대비 +4.9% 27,900 에 시장가 추종 체결한 버그 수정).
+    """
     last = float(last_price or 0)
     if last <= 0:
         return 0
     band = (float(slippage_pct or 0) / 100.0)
     raw = last * (1 + band) if side == "buy" else last * (1 - band)
+    ref = float(ref_price or 0)
+    cap = float(max_premium_pct or 0) / 100.0
+    if ref > 0 and cap > 0:
+        if side == "buy":
+            raw = min(raw, ref * (1 + cap))   # 정규가 대비 프리미엄 상한
+        else:
+            raw = max(raw, ref * (1 - cap))   # 정규가 대비 디스카운트 하한
     return round_to_tick(raw)
 
 
@@ -147,7 +172,10 @@ class KISBroker:
         # 모의서버는 더 보수적으로(0.5s), 실전은 0.06s(≈15TPS) 간격.
         self._rate_lock = asyncio.Lock()
         self._last_call: float = 0.0
-        self._min_interval: float = 0.5 if self.is_mock else 0.06
+        # 사장 지시 2026-06-17: 고정 간격이 KIS 실측 한도를 넘는 버스트 구간엔 거부 폭주가 났다.
+        # base 에서 시작해 rate-limit 거부 시 상향(_note_rate_limited)·무거부 시 점감(_decay_interval).
+        self._rate_base: float = 0.5 if self.is_mock else 0.06
+        self._min_interval: float = self._rate_base
         self._nxt_supported = None   # None=미탐, True=지원확인, False=미지원(시간외 스킵)
 
     async def _s(self):
@@ -186,6 +214,10 @@ class KISBroker:
     _RATE_LIMIT_MARKERS = ("초당 거래건수", "거래건수를 초과", "egw00201", "초당 허용", "초당 호출")
     _RATE_LIMIT_BACKOFF_SEC = 0.35
     _RATE_LIMIT_MAX_RETRY = 3
+    # 적응적 간격(사장 지시 2026-06-17): 거부 폭주를 스스로 완화.
+    _RATE_MAX_INTERVAL = 0.30   # 상향 상한
+    _RATE_BUMP = 1.6            # 거부 1회당 곱셈 상향
+    _RATE_DECAY = 0.92         # 무거부 호출마다 base 로 점감
 
     def _resp_token_expired(self, d: Any) -> bool:
         """KIS 응답이 '토큰 만료/무효' 거부인가. 정상(rt_cd==0)·다른 거부 사유는 False."""
@@ -200,6 +232,15 @@ class KISBroker:
             return False
         blob = f"{d.get('msg_cd','')} {d.get('msg1','')}".lower()
         return any(m in blob for m in self._RATE_LIMIT_MARKERS)
+
+    def _note_rate_limited(self) -> None:
+        """rate-limit 거부 관측 → 호출 간격을 곱셈 상향(상한까지)해 버스트를 스스로 벌린다."""
+        self._min_interval = min(self._RATE_MAX_INTERVAL, self._min_interval * self._RATE_BUMP)
+
+    def _decay_interval(self) -> None:
+        """거부 없이 호출이 흐르면 간격을 base 로 점감 복귀(base 아래로는 내리지 않음)."""
+        if self._min_interval > self._rate_base:
+            self._min_interval = max(self._rate_base, self._min_interval * self._RATE_DECAY)
 
     async def _authed_json(self, make_request):
         """make_request: async (tok:str) -> dict(파싱된 KIS JSON). 토큰을 주입해 1회 호출하고,
@@ -220,6 +261,7 @@ class KISBroker:
         attempts = 0
         while self._resp_rate_limited(d) and attempts < self._RATE_LIMIT_MAX_RETRY:
             attempts += 1
+            self._note_rate_limited()   # 적응적 간격 상향 — 이후 호출이 스스로 벌어져 거부 연쇄를 줄인다
             delay = self._RATE_LIMIT_BACKOFF_SEC * attempts
             logger.warning(f"KIS rate-limit(초당 거래건수 초과) — {delay:.2f}s 후 재전송 {attempts}/{self._RATE_LIMIT_MAX_RETRY}")
             if delay > 0:
@@ -248,6 +290,7 @@ class KISBroker:
             if wait > 0:
                 await asyncio.sleep(wait)
             self._last_call = loop.time()
+            self._decay_interval()   # 거부 없이 흐르면 base 로 점감 복귀
 
     async def _paged_get(self, path: str, tr_id: str, params: Dict[str, Any],
                          fk_key: str = "CTX_AREA_FK100", nk_key: str = "CTX_AREA_NK100",
@@ -905,10 +948,68 @@ class KISBroker:
                     "tot_asst_amt": self._num(o3.get("tot_asst_amt")),
                     "tot_dncl_amt": self._num(o3.get("tot_dncl_amt")),
                     "tot_evlu_pfls_amt": self._num(o3.get("tot_evlu_pfls_amt")),
+                    "deposit_frcr": deposit_frcr,   # 외화예수금 원통화(USD) — USD→KRW 역환전 판단용
                     "deposit_krw": deposit_krw}
         except Exception as e:
             logger.warning(f"[해외원화평가] CTRP6504R 실패: {e}")
             return {"ok": False, "krw_value": 0.0, "stock_value": 0.0, "exrt": 0.0}
+
+    async def idle_usd_deposit(self) -> Dict:
+        """유휴 USD 예수금(원통화·원화환산·기준환율) — read-only. USD→KRW 역환전 판단 전용.
+        CTRP6504R(_overseas_present_krw)의 외화예수금(frcr_dncl_amt_2)을 그대로 노출한다.
+        주문·표시·자산곡선에 무영향. 실패/모의/비정상환율 → {ok:False}.
+        ※ KRW 한도와 섞지 말 것: 여기서 주는 usd 는 'USD 평가(예수금)'다."""
+        try:
+            pk = await self._overseas_present_krw()
+            if not pk.get("ok"):
+                return {"ok": False, "usd": 0.0, "krw_value": 0.0, "exrt": 0.0}
+            exrt = float(pk.get("exrt") or 0.0)
+            usd = float(pk.get("deposit_frcr") or 0.0)
+            krw = float(pk.get("deposit_krw") or 0.0)
+            # exrt 비정상(모의서버 garbage <500)이면 USD 환산을 신뢰 불가 — 0 처리(보수적, 환전 오발 방지).
+            if exrt and exrt < 500:
+                return {"ok": False, "usd": 0.0, "krw_value": 0.0, "exrt": exrt}
+            return {"ok": True, "usd": usd, "krw_value": krw, "exrt": exrt}
+        except Exception as e:
+            logger.warning(f"[유휴USD조회] 실패: {e}")
+            return {"ok": False, "usd": 0.0, "krw_value": 0.0, "exrt": 0.0}
+
+    async def us_to_krw_exchange(self, usd_amount: float, *, dry_run: bool = True,
+                                 reason: str = "") -> Dict:
+        """USD→KRW 역환전 '실행' 단일 진입점. **실제 환전은 반드시 여기 한 곳에서만** 수행한다.
+
+        현실(2026-06-26 확인): KIS OpenAPI 는 공개 '환전' TR/엔드포인트를 제공하지 않는다 — 공식
+        open-trading-api 저장소·본 코드베이스 모두 환전 엔드포인트 0건. 정방향(KRW→USD)은
+        통합증거금이 결제 시 자동 처리할 뿐 명시 API 호출이 없다. 따라서 '엔드포인트 발명 금지'
+        원칙에 따라 여기서 임의 URL/TR 을 호출하지 않는다:
+          - is_mock / dry_run → 절대 실주문 금지(no-op, 의도만 로깅).
+          - config.KIS_FX_EXCHANGE_TR 미설정(기본) → {ok:False, manual_required:True}(수동 환전 신호).
+        KIS 가 환전 TR 을 공개/계약 제공하면, 검증된 TR·URL·body 를 *오직 이 메서드 안에서만*
+        배선한다(다른 곳에서 환전을 호출/조립하지 말 것)."""
+        usd_amount = float(usd_amount or 0.0)
+        if usd_amount <= 0:
+            return {"ok": False, "reason": "환전액 0", "manual_required": False}
+        if self.is_mock:
+            logger.info(f"[USD→KRW] 모의계좌 — 환전 미실행(no-op) ${usd_amount:,.2f} ({reason})")
+            return {"ok": False, "reason": "모의계좌 — 환전 미지원", "manual_required": False}
+        if dry_run:
+            logger.info(f"[USD→KRW][DRY-RUN] 환전 미실행 ${usd_amount:,.2f} ({reason})")
+            return {"ok": False, "reason": "dry-run — 환전 미실행", "manual_required": False, "dry_run": True}
+        try:
+            from config import KIS_FX_EXCHANGE_TR as _FX_TR
+        except Exception:
+            _FX_TR = ""
+        if not _FX_TR:
+            # KIS 공개 환전 TR 없음 → 자동 실환전 불가. 조용히 누락 금지: 수동 환전 필요 신호로 반환.
+            logger.warning(f"[USD→KRW] 환전 TR 미설정 — 자동 환전 불가, 수동 환전 필요 ${usd_amount:,.2f} ({reason})")
+            return {"ok": False, "reason": "KIS 공개 환전 TR 없음 — 수동 환전 필요",
+                    "manual_required": True, "usd": usd_amount}
+        # ── 확장점(미배선): KIS 환전 TR 이 확보되면 *여기서만* POST 한다. 검증된 TR/URL/body 가
+        #    없는 상태에서 임의 엔드포인트를 호출하면 실주문 사고이므로 절대 금지. ──
+        logger.error(f"[USD→KRW] KIS_FX_EXCHANGE_TR={_FX_TR} 설정됐으나 실행 경로 미배선 — 수동 환전 필요 "
+                     f"${usd_amount:,.2f} ({reason})")
+        return {"ok": False, "reason": "환전 실행 경로 미배선(미검증 TR)",
+                "manual_required": True, "usd": usd_amount}
 
     # ═══════════════ 신규 권위조회 (사장 지시 2026-06-01, KIS 공식샘플 정독 반영) ═══════════════
     # 잔고/주문 한도를 추정(D+2·환율 합성) 대신 KIS 권위 전용조회로. 실전 전용 TR(6548/6010/8494)은
@@ -942,15 +1043,41 @@ class KISBroker:
 
     async def us_buying_power(self, ticker: str, unpr: float, excg: Optional[str] = None) -> Dict:
         """해외 매수가능 (TTTS3007R). USD 주문가능금액(ord_psbl_frcr_amt)·최대수량·환율을 직접 준다 —
-        KR 원화예수금을 환율로 나눈 합성 대신 사용(통화혼용·과대사이징 방지). 실패 시 {ok:False}."""
+        KR 원화예수금을 환율로 나눈 합성 대신 사용(통화혼용·과대사이징 방지). 실패 시 {ok:False}.
+
+        거래소 결정(버그 2026-06-17, uid1 NYSE 매수 거부 반복): 호출부(클램프)가 excg 를
+        주지 않아 'NASD' 로 고정되면 NYSE/AMEX 종목이 '상품이 없습니다'(rt_cd≠0)로 거부되어
+        ok=False → 클램프가 스킵되고 못 살 주문이 KIS 까지 갔다. 실제 주문(_overseas_order_body)이
+        쓰는 _us_excd_cache(시세 프로브 자동판별)와 동일하게 맞춘다 — excg 미지정 시 캐시(없으면
+        1회 프로브)에서 확보, 명시값(NAS/NYS/AMS)도 excd_to_excg 로 정규화."""
+        tk = (ticker or "").upper()
+        if excg:
+            excg = excd_to_excg(excg)
+        else:
+            cached = self._us_excd_cache.get(tk)
+            if not cached:
+                try:
+                    await self.us_last_price(tk)   # 거래소 자동판별 → 캐시 채움
+                except Exception:
+                    pass
+                cached = self._us_excd_cache.get(tk)
+            excg = excd_to_excg(cached) if cached else "NASD"
         c, p = self._acnt()
         d = await self._get_json("/uapi/overseas-stock/v1/trading/inquire-psamount", "TTTS3007R",
-            {"CANO": c, "ACNT_PRDT_CD": p, "OVRS_EXCG_CD": (excg or "NASD"),
-             "OVRS_ORD_UNPR": f"{float(unpr or 0):.4f}", "ITEM_CD": (ticker or "").upper()})
+            {"CANO": c, "ACNT_PRDT_CD": p, "OVRS_EXCG_CD": excg,
+             "OVRS_ORD_UNPR": f"{float(unpr or 0):.4f}", "ITEM_CD": tk})
         if str(d.get("rt_cd", "")) != "0":
             return {"ok": False, "usd": 0.0, "qty": 0, "exrt": 0.0, "msg1": d.get("msg1", "")}
         o = d.get("output") or {}
-        return {"ok": True, "usd": self._num(o.get("ord_psbl_frcr_amt")),
+        # 통합증거금(버그 2026-06-17, uid1 US 신규매수 전부 '예수금 $0 제외'): KIS 는 KRW 를 환율로
+        # 환산한 해외 매수력을 ovrs_ord_psbl_amt(해외 주문가능금액)·max_ord_psbl_qty 로 정확히 준다.
+        # 순수 USD 현금(ord_psbl_frcr_amt)만 읽으면 USD 0 계좌에서 통합증거금이 무력화돼 매수가 전부
+        # 제외됐다(라이브 확인: ord_psbl_frcr_amt=0 · ovrs_ord_psbl_amt=1657.94 · max_ord_psbl_qty=13).
+        # usd 는 ovrs_ord_psbl_amt → frcr_ord_psbl_amt1 → ord_psbl_frcr_amt 순 첫 양수(qty 클램프가 최종 방어).
+        _usd = (self._num(o.get("ovrs_ord_psbl_amt"))
+                or self._num(o.get("frcr_ord_psbl_amt1"))
+                or self._num(o.get("ord_psbl_frcr_amt")))
+        return {"ok": True, "usd": _usd,
                 "qty": self._int(o.get("max_ord_psbl_qty")), "exrt": self._num(o.get("exrt"))}
 
     async def kr_account_asset(self) -> Dict:
@@ -1222,9 +1349,8 @@ class KISBroker:
             # garbage 다(라이브 확인: exrt 224, US종목 평가 145M인데 모의 계좌는 100M짜리 — 물리적 불가).
             # 가격×수량×환율 재계산도 입력이 전부 오염돼 무의미하므로, exrt 비정상(<500)이면 해외평가를
             # 신뢰 불가로 0 처리(제외)한다 → 모의 equity = 국내+현금만(안정·정직). 실거래(exrt~1500)는 영향 없음.
-            if pk.get("exrt") and pk["exrt"] < 500:
-                krw = 0.0
-            self._set_overseas_cache(krw, _now, stock=pk.get("stock_value"), exrt=pk.get("exrt"))
+            krw, _ov_stock = _sanitize_overseas(krw, pk.get("stock_value"), pk.get("exrt"))
+            self._set_overseas_cache(krw, _now, stock=_ov_stock, exrt=pk.get("exrt"))
             # 사장 지시 2026-06-01: 기준환율 sanity 가드 — 모의서버가 비정상 환율(221.9 등)을 주면
             # 전역 FX 캐시(예산·리스크 환산)가 오염돼 실전 계정까지 망가진다. USD/KRW 는 역사적으로 500↑.
             if pk["exrt"] > 500:
@@ -1709,21 +1835,38 @@ class KISBroker:
 
     # ═══════════════════ CSV 누적 ═══════════════════
     def _append_csv(self, filename: str, rows: List[Dict], columns: List[str]):
+        """CSV upsert — 같은 키(columns[0]=date/datetime)는 덮어쓴다(당일 봉 갱신·종가 확정).
+        2026-06-15: 동일 날짜 스킵으로 당일 봉이 첫 조회값에 고정되던 버그 수정. 겹침 없으면 append."""
         if not rows: return
+        key = columns[0]
         path = DATA_DIR / filename
         exists = path.exists()
+        existing: List[Dict] = []
         seen = set()
         if exists:
             with open(path, "r", encoding="utf-8") as f:
                 for line in csv.DictReader(f):
-                    seen.add(line.get(columns[0], ""))
-        new_rows = [r for r in rows if r.get(columns[0], "") and r[columns[0]] not in seen]
-        if not new_rows: return
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=columns)
-            if not exists: w.writeheader()
-            w.writerows(new_rows)
-        logger.info(f"CSV 누적: {filename} +{len(new_rows)}행")
+                    existing.append(line); seen.add(line.get(key, ""))
+        new_keys = {str(r.get(key, "")) for r in rows if str(r.get(key, "")) != ""}
+        overlap = new_keys & seen
+        if not overlap:
+            new_rows = [r for r in rows if str(r.get(key, "")) != "" and str(r.get(key, "")) not in seen]
+            if not new_rows: return
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=columns)
+                if not exists: w.writeheader()
+                w.writerows(new_rows)
+            logger.info(f"CSV 누적: {filename} +{len(new_rows)}행")
+            return
+        # 겹침 → 동일 키 덮어쓰기(read-modify-write)
+        new_by_key = {str(r.get(key, "")): r for r in rows if str(r.get(key, "")) != ""}
+        merged: Dict[str, Dict] = {row.get(key, ""): row for row in existing}
+        merged.update(new_by_key)  # 같은 키는 새 값으로 교체
+        out = sorted(merged.values(), key=lambda r: r.get(key, ""))
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+            w.writeheader(); w.writerows(out)
+        logger.info(f"CSV 갱신: {filename} ({len(new_by_key)}행 upsert, 총 {len(out)})")
 
 # Phase 2: the global broker singleton is retired. Brokers are owned by UserContext
 # (one per uid, built with that uid's injected credentials). This shim raises so any
