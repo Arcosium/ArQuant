@@ -174,3 +174,6 @@ data/
 
 # 계정 해지/마이그레이션 백업 (암호화 자격증명 포함 — 커밋 금지)
 backups/
+
+# APK 산출물 — 배포는 Google Drive(gdrive:apk/), git 에는 미포함 (63MB 바이너리)
+/QuantInSight.apk
