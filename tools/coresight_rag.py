@@ -37,6 +37,100 @@ def _is_admin_active(uid: Optional[int] = None) -> bool:
         return False
 
 
+# ── 시맨틱(임베딩) 검색 — additive·fail-soft. 기본 OFF(env CORESIGHT_RAG_MODE) ──────
+# CORESIGHT_RAG_MODE: keyword(기본, 기존동작) | hybrid(키워드+시맨틱 RRF) | semantic
+# arcembed(:8765) 미가용·오류 시 무조건 키워드로 폴백 → 스웜 루프 절대 안 죽인다.
+_CORESIGHT_VEC = None
+
+
+def _arcembed():
+    try:
+        import arcembed
+        return arcembed
+    except Exception:
+        import sys as _sys
+        lib = os.path.expanduser("~/projects/lib")
+        if lib not in _sys.path:
+            _sys.path.insert(0, lib)
+        try:
+            import arcembed
+            return arcembed
+        except Exception:
+            return None
+
+
+def _file_text(data):
+    rk = (data.get("refined_knowledge") or {}) if isinstance(data, dict) else {}
+    parts = [rk.get("summary", "")] + list(rk.get("logic_points") or [])
+    txt = "\n".join(p for p in parts if p).strip()
+    if not txt and isinstance(data, dict):
+        txt = data.get("extracted_text") or data.get("summary") or ""
+    return (txt or "").strip()[:2000]
+
+
+def _semantic_index(path):
+    """CORESIGHT_PATH JSON → 임베딩 인덱스(모듈 캐시, 신규 파일만 증분). arcembed 없으면 None."""
+    global _CORESIGHT_VEC
+    ae = _arcembed()
+    if ae is None:
+        return None
+    if _CORESIGHT_VEC is None:
+        vecdb = os.path.join(os.path.dirname(path.rstrip("/")), "coresight_rag_vec.db")
+        _CORESIGHT_VEC = ae.VectorIndex(vecdb)
+    ix = _CORESIGHT_VEC
+    todo = [fp for fp in glob.glob(os.path.join(path, "*.json")) if not ix.has(fp)]
+    ids, texts, metas = [], [], []
+    for fp in todo:
+        try:
+            d = json.load(open(fp, encoding="utf-8"))
+        except Exception:
+            continue
+        t = _file_text(d)
+        if not t:
+            continue
+        ids.append(fp)
+        texts.append(t)
+        metas.append({"title": os.path.basename(fp).replace(".json", ""), "path": fp})
+    if texts:
+        V = ae.embed(texts)
+        ix.add_many([(ids[i], V[i], metas[i]) for i in range(len(ids))])
+    return ix
+
+
+def _rank_hybrid(query, keyword_results, path, top_k, mode):
+    """키워드 결과 + 시맨틱 검색을 RRF 로 병합. 실패 시 키워드 top_k."""
+    ae = _arcembed()
+    ix = _semantic_index(path)
+    if ae is None or ix is None:
+        return keyword_results[:top_k]
+    sem = ix.search(ae.embed(query), k=max(top_k * 3, 15))  # [(path, score, meta)]
+    kw_rank = {r["path"]: i for i, r in enumerate(keyword_results)}
+    sem_rank = {p: i for i, (p, s, m) in enumerate(sem)}
+    kw_by_path = {r["path"]: r for r in keyword_results}
+    if mode == "semantic":
+        order = [p for p, _, _ in sem]
+    else:  # hybrid RRF (k=60 관례)
+        order = sorted(set(kw_rank) | set(sem_rank),
+                       key=lambda p: 1.0 / (60 + kw_rank.get(p, 10**6))
+                       + 1.0 / (60 + sem_rank.get(p, 10**6)), reverse=True)
+    out = []
+    for p in order[:top_k]:
+        if p in kw_by_path:
+            out.append(kw_by_path[p])
+            continue
+        summary = ""
+        try:
+            d = json.load(open(p, encoding="utf-8"))
+            rk = (d.get("refined_knowledge") or {}) if isinstance(d, dict) else {}
+            summary = (rk.get("summary") or (d.get("extracted_text", "")[:500]
+                       if isinstance(d, dict) else ""))
+        except Exception:
+            pass
+        out.append({"title": os.path.basename(p).replace(".json", ""),
+                    "score": 0, "summary": summary, "path": p})
+    return out
+
+
 async def query_coresight(query: str, top_k: int = 5, uid: Optional[int] = None) -> str:
     """
     Search Coresight knowledge base files in real-time.
@@ -111,7 +205,17 @@ async def query_coresight(query: str, top_k: int = 5, uid: Optional[int] = None)
             continue
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    top_results = results[:top_k]
+
+    # 시맨틱/하이브리드(opt-in) — 실패 시 키워드로 폴백(fail-soft, 스웜 안 죽인다)
+    mode = os.getenv("CORESIGHT_RAG_MODE", "keyword").lower()
+    if mode in ("hybrid", "semantic"):
+        try:
+            top_results = _rank_hybrid(query, results, CORESIGHT_PATH, top_k, mode)
+        except Exception as e:
+            logger.info("Coresight 시맨틱 실패 — 키워드 폴백: %s", e)
+            top_results = results[:top_k]
+    else:
+        top_results = results[:top_k]
 
     if not top_results:
         return f"[Coresight] '{query}'에 대한 관련 지식을 찾지 못했습니다."

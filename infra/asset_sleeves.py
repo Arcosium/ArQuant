@@ -221,6 +221,24 @@ def cap_sleeve_buy_notional(notional_krw: float, total_eval_krw: float, cash_krw
 
 
 # ── 결정 파싱 / 주문 조립 ──────────────────────────────────────────────────────
+def normalize_sell_directive(d: str) -> str:
+    """매도 지시 정규화 (사장 지시 2026-07-20) — LLM이 '1주 매도'를 '1매'/'5주'/'3매도'로 오기하면
+    조립부의 isdigit() 판정에 걸려 매도가 **조용히 누락**되던 것 방지('실주문 누락 금지' 원칙).
+    'N매'/'N주'/'N매도'/'N股' → 'N', '전량매도'→'전량', '절반매도'/'반'→'절반'. 매수/보유/전량/절반/
+    순수숫자/매도는 그대로 통과."""
+    s = str(d or "").strip()
+    if not s:
+        return s
+    m = re.match(r"^(\d+)\s*(?:주|매도|매|股|shares?|share)?$", s, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    if s in ("전량매도", "전량 매도", "전부", "전부매도"):
+        return "전량"
+    if s in ("절반매도", "반", "반매도", "1/2"):
+        return "절반"
+    return s
+
+
 def _sleeve_decision_line(text: str, keyword: str):
     """매니저 결정 줄에서 (code, directive, weight_or_None) 튜플들을 파싱하는 공통 이터레이터.
     형식: '<keyword>: 153130=매수:50, 357870=매수:30, 114260=보유'
@@ -238,7 +256,7 @@ def _sleeve_decision_line(text: str, keyword: str):
         if not mm:
             continue
         code = mm.group(1).upper()
-        directive = mm.group(2).strip()
+        directive = normalize_sell_directive(mm.group(2).strip())  # '1매'→'1' 등(매수/보유는 통과)
         if directive == "보류":   # '보류'(매매 안 함)를 '보유'와 동의어로 정규화
             directive = "보유"
         weight = None

@@ -38,7 +38,7 @@ from infra.asset_sleeves import (
     sleeve_codes, sleeve_for_code, parse_macro_sleeve_pct, sleeve_pool_for_session,
     split_sleeve_holdings, current_sleeve_weight, size_sleeve_action,
     cap_sleeve_buy_notional, parse_sleeve_decisions, parse_sleeve_weights,
-    assemble_sleeve_orders, should_execute_sleeve_buy,
+    assemble_sleeve_orders, should_execute_sleeve_buy, normalize_sell_directive,
     build_exec_list, format_sleeve_holdings_block,
 )
 import runtime  # live strategy overrides — runtime.get("KEY") → override or config default
@@ -1871,7 +1871,9 @@ def _parse_sell_decisions(text: str) -> Dict[str, str]:
     for part in re.split(r"[,，;]", m.group(1).splitlines()[0]):
         mm = re.match(r"\s*([0-9]{6}|[A-Za-z]{1,5})\s*=\s*([^\s,，;]+)", part)
         if mm:
-            out[mm.group(1).upper()] = mm.group(2).strip()
+            # 사장 지시 2026-07-20: '1매'/'5주'/'3매도' 등 단위 접미사를 주수로 정규화 —
+            # 종전엔 isdigit() 판정에 걸려 매도가 조용히 누락됐다(#481 261220=1매).
+            out[mm.group(1).upper()] = normalize_sell_directive(mm.group(2).strip())
     return out
 
 
