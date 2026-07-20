@@ -4,7 +4,7 @@
 #   기존 인스턴스를 lsof + pkill 양쪽으로 확실히 정리하고, 포트가 '실제로'
 #   비워질 때까지 대기한 뒤에만 새 uvicorn 을 띄운다. 마지막에 헬스 확인.
 
-APP_DIR="/home/opc/projects/ArQuant"
+APP_DIR="/home/arcosium/projects/QuantInSight"
 LOG_FILE="/tmp/arquant.log"
 TUNNEL_LOG="/tmp/cloudflared.log"
 PORT=8500

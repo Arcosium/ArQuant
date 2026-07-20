@@ -28,7 +28,6 @@ _PROFILES_DIR = Path(__file__).resolve().parent.parent / "data" / "profiles"
 # 프로덕션 도메인 + 로컬 개발(에뮬레이터/localhost)만 허용. 추가 origin은 ARQUANT_EXTRA_ORIGINS(콤마 구분)로 주입.
 _ALLOWED_ORIGINS = [
     "https://quantinsight.ai-ve.uk",  # 주 도메인 (ArQuant→QuantInSight 개명, 2026-07-20)
-    "https://arquant.ai-ve.uk",       # 구 도메인 — 기배포 모바일 APK 호환용 별칭
     "http://localhost:8500", "http://127.0.0.1:8500",
     "http://10.0.2.2:8500",  # Android emulator host loopback
 ]

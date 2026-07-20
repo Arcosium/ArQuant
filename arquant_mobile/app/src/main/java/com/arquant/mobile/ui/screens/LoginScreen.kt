@@ -157,7 +157,7 @@ fun LoginScreen(
             ) {
                 ArQuantLogoBox()
                 Column {
-                    Text("ArQuant", fontSize = 16.sp, fontWeight = FontWeight.Bold,
+                    Text("QuantInSight", fontSize = 16.sp, fontWeight = FontWeight.Bold,
                         color = AqColors.TextPrimary)
                     Text("Multi-Asset AI Trading", fontSize = 10.sp, color = AqColors.TextDim)
                 }

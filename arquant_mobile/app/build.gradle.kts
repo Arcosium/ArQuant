@@ -28,8 +28,8 @@ android {
         versionCode = 1
         versionName = "1.0.0"
 
-        buildConfigField("String", "ARQUANT_BASE_URL", "\"https://arquant.ai-ve.uk\"")
-        buildConfigField("String", "ARQUANT_WS_URL", "\"wss://arquant.ai-ve.uk/ws\"")
+        buildConfigField("String", "ARQUANT_BASE_URL", "\"https://quantinsight.ai-ve.uk\"")
+        buildConfigField("String", "ARQUANT_WS_URL", "\"wss://quantinsight.ai-ve.uk/ws\"")
         // 사장 피드백 2026-05-16: Cloudflare Access 제거 → 앱 자체 로그인(세션 토큰).
         // CF_ACCESS_* BuildConfig 및 local.properties 의 cf.access.* 항목은 더 이상 사용하지 않음.
     }
