@@ -116,6 +116,11 @@ DART_CACHE_TTL_SEC  = 24 * 60 * 60    # 1 day
 # 감시/재료성 뉴스 트리거는 폐지 — 단순히 1시간마다 사이클 1회 + 한국/미국 장 개장 시 누적 뉴스로 1회.
 # (구버전 ANALYSIS_NEWS_THRESHOLD / ANALYSIS_RAW_FALLBACK 트리거 파라미터는 사장 지시 2026-05-21로 완전 제거)
 PERIODIC_CYCLE_SEC      = 1 * 60 * 60 # run a cycle this often while a market is open (1시간마다 1회)
+# 연속 사이클(단타) — 사장 지시 2026-07-20: True 면 장중 사이클이 끝나자마자 다음 사이클을
+# 곧바로 재발화한다(정시 :00 대기 없음). CONTINUOUS_MIN_GAP_SEC 는 사이클 사이 최소 간격(초)
+# — KIS TPS·뉴스 크롤 여유용 하한. 런타임/대시보드 '전략' 탭에서 프로필별 on/off·조정 가능.
+CONTINUOUS_CYCLES       = False
+CONTINUOUS_MIN_GAP_SEC  = 20
 HEADLINE_DEDUP_RATIO    = 0.85        # difflib ratio above which two headlines are "the same"
 NEWS_PREFILTER_TRIGGER  = 40          # 누적 헤드라인이 이 수를 넘으면 큐레이터로 사전 선별
 NEWS_PREFILTER_LIMIT    = 40          # 사전 선별 후 마켓센티먼트팀장에게 넘길 최대 헤드라인 수
@@ -387,6 +392,8 @@ def strategy_param_catalog_text():
 # '전략' 탭에서 값을 직접 편집하면 runtime.py 가 프로필별로 영속·라이브 반영한다.
 # Keys here MUST match module-level constant names above (runtime.get() falls back to those).
 STRATEGY_TUNABLE_KEYS = [
+    # 연속 사이클(단타) — 사장 지시 2026-07-20
+    "CONTINUOUS_CYCLES", "CONTINUOUS_MIN_GAP_SEC",
     "PER_ORDER_BUDGET_RATIO", "PER_ORDER_BUDGET_OVERSHOOT", "MAX_CYCLE_BUDGET_RATIO", "MIN_CASH_BUFFER",
     "MACRO_DEPLOY_FLOOR_ENABLED", "PER_ORDER_BUDGET_FLOOR_RATIO", "MAX_CYCLE_BUDGET_FLOOR_RATIO",
     "ENABLE_DILUTION_GATE", "ENABLE_IC_SIZING",
@@ -450,6 +457,12 @@ OPS_PROTECTED_KEYS = {
 #   int        → 정수 그대로
 #   bool       → true/false 토글
 STRATEGY_KEY_META = {
+    "CONTINUOUS_CYCLES":          {"label": "연속 사이클(단타)", "type": "bool",
+                                   "help": "켜면 장중 사이클이 끝나자마자 다음 사이클을 곧바로 재발화(정시 대기 없음). 단타 운용용.",
+                                   "group": "사이클"},
+    "CONTINUOUS_MIN_GAP_SEC":     {"label": "연속 사이클 최소 간격", "type": "int", "unit": "초",
+                                   "help": "연속 사이클 사이 최소 대기(초). KIS 초당 거래건수·뉴스 크롤 여유용 하한.",
+                                   "min": 5, "max": 600, "step": 5, "group": "사이클"},
     "PER_ORDER_BUDGET_RATIO":     {"label": "1주문 예수금 사용 비율", "type": "pct_ratio", "unit": "%",
                                    "help": "한 번 매수 시 예수금의 최대 X%까지 사용 (예: 10 = 예수금의 10%)",
                                    "min": 1, "max": 100, "step": 1, "group": "사이징"},

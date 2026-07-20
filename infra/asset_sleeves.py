@@ -221,35 +221,67 @@ def cap_sleeve_buy_notional(notional_krw: float, total_eval_krw: float, cash_krw
 
 
 # ── 결정 파싱 / 주문 조립 ──────────────────────────────────────────────────────
-def parse_sleeve_decisions(text: str, keyword: str, pool_codes) -> Dict[str, str]:
-    """매니저의 '<keyword>: 148070=매수, TLT=보유' 한 줄 → {code: directive}.
-    keyword 예: '채권결정' | '원자재결정'. ETF 풀 화이트리스트 밖 코드는 드롭(티커 환각 가드)."""
-    out: Dict[str, str] = {}
-    # keyword 가 '채권결정' 이면 '채권\s*결정' 도 허용(LLM 띄어쓰기 변형 대응).
+def _sleeve_decision_line(text: str, keyword: str):
+    """매니저 결정 줄에서 (code, directive, weight_or_None) 튜플들을 파싱하는 공통 이터레이터.
+    형식: '<keyword>: 153130=매수:50, 357870=매수:30, 114260=보유'
+    directive 는 콜론 앞(매수/보유/전량/절반/주수), weight 는 매수 시 배분 비중(정수/실수 %)."""
     kw_pat = re.escape(keyword)
     if keyword.endswith("결정"):
         kw_pat = re.escape(keyword[:-2]) + r"\s*결정"
     m = re.search(kw_pat + r"\s*[:：]\s*(.+)", text or "", re.IGNORECASE)
     if not m:
-        return out
-    pool = {str(c).strip().upper() for c in (pool_codes or [])}
+        return
     for part in re.split(r"[,，;]", m.group(1).splitlines()[0]):
-        mm = re.match(r"\s*([0-9]{6}|[A-Za-z]{1,5})\s*=\s*([^\s,，;]+)", part)
-        if mm and mm.group(1).upper() in pool:
-            _d = mm.group(2).strip()
-            if _d == "보류":   # '보류'(매매 안 함)를 '보유'와 동의어로 정규화
-                _d = "보유"
-            out[mm.group(1).upper()] = _d
+        # directive 는 콜론(:／：)을 포함하지 않는 토큰, 그 뒤 선택적 ':비중'.
+        mm = re.match(r"\s*([0-9]{6}|[A-Za-z]{1,5})\s*=\s*([^\s,，;:：]+)\s*(?:[:：]\s*(\d+(?:\.\d+)?))?",
+                      part)
+        if not mm:
+            continue
+        code = mm.group(1).upper()
+        directive = mm.group(2).strip()
+        if directive == "보류":   # '보류'(매매 안 함)를 '보유'와 동의어로 정규화
+            directive = "보유"
+        weight = None
+        if mm.group(3) is not None:
+            try:
+                weight = float(mm.group(3))
+            except ValueError:
+                weight = None
+        yield code, directive, weight
+
+
+def parse_sleeve_decisions(text: str, keyword: str, pool_codes) -> Dict[str, str]:
+    """매니저의 '<keyword>: 148070=매수, TLT=보유' 한 줄 → {code: directive}.
+    keyword 예: '채권결정' | '원자재결정'. ETF 풀 화이트리스트 밖 코드는 드롭(티커 환각 가드).
+    '코드=매수:비중'의 비중 부분은 여기서 벗겨내고 directive 만 반환한다(비중은 parse_sleeve_weights)."""
+    out: Dict[str, str] = {}
+    pool = {str(c).strip().upper() for c in (pool_codes or [])}
+    for code, directive, _w in _sleeve_decision_line(text, keyword):
+        if code in pool:
+            out[code] = directive
+    return out
+
+
+def parse_sleeve_weights(text: str, keyword: str, pool_codes) -> Dict[str, float]:
+    """매수 종목의 배분 비중 '{code: weight%}' (사장 지시 2026-07-20 — 매니저 50/30/20 실제 반영).
+    '코드=매수:비중' 에서 비중이 명시된 매수 항목만 담는다. 미명시면 빈 dict → 호출부가 균등 폴백."""
+    out: Dict[str, float] = {}
+    pool = {str(c).strip().upper() for c in (pool_codes or [])}
+    for code, directive, w in _sleeve_decision_line(text, keyword):
+        if code in pool and directive == "매수" and w is not None and w > 0:
+            out[code] = w
     return out
 
 
 def assemble_sleeve_orders(spec: SleeveSpec, action, notional_krw, directives, holdings,
-                           price_lookup, usdkrw: float = 1.0):
+                           price_lookup, usdkrw: float = 1.0, weights=None):
     """매니저 결정(파싱 결과)을 실제 주문 리스트로 조립한다(순수 함수, broker/LLM 무관).
 
     - action: size_sleeve_action 결과('buy'/'sell'/'hold'/'skip'). 'buy'/'sell'만 주문 생성.
     - notional_krw: 매수 시 분배할 총 원화 예산. 매도는 보유 주수 기반이라 무관.
     - directives: {code: directive}. directive ∈ {'매수','보유','전량','절반', 정수문자열}.
+    - weights: {code: 비중%} (사장 지시 2026-07-20). 매수 종목 '전부'에 양수 비중이 있으면
+      그 비중대로 예산을 분배하고, 일부만/전무면 **균등 분할**(기존 동작)로 폴백한다.
     - holdings: 현재 보유 슬리브 ETF 리스트([{code, qty, ...}]).
     - price_lookup(code) -> float: KR=원화, US=USD 원가격. 0/None이면 그 코드 스킵.
     - usdkrw: US ETF qty 계산용 환산율. order price 에는 **원가격**(원화 또는 USD)을 넣는다.
@@ -260,8 +292,14 @@ def assemble_sleeve_orders(spec: SleeveSpec, action, notional_krw, directives, h
         picks = [c for c, d in (directives or {}).items() if str(d).strip() == "매수"]
         if not picks:
             return orders
-        per_budget = float(notional_krw or 0.0) / len(picks)
-        for code in picks:
+        total = float(notional_krw or 0.0)
+        w = weights or {}
+        _pw = [float(w.get(c) or 0.0) for c in picks]
+        # 매수 종목 '전부'에 양수 비중이 지정됐을 때만 가중 분배 — 부분/전무면 균등 폴백(예측가능).
+        _use_weights = bool(picks) and all(x > 0 for x in _pw) and sum(_pw) > 0
+        _wsum = sum(_pw) if _use_weights else 0.0
+        for _i, code in enumerate(picks):
+            per_budget = (total * _pw[_i] / _wsum) if _use_weights else (total / len(picks))
             price = float(price_lookup(code) or 0.0)
             if price <= 0:
                 continue

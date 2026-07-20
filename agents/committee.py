@@ -228,9 +228,17 @@ def _transcript(dialogue: List[dict]) -> str:
 
 async def _turn(role: str, brief: str, dialogue: List[dict], ask: str,
                 want_stance: bool, want_claims: bool = False,
-                thinking: Optional[bool] = None) -> Optional[dict]:
-    """한 발언(턴) LLM 호출 → {"text", "stance"?, "confidence"?, "claims"?} | None(실패)."""
+                thinking: Optional[bool] = None,
+                name_override: Optional[str] = None,
+                persona_override: Optional[str] = None) -> Optional[dict]:
+    """한 발언(턴) LLM 호출 → {"text", "stance"?, "confidence"?, "claims"?} | None(실패).
+    name_override/persona_override: 슬리브 심의 등에서 chief 를 채권·원자재운용실장으로
+    바꿔 부를 때 시스템 프롬프트의 직책·역할 설명을 치환한다(주식 심의 경로엔 미영향)."""
     name, persona = _PERSONAS[role]
+    if name_override:
+        name = name_override
+    if persona_override:
+        persona = persona_override
     if want_stance and want_claims:
         fmt = ('{"발언":"결정 근거 2~3문장", "스탠스":"매수|보류|회피", "확신":0~100, '
                '"claims":[{"text":"제공 사실 밖 주장(있을 때만)","fact_ref":null}]}')
@@ -255,7 +263,9 @@ async def _turn(role: str, brief: str, dialogue: List[dict], ask: str,
         text = str(d.get("발언", "")).strip()
         if not text:
             return None
-        out: Dict[str, Any] = {"text": text[:400]}
+        # 결정문 절단 완화(사장 지시 2026-07-20): 실장 최종 결정이 문장 중간에 잘리던 문제 —
+        # 턴 텍스트 캡 400→600, 브로드캐스트 절단도 호출부에서 완화.
+        out: Dict[str, Any] = {"text": text[:600]}
         if want_stance:
             if d.get("스탠스") not in _STANCES:
                 return None
@@ -368,9 +378,79 @@ async def deliberate_target(code: str, name: str, report: Report, *,
     opinions.append({"agent": "주식운용실장", "role": "chief", "stance": r["stance"],
                      "confidence": round(float(r.get("confidence", 0.6)), 2),
                      "rationale": r["text"], "evidence": [f"토론 {DEBATE_ROUNDS}R 종합"]})
-    await _emit("주식운용실장", f"[{name} 심의 결정] {r['stance']} — {r['text'][:160]}")
+    await _emit("주식운용실장", f"[{name} 심의 결정] {r['stance']} — {r['text'][:400]}")
     return opinions, dialogue, {"stance": r["stance"], "text": r["text"],
                                 "confidence": float(r.get("confidence", 0.6))}, llm_used
+
+
+# ── 슬리브(채권·원자재) 매수 심의 (사장 지시 2026-07-20) ─────────────────────────
+def _fmt_sleeve_brief(code: str, name: str, sleeve_label: str, macro_view: str,
+                      manager_rationale: str, weight_ctx: str, price: float) -> str:
+    return f"""[심의 대상] {sleeve_label} ETF — {name} ({code})
+[가격] 약 {price:,.0f} (원가격)
+[자산배분 맥락] {weight_ctx or '(없음)'}
+[매크로 요약] {macro_view or '(없음)'}
+[{sleeve_label}운용실장 매수 논거]
+{(manager_rationale or '(없음)')[:900]}
+※ 이 ETF는 개별 종목 퀀트점수가 없는 자산배분 수단이다 — 매크로 정합성·목표 비중·과다노출 리스크로 판단하라."""
+
+
+async def deliberate_sleeve_buy(code: str, name: str, *, sleeve_label: str,
+                                chief_label: str, macro_view: str,
+                                manager_rationale: str, weight_ctx: str = "",
+                                price: float = 0.0,
+                                progress: Optional[Callable[[str, str], Awaitable[None]]] = None,
+                                ) -> Tuple[List[dict], dict, bool]:
+    """채권·원자재 슬리브 매수 후보 1건 위원회 심의.
+
+    매수옹호역↔리스크반론역 찬반토론 N라운드 → 슬리브운용실장(chief_label) 최종 매수/보류/회피.
+    주식 deliberate_target 과 달리 퀀트점수·정직성 게이트가 없고 자산배분 정합성·과다노출만
+    다툰다. 어떤 실패도 사이클을 막지 않는다(호출부 fail-open). 반환 (dialogue, decision, llm_used)."""
+    brief = _fmt_sleeve_brief(code, name, sleeve_label, macro_view, manager_rationale, weight_ctx, price)
+    _chief_persona = (f"채권·원자재 자산배분을 총괄하는 {chief_label}이다. 회의록의 찬반토론을 종합해 "
+                      "이 ETF 매수 여부를 최종 결정한다 — 자산배분 정합성과 과다노출 리스크를 함께 본다.")
+    dialogue: List[dict] = []
+    llm_used = False
+
+    async def _emit(agent: str, msg: str):
+        if progress:
+            try:
+                await progress(agent, msg)
+            except Exception:
+                pass
+
+    for rnd in range(1, DEBATE_ROUNDS + 1):
+        ask_bull = (f"이 {sleeve_label} ETF 매수(자산배분)를 옹호하는 논거를 제시하라."
+                    if rnd == 1 else f"리스크반론역의 직전 논거를 반박하라. (라운드 {rnd})")
+        ask_bear = (f"이 {sleeve_label} ETF 매수를 반대하는 논거를 제시하라."
+                    if rnd == 1 else f"매수옹호역의 직전 논거를 반박하라. (라운드 {rnd})")
+        for role, ask, fb in (
+                ("bull", ask_bull,
+                 f"매크로가 {sleeve_label} 비중 확대를 권고한다 — 자산배분상 매수가 정합적이다."),
+                ("bear", ask_bear,
+                 "이미 목표 비중에 근접했거나 신호가 약하면 추가 매수는 과다 노출이다.")):
+            r = await _turn(role, brief, dialogue, ask, False, thinking=False)
+            if r:
+                llm_used = True
+            else:
+                r = {"text": fb}
+            dialogue.append({"speaker": _PERSONAS[role][0], "role": role,
+                             "text": r["text"], "round": rnd})
+            await _emit(_PERSONAS[role][0], f"[{name} {sleeve_label} 심의 R{rnd}] {r['text'][:200]}")
+
+    r = await _turn("chief", brief, dialogue,
+                    "찬반토론을 종합해 이 ETF 매수 여부를 최종 결정하라(매수|보류|회피).",
+                    True, thinking=False,
+                    name_override=chief_label, persona_override=_chief_persona)
+    if r is None:
+        r = {"text": f"{chief_label} 자산배분 판단 유지 — LLM 심의 불가로 매수 유지(결정론 폴백).",
+             "stance": BUY, "confidence": 0.6}
+    else:
+        llm_used = True
+    dialogue.append({"speaker": chief_label, "role": "chief", "text": r["text"], "stance": r["stance"]})
+    await _emit(chief_label, f"[{name} {sleeve_label} 심의 결정] {r['stance']} — {r['text'][:400]}")
+    return dialogue, {"stance": r["stance"], "text": r["text"],
+                      "confidence": float(r.get("confidence", 0.6))}, llm_used
 
 
 # ── 결정론 리스크 게이트 (risk_gate.py 이식) ─────────────────────────────────────
