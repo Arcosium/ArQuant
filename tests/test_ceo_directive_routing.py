@@ -32,7 +32,7 @@ def _ctx(uid, admin):
     return UserContext({"id": uid, "username": f"u{uid}", "is_admin": admin,
         "kis_app_key": "K", "kis_app_secret": "S", "kis_account_no": "1-01",
         "kis_base_url": "https://openapivts.koreainvestment.com:29443",
-        "deepseek_api_key": "DS", "dart_key": "", "label": "x"})
+        "llm_key": "DS", "dart_key": "", "label": "x"})
 
 
 def test_non_admin_ops_support_not_refused_and_no_admin_id_leak():

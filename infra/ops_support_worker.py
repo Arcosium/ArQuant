@@ -51,7 +51,7 @@ logger = logging.getLogger("OPS")
 
 # ─── LLM client (local OpenAI-compatible server, no BaseAgent dependency) ──
 from config import MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS
-from infra.deepseek_client import chat_completion, response_text
+from infra.local_llm_client import chat_completion, response_text
 
 # ─── Tunable limits (매직넘버 상수화) ─────────────────────────────────────
 LLM_TIMEOUT_SEC = 300
@@ -65,7 +65,7 @@ MAX_RATIONALE_CHARS = 2000         # 대시보드 메시지에 표시할 rationa
 TRACEBACK_TAIL_LINES = 8           # error traceback 표시 줄 수
 MAX_PROPOSED_SHOWN = 5             # 개선 제안 표시 개수
 
-OPS_MODEL = MODEL_ASSIGNMENTS.get("ops_support", "deepseek-v4-pro")
+OPS_MODEL = MODEL_ASSIGNMENTS.get("ops_support", "Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf+thinking")
 OPS_MAX_TOKENS = AGENT_MAX_TOKENS.get("ops_support", 4096)
 
 # 사장 지시 2026-05-20: 산하 팀장(investment/operations/finance) 및 코드 자가수정 기능 제거.

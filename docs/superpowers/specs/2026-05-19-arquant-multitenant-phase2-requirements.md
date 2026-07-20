@@ -71,7 +71,7 @@ should follow this (`data/<uid>/…`).
 - WebSocket (#8): tag connections with `user_id`; `broadcast(msg, user_id=…)` filter.
 - Background workers (#9): per-user identity vs single admin-scoped worker (ties to
   decision #3).
-- API rate-limit / cost ceilings per user (N concurrent KIS + DeepSeek accounts).
+- API rate-limit / cost ceilings per user (N concurrent KIS + 로컬 LLM accounts).
 - Per-user swarm lifecycle: start/stop/resume markers per user (replace
   `data/.active_account`, `data/.resume_on_boot`).
 

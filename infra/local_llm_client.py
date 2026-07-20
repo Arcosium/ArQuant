@@ -8,23 +8,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import aiohttp
 
-logger = logging.getLogger("DEEPSEEK")
+logger = logging.getLogger("LOCAL_LLM")
 
 # Thinking ON 을 나타내는 가상 접미사(실제 모델명엔 없음 — 전송 전 제거).
 _THINK_SUFFIX = "+thinking"
 
-# 사장 지시 2026-06-10 (공식 문서 정독 반영): 동시성 초과/서버부하/타임아웃은 백오프 재시도한다.
-# 문서 근거 — 429(Rate Limit, pro 동시성 500/flash 2500), 500(Server Error), 503(Overloaded)은
-# "잠시 후 재시도" 권고. 400/401/402(잔액)/422 는 영구오류라 재시도 무의미 → 즉시 실패.
+# 로컬 OpenAI 호환 서버가 재기동 중이거나 일시적으로 바쁠 수 있으므로 백오프 재시도한다.
+# 400/401/402/422 같은 영구 오류는 재시도하지 않고 즉시 실패한다.
 _RETRYABLE_STATUS = (429, 500, 503)
 _MAX_ATTEMPTS = 3
+_LOCAL_LLM_GRACE_SEC = int(os.environ.get("LOCAL_LLM_GRACE_SEC", "1800"))
+_LOCAL_LLM_TIMEOUT_SEC = int(os.environ.get("LOCAL_LLM_TIMEOUT_SEC", "900"))
 
 
-class DeepSeekAPIError(RuntimeError):
+class LocalLLMError(RuntimeError):
     pass
 
 
@@ -79,39 +82,64 @@ def build_request(
 
 # ── HTTP + 백오프 재시도(공유) ────────────────────────────────────────────────
 
+def _is_local_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 async def _post_with_retry(url: str, headers: Dict[str, str],
                            payload: Dict[str, Any], timeout_sec: int) -> Dict[str, Any]:
     last_err: Optional[str] = None
-    for attempt in range(_MAX_ATTEMPTS):
+    is_local = _is_local_url(url)
+    grace_deadline = asyncio.get_running_loop().time() + _LOCAL_LLM_GRACE_SEC
+    attempt = 0
+    while True:
         try:
-            timeout = aiohttp.ClientTimeout(total=timeout_sec)
+            effective_timeout_sec = (
+                max(int(timeout_sec), _LOCAL_LLM_TIMEOUT_SEC)
+                if is_local
+                else int(timeout_sec)
+            )
+            timeout = aiohttp.ClientTimeout(total=effective_timeout_sec)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status == 200:
                         data = await response.json()
                         if not isinstance(data, dict) or not data.get("choices"):
-                            raise DeepSeekAPIError(
+                            raise LocalLLMError(
                                 f"LLM 응답 형식 오류: {str(data)[:300]}")
                         return data
                     body = await response.text()
                     last_err = f"HTTP {response.status}: {body[:300]}"
                     # 영구오류 또는 마지막 시도 → 즉시 실패
                     if response.status not in _RETRYABLE_STATUS:
-                        raise DeepSeekAPIError(f"LLM HTTP {response.status}: {body[:600]}")
-                    if attempt >= _MAX_ATTEMPTS - 1:
-                        raise DeepSeekAPIError(
+                        raise LocalLLMError(f"LLM HTTP {response.status}: {body[:600]}")
+                    if not is_local and attempt >= _MAX_ATTEMPTS - 1:
+                        raise LocalLLMError(
                             f"LLM HTTP {response.status} ({_MAX_ATTEMPTS}회 재시도 실패): {body[:300]}")
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             last_err = f"{type(e).__name__}: {str(e)[:200]}"
-            if attempt >= _MAX_ATTEMPTS - 1:
-                raise DeepSeekAPIError(
+            if not is_local and attempt >= _MAX_ATTEMPTS - 1:
+                raise LocalLLMError(
                     f"LLM 연결/timeout 실패({_MAX_ATTEMPTS}회): {last_err}")
-        # 재시도 — 백오프(1.5/3/6s) 후 다음 시도
-        _wait = 1.5 * (2 ** attempt)
-        logger.warning("LLM 재시도 %d/%d (%s) — %.1fs 후 재요청",
-                       attempt + 1, _MAX_ATTEMPTS, last_err, _wait)
+        attempt += 1
+        if is_local:
+            remaining = grace_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise LocalLLMError(
+                    f"로컬 LLM 재기동 대기 초과({_LOCAL_LLM_GRACE_SEC}s): {last_err}")
+            _wait = min(1.5 * (2 ** min(attempt - 1, 5)), 15.0, remaining)
+            logger.warning("로컬 LLM 대기 %d회 (%s) — %.1fs 후 재요청",
+                           attempt, last_err, _wait)
+        else:
+            if attempt >= _MAX_ATTEMPTS:
+                raise LocalLLMError(
+                    f"LLM 연결/timeout 실패({_MAX_ATTEMPTS}회): {last_err}")
+            _wait = 1.5 * (2 ** (attempt - 1))
+            logger.warning("LLM 재시도 %d/%d (%s) — %.1fs 후 재요청",
+                           attempt, _MAX_ATTEMPTS, last_err, _wait)
         await asyncio.sleep(_wait)
-    raise DeepSeekAPIError(f"LLM 호출 실패: {last_err}")
+    raise LocalLLMError(f"LLM 호출 실패: {last_err}")
 
 
 async def chat_completion(

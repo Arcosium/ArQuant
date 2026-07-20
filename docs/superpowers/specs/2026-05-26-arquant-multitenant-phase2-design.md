@@ -10,7 +10,7 @@ by design (Phase 2 was deferred); per-request HTTP identity is isolated but the 
 
 ## Goal
 
-Let 5–15 accounts trade **concurrently and independently** from their own KIS/DeepSeek
+Let 5–15 accounts trade **concurrently and independently** from their own KIS/로컬 LLM
 credentials, with no cross-contamination of state, orders, equity, logs, or WebSocket events.
 
 ## Kickoff decisions (2026-05-26)
@@ -158,5 +158,5 @@ sentinel-reseed on profile reset).
 ## Non-goals (Phase 2)
 
 Email recovery, CSRF tokens, per-user Fernet key derivation (tracked in Phase 1 §8),
-per-user API rate-limit/cost ceilings (each user uses their own KIS/DeepSeek keys, so cost
+per-user API rate-limit/cost ceilings (each user uses their own KIS/로컬 LLM keys, so cost
 is naturally isolated — YAGNI for beta scale).

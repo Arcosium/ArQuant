@@ -6,7 +6,7 @@
 
 **Architecture:** 순수함수(주식비중·클램프·쓰로틀)는 분리해 단위테스트하고, 게이트/프롬프트/워커 수정은 기존 패턴(runtime override·STRATEGY_KEY_META·`_get_json` 재시도)을 따른다. 스키마 변경 없음.
 
-**Tech Stack:** Python 3.11, pytest, asyncio, KIS REST, DeepSeek(ops LLM).
+**Tech Stack:** Python 3.11, pytest, asyncio, KIS REST, 로컬 LLM(ops LLM).
 
 **커밋 정책:** 이 저장소는 외부 자동 Backup 도구가 `git add -A` + `Backup:` 커밋을 주기적으로 수행한다(CLAUDE.md). **수동 커밋 금지** — 각 태스크 체크포인트는 *테스트 통과*다. 전부 구현 후 사장 확인 하에 재시작 1회로 배포.
 

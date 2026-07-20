@@ -180,7 +180,7 @@ for spec in SLEEVES:
 ## 5. 원자재운용실장 + 4분할 자산배분 (요청 #4)
 
 - `config.MODEL_ASSIGNMENTS`·`AGENT_MAX_TOKENS`에 `commodity_manager` 추가
-  (모델 `deepseek-v4-flash`, 토큰 2000 — 채권과 동일).
+  (모델 `Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf`, 토큰 2000 — 채권과 동일).
 - `agents/specialists.py`: `create_commodity_manager(injection)` — 채권 매니저와 동형,
   성격="실물자산 매크로 전략가"(인플레·달러·지정학·수급으로 판단, 주식 퀀트 무관).
 - `main_swarm`: `self.commodity_manager` 인스턴스화, `agent_map` 등록.

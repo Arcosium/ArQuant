@@ -9,7 +9,7 @@ import javax.inject.Singleton
  * 사장 피드백 2026-05-16: Cloudflare Access 제거 → 앱 자체 로그인 세션 토큰 보관.
  *
  * 저장되는 값은 **불투명한 7일 세션 토큰**일 뿐이며, 실제 API 비밀(KIS App Secret /
- * DeepSeek 키 등)은 서버에 Fernet 암호화되어 있고 단말로 내려오지 않는다.
+ * 로컬 LLM 키 등)은 서버에 Fernet 암호화되어 있고 단말로 내려오지 않는다.
  * 따라서 앱 샌드박스 전용 SharedPreferences 로 충분하다 (브라우저 세션 쿠키와 동급 위험).
  */
 @Singleton

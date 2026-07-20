@@ -8,7 +8,7 @@ def _ctx(uid, mock=False):
         "kis_account_no": f"{uid}-01",
         "kis_base_url": ("https://openapivts.koreainvestment.com:29443" if mock
                          else "https://openapi.koreainvestment.com:9443"),
-        "deepseek_api_key": f"DS{uid}", "dart_key": "", "label": f"u{uid}",
+        "llm_key": f"DS{uid}", "dart_key": "", "label": f"u{uid}",
     })
 
 

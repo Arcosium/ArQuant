@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS cycles (
     bp_total_eval   REAL,
     bp_pnl_ratio    REAL,
     error           TEXT,
-    uid             INTEGER
+    uid             INTEGER,
+    committee       TEXT                        -- JSON — QuantInSight 이식 위원회 심의 기록 (2026-07-18)
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_started ON cycles(started_at);
 CREATE INDEX IF NOT EXISTS idx_cycles_session ON cycles(session);
@@ -75,6 +76,9 @@ def _get_conn() -> sqlite3.Connection:
         if "uid" not in cols:
             _conn.execute("ALTER TABLE cycles ADD COLUMN uid INTEGER")
             _conn.execute("CREATE INDEX IF NOT EXISTS idx_cycles_uid ON cycles(uid)")
+        # QuantInSight 이식(2026-07-18): 위원회 심의 기록 컬럼 — 기존 DB 무이전 호환.
+        if "committee" not in cols:
+            _conn.execute("ALTER TABLE cycles ADD COLUMN committee TEXT")
         # 보유기간 per-uid 격리(2026-06-15): 기존 비-uid 테이블은 계정 간 오염되어 있고
         # derived 데이터(매 사이클 재적재)이므로 재생성한다. PRAGMA 결과가 비면(테이블 미존재) 스킵.
         hh = {r[1] for r in _conn.execute("PRAGMA table_info(holdings_history)").fetchall()}
@@ -101,11 +105,11 @@ def record_cycle(meta: Dict[str, Any]) -> Optional[int]:
             "candidate_codes","target_codes","sell_directives","orders_planned",
             "orders_executed","risk_approved","risk_report","macro_report",
             "quant_report","news_report","final_report","bp_cash","bp_total_eval",
-            "bp_pnl_ratio","error","uid")
+            "bp_pnl_ratio","error","uid","committee")
     vals = []
     for c in cols:
         v = meta.get(c)
-        if c in ("candidate_codes","target_codes","sell_directives","orders_planned","orders_executed"):
+        if c in ("candidate_codes","target_codes","sell_directives","orders_planned","orders_executed","committee"):
             v = _j(v)
         elif c in ("market_open","risk_approved"):
             v = 1 if v else 0
@@ -134,6 +138,40 @@ def list_cycles(limit: int = 50, offset: int = 0, uid: Optional[int] = None) -> 
         return [dict(r) for r in rows]
     except Exception as e:
         logger.warning(f"list_cycles 실패: {e}")
+        return []
+
+def list_cycles_summary(limit: int = 100, offset: int = 0, uid: Optional[int] = None) -> List[Dict]:
+    """사이클 탭 히스토리용 경량 목록 — 무거운 리포트 본문 없이 id/시각/세션 + 체결·심의 유무만.
+    (QuantInSight 이식 UI 2026-07-18: 목록은 이걸로, 상세는 get_cycle 로.)"""
+    try:
+        where = "WHERE uid=?" if uid is not None else ""
+        args = ([int(uid)] if uid is not None else []) + [int(limit), int(offset)]
+        with _lock:
+            rows = _get_conn().execute(
+                f"SELECT id, started_at, ended_at, session, market_open, error, "
+                f"orders_executed, sell_directives, committee IS NOT NULL AS has_committee "
+                f"FROM cycles {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                tuple(args)).fetchall()
+        out: List[Dict] = []
+        for r in rows:
+            d = dict(r)
+            buys = sells = 0
+            try:
+                for e in json.loads(d.get("orders_executed") or "[]"):
+                    side = str((e or {}).get("side", "")).lower()
+                    if side in ("sell", "매도"):
+                        sells += 1
+                    else:
+                        buys += 1
+            except Exception:
+                pass
+            out.append({"id": d["id"], "started_at": d["started_at"], "ended_at": d["ended_at"],
+                        "session": d["session"], "market_open": d["market_open"],
+                        "error": bool(d.get("error")), "orders": buys, "sells": sells,
+                        "has_committee": bool(d.get("has_committee"))})
+        return out
+    except Exception as e:
+        logger.warning(f"list_cycles_summary 실패: {e}")
         return []
 
 def get_cycle(cycle_id: int) -> Optional[Dict]:

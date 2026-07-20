@@ -20,6 +20,12 @@ TOKEN_CACHE_FILE = DATA_DIR / "kis_token.json"
 
 import re as _re
 
+try:  # 공용 시세(EOD) 레이어 — pykrx/yfinance 우선, 실패 시 기존 KIS 경로 폴백
+    import arcmarket
+except ImportError:
+    arcmarket = None
+
+
 def _clean_kis_msg(msg: str) -> str:
     """사장 피드백 2026-05-16: KIS 원문(msg1)에서 '해외투자영업부(3276-5300)문의'·전화번호 같은
     안내 보일러플레이트를 제거하고 **실제 거부/처리 사유만** 남긴다.
@@ -459,11 +465,47 @@ class KISBroker:
         self._append_csv(f"daily_{code}.csv", rows, ["date","open","high","low","close","volume"])
         return rows
 
+    async def _arcmarket_daily_rows(self, symbol: str, *, kr: bool,
+                                    days: int, adjusted: bool = False) -> Optional[List[Dict]]:
+        """arcmarket(pykrx/yfinance) EOD 일봉 → KIS 경로와 동일한 row 규격.
+        사장 지시 2026-07-02: 시세는 pykrx/yfinance 일원화, 없는 정보만 KIS.
+        블로킹 IO 라서 to_thread 로 실행. 실패/미가용이면 None → KIS 폴백."""
+        if arcmarket is None:
+            return None
+        def _fetch():
+            df = (arcmarket.kr_daily(symbol, days=days) if kr
+                  else arcmarket.us_daily(symbol, days=days, adjusted=adjusted))
+            if df is None or df.empty:
+                return None
+            df = df.fillna(0)
+            rows = []
+            for d, x in df.iterrows():
+                if kr:
+                    rows.append({"date": d.strftime("%Y-%m-%d"),
+                                 "open": int(x["open"]), "high": int(x["high"]),
+                                 "low": int(x["low"]), "close": int(x["close"]),
+                                 "volume": int(x["volume"])})
+                else:
+                    rows.append({"date": d.strftime("%Y-%m-%d"),
+                                 "open": float(x["open"]), "high": float(x["high"]),
+                                 "low": float(x["low"]), "close": float(x["close"]),
+                                 "volume": int(x["volume"])})
+            return rows or None
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logger.warning(f"[arcmarket] {symbol} EOD 조회 실패 — KIS 폴백: {e}")
+            return None
+
     async def kr_daily_chart_deep(self, code: str, years: int = 2, max_calls: int = 10) -> List[Dict]:
-        """KIS 일봉을 날짜 윈도우로 페이지네이션해 ~years년치 깊게 수집 → CSV 누적.
-        KIS inquire-daily-itemchartprice는 호출당 ~100행만 주므로 윈도우를 과거로
-        굴리며 여러 번 호출한다 (사장 피드백 2026-05-18 — KIS 우선·'데이터 부족' 해소).
-        날짜를 네이버 경로와 동일한 YYYY-MM-DD로 정규화해 같은 CSV에 안전 누적."""
+        """국내 일봉 깊은 수집(~years년) → CSV 누적.
+        1순위 arcmarket(pykrx/yfinance — 사장 지시 2026-07-02 시세 일원화),
+        실패 시 기존 KIS 날짜 윈도우 페이지네이션 폴백 (호출당 ~100행)."""
+        via = await self._arcmarket_daily_rows(code, kr=True, days=int(max(1, years) * 365))
+        if via:
+            self._append_csv(f"daily_{code}.csv", via, ["date", "open", "high", "low", "close", "volume"])
+            logger.info(f"[일봉deep] {code}: arcmarket {len(via)}건 (pykrx/yfinance)")
+            return via
         tok = await self.token(); s = await self._s()
         target = (datetime.now(KST) - timedelta(days=int(max(1, years) * 365))).strftime("%Y%m%d")
         win_end = datetime.now(KST)
@@ -1586,6 +1628,13 @@ class KISBroker:
         tk = (ticker or "").strip().upper()
         if not tk:
             return []
+        # 1순위 arcmarket(yfinance, 수정주가 — KIS MODP=1 과 정합). 실패 시 KIS 폴백.
+        via = await self._arcmarket_daily_rows(tk, kr=False, days=max(30, int(days * 1.6)), adjusted=True)
+        if via:
+            via = via[-max(1, days):]
+            self._append_csv(f"daily_US_{tk}.csv", via, ["date", "open", "high", "low", "close", "volume"])
+            logger.info(f"[US일봉] {tk}: arcmarket {len(via)}건 (yfinance)")
+            return via
         if tk in self._us_dataless:
             logger.info(f"[US일봉] {tk} 상장폐지/데이터없음 캐시 — KIS 조회 생략 (재시작 시 재검증)")
             return []

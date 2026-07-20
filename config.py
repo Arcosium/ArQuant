@@ -32,8 +32,20 @@ LEGACY_KRX_SIMULATOR_PATH = Path("/home/opc/projects/KRX Quant Simulator")
 # URL은 설치 시에만 지정한다. 예: http://127.0.0.1:8080/v1
 # llama.cpp 서버는 보통 /v1 을 노출하므로 기본값도 그 형식으로 둔다.
 LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080/v1").rstrip("/")
-LOCAL_LLM_MODEL = os.getenv(
-    "LOCAL_LLM_MODEL", "Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf")
+LOCAL_ADAPTER_MODEL = "qwen3.6-35b-a3b-uncensored-genesis-lora:latest"
+_LOCAL_BASE_MODEL_NAMES = {
+    "Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf",
+    "qwen3.6-35b-a3b-uncensored",
+    "qwen3.6-35b-a3b-uncensored:latest",
+}
+
+
+def _local_llm_model():
+    model = (os.getenv("LOCAL_LLM_MODEL") or LOCAL_ADAPTER_MODEL).strip()
+    return LOCAL_ADAPTER_MODEL if model in _LOCAL_BASE_MODEL_NAMES else model
+
+
+LOCAL_LLM_MODEL = _local_llm_model()
 
 # '+thinking'은 내부 가상 접미사다. 전송 직전에 제거하고 OpenAI 호환 요청의
 # chat_template_kwargs.enable_thinking / reasoning.enabled 로 변환한다.
@@ -56,7 +68,7 @@ MODEL_ASSIGNMENTS = {
     "news_analyst": _FLASH,
     "news_curator": _FLASH,
     # macro_researcher 는 Hermes web_search/web_extract(tool-calling)를 써야 한다 — reasoning
-    # OFF 평문 슬러그 유지(tool-calling 안정성). (Qwen3.6-A3B 는 OpenRouter 에서 도구호출 지원.)
+    # OFF 평문 슬러그 유지(tool-calling 안정성). (Qwen3.6-A3B 는 로컬 LLM 에서 도구호출 지원.)
     "macro_researcher": _FLASH,
     "trader": _FLASH,
     "risk_guard": _FLASH,
@@ -76,7 +88,7 @@ US_BUY_FAIL_STREAK_LIMIT = 2
 # Per-agent output token caps (replaces uniform 4096). Risk/Policy emit short
 # structured JSON; analysts need more room.
 AGENT_MAX_TOKENS = {
-    "chief_orchestrator": 12000,  # deepseek-v4-pro로 교체(2026-05-19) — 비-reasoning이라 자연 완료 시 즉시 반환,
+    "chief_orchestrator": 12000,  # Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf+thinking로 교체(2026-05-19) — 비-reasoning이라 자연 완료 시 즉시 반환,
                                   # 12000은 안전한 상한(2패스 결정 출력 충분히 수용, 잠식 없음).
     "macro_analyst":      8000,   # 4000으로는 상세 매크로 리포트가 중간에 끊김 (2026-05-19 관측).
                                   # 6000으로 상향하여 완결된 응답 보장.
@@ -87,7 +99,7 @@ AGENT_MAX_TOKENS = {
     "trader":             1500,   # 사장 피드백 (3차) — 자연어 보고용. 체결 결과 요약 + 매매 이유 정리
     "risk_guard":         2200,   # DART 공시 읽고 종목별 재심 + 사유
     # policy_filter 폐지(2026-05-18)
-    "post_manager":      12000,   # deepseek-v4-pro(2026-05-24 교체) — chief_orchestrator와 동일 모델·동일 토큰 한도
+    "post_manager":      12000,   # Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf+thinking(2026-05-24 교체) — chief_orchestrator와 동일 모델·동일 토큰 한도
     "ops_support":        8000,   # 코드 변경 JSON + 근거 설명 (사장 지시 2026-05-14 — 토큰 한도 상향)
     "fund_planner":       1200,   # 사장 지시 2026-05-28 — 4줄(목표가/손절가/계획 보유/사유) 정형 출력 + 한 단락 보강
     "bond_manager":       5000,   # 채권운용실장. 2026-06-10 pro 전환 후 2000→5000: pro=reasoning은 max_tokens에 CoT 포함이라 2000이면 본문이 잘림(391자 관측). CoT+결정문 여유 확보.
@@ -761,3 +773,16 @@ del _k
 # ─── Server ──────────────────────────────────────────────────────────────────
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
 APP_PORT = int(os.getenv("APP_PORT", "8500"))
+
+# ─── Timefolio 대회 전용 사이클 (timefolio_swarm.py — 사장 지시 2026-07-09) ────
+# account_mode=timefolio 계정만 쓰는 파라미터. KIS 파이프라인과 무관.
+TIMEFOLIO_UNIVERSE_CSV = os.getenv(
+    "TIMEFOLIO_UNIVERSE_CSV", "/home/arcosium/projects/Lag_Trading/data/universe.csv")
+TIMEFOLIO_BARS_DB = os.getenv(
+    "TIMEFOLIO_BARS_DB", "/home/arcosium/projects/Lag_Trading/data/bars.db")   # 읽기 전용(모멘텀 스크린)
+TIMEFOLIO_MOVERS_TOP = int(os.getenv("TIMEFOLIO_MOVERS_TOP", "12"))            # 분봉 모멘텀 상위 N
+TIMEFOLIO_MAX_CANDIDATES = int(os.getenv("TIMEFOLIO_MAX_CANDIDATES", "16"))    # 적격 스크리닝 입력 상한
+TIMEFOLIO_FINALISTS = int(os.getenv("TIMEFOLIO_FINALISTS", "8"))               # 퀀트·LLM에 올릴 후보 상한
+TIMEFOLIO_MAX_BUYS_PER_CYCLE = int(os.getenv("TIMEFOLIO_MAX_BUYS_PER_CYCLE", "3"))
+TIMEFOLIO_SMALLCAP_BUDGET_PCT = float(os.getenv("TIMEFOLIO_SMALLCAP_BUDGET_PCT", "27"))  # 룰 30% - 버퍼
+TIMEFOLIO_CASH_FLOOR_PCT = float(os.getenv("TIMEFOLIO_CASH_FLOOR_PCT", "2"))   # 최소 현금 유보(주문 거부 방지)

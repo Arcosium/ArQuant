@@ -160,4 +160,4 @@ BOND_ETF_POOL_US = [
 - **주식 매도 트랙 격리(C2)**: `ENABLE_BOND_ETF` ON이면 채권 ETF를 사후관리실장 입력·매도결정·
   `_build_orders` 자동 익절손절 대상에서 제외한다(`split_bond_holdings`). `cyc.holdings` 원본은
   채권 스테이지·이력용으로 보존. OFF면 기존 동작 100% 불변.
-- **모델 키**: 채권관리실장 `bond_manager` → `deepseek-v4-flash`(admin 오버라이드 가능).
+- **모델 키**: 채권관리실장 `bond_manager` → `Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf`(admin 오버라이드 가능).

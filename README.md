@@ -1,6 +1,8 @@
-# 🏛️ ArQuant — AI 멀티에셋 퀀트 트레이딩 시스템
+# 🏛️ QuantInSight — 근거를 읽고 판단하는 AI 멀티에셋 퀀트 트레이딩 시스템
 
-> **https://arquant.ai-ve.uk** — 자체 로그인(아이디/비밀번호), 멀티테넌트
+> 구 프로젝트명 **ArQuant** — 2026-07-20 QuantInSight 로 개명 (공개 주소·레포지토리 동반 이전)
+
+> **https://quantinsight.ai-ve.uk** — 자체 로그인(아이디/비밀번호), 멀티테넌트 · 통합 계정(KIS 실전/모의/타임폴리오 토글)
 
 **LLM 멀티에이전트 "스웜"이 한국·미국 주식과 채권·원자재 ETF를 자동 매매하는 시스템.**
 10명의 AI 에이전트(로컬 LLM 구동)가 매시 정각 시장 감시 사이클을 돌며 뉴스·매크로·퀀트·리스크를
@@ -18,7 +20,7 @@
 ## 📁 프로젝트 구조
 
 ```
-ArQuant/
+QuantInSight/
 ├── main_swarm.py            # 핵심 오케스트레이터 — 세션별 무한 감시 루프 + 사이클 실행
 ├── config.py                # 전략 기본값(STRATEGY_DEFAULTS 53키) · 모델 배정 · 세션 스케줄
 ├── runtime.py               # 라이브 파라미터 오버라이드 — 재시작 없이 반영 (전략 탭)
@@ -150,7 +152,7 @@ ADMIN 계정이 1회 생산하고 비관리자 계정은 공유받는다(produce
 ## 📒 실거래 원장 — KIS 집계 비의존 자산평가 (`infra/trade_ledger.py`)
 
 KIS 통합총자산 TR 3종은 서로 불일치하고(자기모순), USD 결제 과도기(T+2)엔 매도대금이
-어느 예수금 필드에도 안 잡혀 자산곡선·수익률이 환각을 일으켰다. ArQuant는 KIS를
+어느 예수금 필드에도 안 잡혀 자산곡선·수익률이 환각을 일으켰다. QuantInSight는 KIS를
 **체결 사실·종목 평단·시세**에만 신뢰하고 평가는 자체 원장으로 한다:
 
 1. **시드(1회)** — KIS 보유(qty/평단) + KRW 예수금(D+2) + USD 외화예수금 +
@@ -284,7 +286,7 @@ LLM은 **로컬 OpenAI 호환 서버**(llama.cpp 등)에서 GGUF 모델을 구�
 - 서버 주소·모델은 env로 지정: `LOCAL_LLM_BASE_URL`(기본 `http://127.0.0.1:8080/v1`) ·
   `LOCAL_LLM_MODEL`(기본 `Qwen3.6-35B-A3B-...-Q8_0.gguf`). thinking ON/OFF는 `+thinking` 가상
   접미사로 표현하고 전송 직전 `chat_template_kwargs.enable_thinking` / `reasoning.enabled` 로
-  변환한다(`infra/deepseek_client.py` — 파일명은 유지, 내용은 로컬 클라이언트).
+  변환한다(`infra/local_llm_client.py` — 파일명은 유지, 내용은 로컬 클라이언트).
 - 비용 추적 인프라(토큰 롤업 `data/api_cost_rollup.json` · 대시보드 💵 배지)는 유지되나 로컬
   모델 단가가 0이라 표시는 항상 $0.00 이다. ADMIN 탭에서 역할별 모델·추론 토글 오버라이드 가능(재시작 반영).
 - DART 키는 서버 소유 단일 env(전 계정 공통, 사용자 입력 불필요).
@@ -307,7 +309,7 @@ LLM은 **로컬 OpenAI 호환 서버**(llama.cpp 등)에서 GGUF 모델을 구�
 
 ## 📌 면책
 
-ArQuant는 실제 자금으로 실거래를 수행한다. 손실 가능성이 있으며 모든 투자 책임은
+QuantInSight는 실제 자금으로 실거래를 수행한다. 손실 가능성이 있으며 모든 투자 책임은
 사용자에게 있다. AI 분석은 외부 모델·데이터에 의존하므로 오류·지연·중단이 발생할 수 있다.
 
 *최종 업데이트: 2026-06-23 (branch `local-llm-no-api-keys` — 로컬 LLM 전환)*

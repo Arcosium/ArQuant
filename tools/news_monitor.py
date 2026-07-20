@@ -269,8 +269,26 @@ class NaverFinanceMonitor:
             if len(self._article_history) > _MAX_PERSIST_ARTICLES:
                 self._article_history = self._article_history[-_MAX_PERSIST_ARTICLES:]
             self._save_persisted()  # 사장 피드백 2026-05-16: 재시작 후에도 목록 유지
+            self._mirror_to_archive(new_articles)
 
         return new_articles
+
+    def _mirror_to_archive(self, articles: List[Dict]) -> None:
+        """공용 뉴스 아카이브(arcnews)에 미러링 — 여기 300건 롤링에서 밀려나도 원본은 남는다.
+
+        정본은 여전히 news_history.json 이다. arcnews.mirror 는 예외를 삼키므로 아카이브가
+        잠기거나 없어도 매매 사이클은 그대로 돈다."""
+        try:
+            import arcnews
+        except ImportError:
+            return          # arcastack.pth 미등록 환경(테스트 등) — 조용히 건너뛴다
+        n = arcnews.mirror(
+            [{"title": a.get("title"), "url": a.get("link"), "summary": a.get("summary", ""),
+              "source": a.get("source") or "naver_finance", "source_label": "네이버 금융",
+              "published_at": a.get("date", ""), "collected_at": a.get("crawled_at")}
+             for a in articles], app="arquant")
+        if n:
+            logger.info(f"🗄 공용 뉴스 아카이브에 {n}건 추가")
 
     def get_recent_articles(self, count: int = 20) -> List[Dict]:
         """Get the most recent N articles from history."""

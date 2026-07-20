@@ -388,7 +388,7 @@ def test_commodity_persona_name_and_keyword():
 
 - [ ] **Step 2: 실패 확인.**
 
-- [ ] **Step 3: 구현** — `config.MODEL_ASSIGNMENTS["commodity_manager"]="deepseek-v4-flash"`,
+- [ ] **Step 3: 구현** — `config.MODEL_ASSIGNMENTS["commodity_manager"]="Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf"`,
   `AGENT_MAX_TOKENS["commodity_manager"]=2000`. `create_commodity_manager` = 채권 매니저 복제,
   성격="실물자산 매크로 전략가"(인플레·달러·지정학·수급 판단, 주식 퀀트 무관), 결정표 키워드
   `원자재결정: GLD=매수, 132030=보유`, 풀 안내.

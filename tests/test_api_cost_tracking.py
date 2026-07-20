@@ -25,7 +25,7 @@ def cost(tmp_path, monkeypatch):
 
 def test_record_updates_total_and_buckets(cost):
     ba = cost
-    ba._record_api_call("deepseek-v4-flash", "tester", 1_000_000, 1_000_000)
+    ba._record_api_call("Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf", "tester", 1_000_000, 1_000_000)
     # flash 단가 (0.14 in, 0.28 out) → 0.42 USD
     s = ba.cost_summary()
     assert s["total"]["usd"] == pytest.approx(0.42, abs=1e-6)
@@ -37,7 +37,7 @@ def test_record_updates_total_and_buckets(cost):
 
 def test_rollup_persists_across_reload(cost, tmp_path, monkeypatch):
     ba = cost
-    ba._record_api_call("deepseek-v4-pro", "tester", 1_000_000, 0)
+    ba._record_api_call("Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf+thinking", "tester", 1_000_000, 0)
     # 인메모리 캐시를 비우고 파일에서 다시 읽어도 누적/일/월은 유지돼야 한다
     if hasattr(ba, "_reset_cost_rollup"):
         ba._reset_cost_rollup()

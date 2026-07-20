@@ -1,5 +1,5 @@
 """Local LLM migration contract: no provider key and preserved thinking split."""
-from infra.deepseek_client import build_request
+from infra.local_llm_client import build_request
 
 
 def test_local_request_has_no_authorization_and_uses_configured_base(monkeypatch):

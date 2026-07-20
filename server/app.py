@@ -2,7 +2,7 @@
 import asyncio, logging, os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 import aiohttp
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -20,14 +20,15 @@ logger = logging.getLogger("APP")
 DEFAULT_KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 MOCK_KIS_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 ALLOWED_KIS_BASE_URLS = frozenset({DEFAULT_KIS_BASE_URL, MOCK_KIS_BASE_URL})
-app = FastAPI(title="ArQuant v1.0", version="1.0.0")
+app = FastAPI(title="QuantInSight", version="2.0.0")
 # 계정 프로필 디렉토리 루트. 모듈 상수로 둬서 테스트가 격리(monkeypatch)할 수 있게 한다.
 # (과거 엔드포인트가 실경로를 직접 계산해 테스트가 실데이터 profiles/<uid> 를 삭제하던 버그 방지)
 _PROFILES_DIR = Path(__file__).resolve().parent.parent / "data" / "profiles"
 # 사장 피드백 2026-05-20: 배포 전 보안 점검 — wildcard + credentials 동시 허용은 안티패턴.
 # 프로덕션 도메인 + 로컬 개발(에뮬레이터/localhost)만 허용. 추가 origin은 ARQUANT_EXTRA_ORIGINS(콤마 구분)로 주입.
 _ALLOWED_ORIGINS = [
-    "https://arquant.ai-ve.uk",
+    "https://quantinsight.ai-ve.uk",  # 주 도메인 (ArQuant→QuantInSight 개명, 2026-07-20)
+    "https://arquant.ai-ve.uk",       # 구 도메인 — 기배포 모바일 APK 호환용 별칭
     "http://localhost:8500", "http://127.0.0.1:8500",
     "http://10.0.2.2:8500",  # Android emulator host loopback
 ]
@@ -274,10 +275,25 @@ class CeoReq(BaseModel):
     message: str
 class CostModeReq(BaseModel):
     mode: str                       # h | d | m | total — 우상단 API 비용 표시 합산 모드(프로필별)
+class FundamentalResearchReq(BaseModel):
+    code: str
+    name: str = ""
+    source: str = "manual_ai_berkshire"
+    memo: str = ""
+    verdict: str = ""
+    business_quality_score: Optional[float] = None
+    valuation_margin_score: Optional[float] = None
+    moat_score: Optional[float] = None
+    management_score: Optional[float] = None
+    thesis_invalidators: list = []
+    financial_checks: list = []
 class RegisterReq(BaseModel):
     username: str                   # 사용자가 정하는 아이디 (중복 불가)
     password: str                   # 10자 이상 + 특수문자 1개 이상
     account_mode: str = "trading"
+    timefolio_contest_id: str = ""
+    timefolio_password: str = ""
+    timefolio_initial_cash: Optional[float] = None
     kis_app_key: str = ""
     kis_app_secret: str = ""
     kis_account_no: str = ""
@@ -285,6 +301,15 @@ class RegisterReq(BaseModel):
     dart_key: str = ""              # 선택 — 없으면 공시 분석 생략
     label: str = ""
     remember: bool = True
+    # ── 통합 가입 v2 (사장 지시 2026-07-20): KIS 실전/모의/타임폴리오 3종을 선택 입력.
+    # 전부 비우면 ADMIN KIS 모의 관전 모드, 입력한 것마다 토글 가능한 매매 프로필 생성.
+    signup_v2: bool = False
+    kis_real_app_key: str = ""
+    kis_real_app_secret: str = ""
+    kis_real_account_no: str = ""
+    kis_paper_app_key: str = ""
+    kis_paper_app_secret: str = ""
+    kis_paper_account_no: str = ""
 class LoginReq(BaseModel):
     username: str
     password: str
@@ -338,6 +363,89 @@ async def check_username(u: str = ""):
         return {"ok": False, "available": False, "reason": "아이디를 입력하세요."}
     return {"ok": True, "available": not auth_store.username_exists(u)}
 
+async def _register_v2(req: RegisterReq, request: Request, ip: str, username: str):
+    """통합 가입 (사장 지시 2026-07-20) — KIS 실전/모의/타임폴리오 3종 선택 입력.
+    입력된 그룹마다 토글 가능한 매매 프로필(서브 행)을 만들고, 하나도 없으면
+    ADMIN KIS 모의투자를 읽기 전용으로 보는 관전 계정으로 시작한다."""
+    real = (req.kis_real_app_key.strip(), req.kis_real_app_secret.strip(),
+            req.kis_real_account_no.strip())
+    paper = (req.kis_paper_app_key.strip(), req.kis_paper_app_secret.strip(),
+             req.kis_paper_account_no.strip())
+    tf_id = (req.timefolio_contest_id or "").strip()
+    want_real, want_paper, want_tf = any(real), any(paper), bool(tf_id or (req.timefolio_password or "").strip())
+    if want_real and not all(real):
+        raise HTTPException(400, "KIS 실전투자는 App Key/Secret, 계좌번호를 모두 입력해야 합니다.")
+    if want_paper and not all(paper):
+        raise HTTPException(400, "KIS 모의투자는 App Key/Secret, 계좌번호를 모두 입력해야 합니다.")
+    if want_tf:
+        if not tf_id:
+            raise HTTPException(400, "타임폴리오 대회 아이디를 입력하세요.")
+        tf_perr = auth_store.password_policy_error(req.timefolio_password or "")
+        if tf_perr:
+            raise HTTPException(400, "타임폴리오 비밀번호: " + tf_perr)
+        if req.timefolio_initial_cash is not None and req.timefolio_initial_cash <= 0:
+            raise HTTPException(400, "초기 운용금액은 0보다 커야 합니다.")
+    if want_real:
+        ok, msg = await _validate_kis(real[0], real[1], DEFAULT_KIS_BASE_URL)
+        if not ok:
+            raise HTTPException(400, "KIS 실전투자: " + msg)
+    if want_paper:
+        ok, msg = await _validate_kis(paper[0], paper[1], MOCK_KIS_BASE_URL)
+        if not ok:
+            raise HTTPException(400, "KIS 모의투자: " + msg)
+    master_mode = auth_store.TRADING_MODE if (want_real or want_paper or want_tf) else auth_store.VIEWER_MODE
+    created: list[int] = []
+    master = auth_store.upsert_user(
+        username=username, password=req.password,
+        kis_app_key="", kis_app_secret="", llm_key="", kis_account_no="",
+        kis_base_url=DEFAULT_KIS_BASE_URL, account_mode=master_mode)
+    created.append(master)
+    try:
+        first_profile = 0
+        if want_real:
+            uid_r = auth_store.create_subprofile(
+                master, auth_store.PROFILE_KIS_REAL, kis_app_key=real[0],
+                kis_app_secret=real[1], kis_account_no=real[2],
+                kis_base_url=DEFAULT_KIS_BASE_URL)
+            created.append(uid_r)
+            first_profile = first_profile or uid_r
+        if want_paper:
+            uid_p = auth_store.create_subprofile(
+                master, auth_store.PROFILE_KIS_PAPER, kis_app_key=paper[0],
+                kis_app_secret=paper[1], kis_account_no=paper[2],
+                kis_base_url=MOCK_KIS_BASE_URL)
+            created.append(uid_p)
+            first_profile = first_profile or uid_p
+        if want_tf:
+            uid_t = auth_store.create_subprofile(master, auth_store.PROFILE_TIMEFOLIO)
+            created.append(uid_t)
+            from Auto_folio.autofolio import contest_store
+            contest_store.register(
+                uid_t, tf_id, req.timefolio_password,
+                initial_cash=(req.timefolio_initial_cash
+                              if req.timefolio_initial_cash and req.timefolio_initial_cash > 0
+                              else contest_store.DEFAULT_INITIAL_CASH))
+            first_profile = first_profile or uid_t
+        if first_profile:
+            auth_store.set_active_profile(master, first_profile)
+    except HTTPException:
+        for u in reversed(created):
+            auth_store.delete_user(u)
+        raise
+    except ValueError as e:
+        for u in reversed(created):
+            auth_store.delete_user(u)
+        raise HTTPException(400, str(e))
+    except Exception:
+        for u in reversed(created):
+            auth_store.delete_user(u)
+        raise
+    auth_store.audit("register", username=username, ip=ip, outcome="ok",
+                     detail=f"v2 profiles={'r' if want_real else ''}{'p' if want_paper else ''}{'t' if want_tf else ''}")
+    auth_store.touch_login(master)
+    return _issue_session(master, req.remember)
+
+
 @app.post("/api/register")
 async def register(req: RegisterReq, request: Request):
     """최초 등록 — 아이디·비밀번호와 KIS 거래 자격증명을 검증 후 저장·활성화."""
@@ -346,13 +454,25 @@ async def register(req: RegisterReq, request: Request):
     username = (req.username or "").strip()
     if not username or len(username) < 3:
         raise HTTPException(400, "아이디는 3자 이상이어야 합니다.")
+    if auth_store.PROFILE_USERNAME_SEP in username:
+        raise HTTPException(400, "아이디에 '::' 는 사용할 수 없습니다.")
     perr = auth_store.password_policy_error(req.password or "")
     if perr:
         raise HTTPException(400, perr)
     if auth_store.username_exists(username):
         raise HTTPException(409, f"이미 사용 중인 아이디입니다: {username}")
-    mode = auth_store.VIEWER_MODE if req.account_mode == auth_store.VIEWER_MODE else auth_store.TRADING_MODE
+    if req.signup_v2:
+        return await _register_v2(req, request, ip, username)
+    mode = auth_store.normalize_account_mode(req.account_mode)
     kis_base_url = (req.kis_base_url or DEFAULT_KIS_BASE_URL).strip().rstrip("/")
+    if mode == auth_store.TIMEFOLIO_MODE:
+        if not (req.timefolio_contest_id or "").strip():
+            raise HTTPException(400, "타임폴리오 모의투자 아이디를 입력하세요.")
+        tf_perr = auth_store.password_policy_error(req.timefolio_password or "")
+        if tf_perr:
+            raise HTTPException(400, "타임폴리오 비밀번호: " + tf_perr)
+        if req.timefolio_initial_cash is not None and req.timefolio_initial_cash <= 0:
+            raise HTTPException(400, "초기 운용금액은 0보다 커야 합니다.")
     if mode == auth_store.TRADING_MODE:
         if not all((req.kis_app_key.strip(), req.kis_app_secret.strip(), req.kis_account_no.strip())):
             raise HTTPException(400, "거래 계정은 KIS 정보를 모두 입력해야 합니다.")
@@ -361,9 +481,24 @@ async def register(req: RegisterReq, request: Request):
             raise HTTPException(400, msg)
     uid = auth_store.upsert_user(
         username=username, password=req.password,
-        kis_app_key=req.kis_app_key.strip(), kis_app_secret=req.kis_app_secret.strip(),
-        deepseek_api_key="", kis_account_no=req.kis_account_no.strip(),
+        kis_app_key=(req.kis_app_key.strip() if mode == auth_store.TRADING_MODE else ""),
+        kis_app_secret=(req.kis_app_secret.strip() if mode == auth_store.TRADING_MODE else ""),
+        llm_key="",
+        kis_account_no=(req.kis_account_no.strip() if mode == auth_store.TRADING_MODE else ""),
         kis_base_url=kis_base_url, account_mode=mode)
+    if mode == auth_store.TIMEFOLIO_MODE:
+        from Auto_folio.autofolio import contest_store
+        try:
+            contest_store.register(
+                uid, req.timefolio_contest_id, req.timefolio_password,
+                initial_cash=(req.timefolio_initial_cash if req.timefolio_initial_cash and req.timefolio_initial_cash > 0 else contest_store.DEFAULT_INITIAL_CASH),
+            )
+        except ValueError as e:
+            auth_store.delete_user(uid)
+            raise HTTPException(400, str(e))
+        except Exception:
+            auth_store.delete_user(uid)
+            raise
     auth_store.audit("register", username=username, ip=ip, outcome="ok", detail="")
     # Phase 2: 전역 활성화 폐지 — 세션만 발급한다. 유저 컨텍스트(브로커/스왐)는
     # 첫 인증 요청 시 REGISTRY.get_or_create(uid) 로 lazy 생성된다.
@@ -428,14 +563,46 @@ async def logout(request: Request):
 async def me(request: Request):
     uid = request.state.user_id
     c = auth_store.get_user_credentials(uid) or {}
+    # 통합 계정(사장 지시 2026-07-20): 자격증명 표시는 활성(토글) 프로필 기준,
+    # 정체성(username/is_admin)은 로그인 행 기준.
+    profiles = auth_store.list_profiles(uid)
+    eff = auth_store.resolve_profile_uid(uid)
+    ec = auth_store.get_user_credentials(eff) or c
+    active_kind = next((p["kind"] for p in profiles if p.get("is_active")), None)
     return {"user_id": uid, "username": c.get("username"), "label": c.get("label"),
-            "kis_app_key_masked": auth_store._mask(c.get("kis_app_key", "")),
-            "kis_account_no_masked": auth_store._mask(c.get("kis_account_no", ""), 4),
-            "kis_base_url": c.get("kis_base_url", ""),  # 프로필 '정보 변경'의 실전/모의 선택자 기본값용 (비밀 아님)
+            "kis_app_key_masked": auth_store._mask(ec.get("kis_app_key", "")),
+            "kis_account_no_masked": auth_store._mask(ec.get("kis_account_no", ""), 4),
+            "kis_base_url": ec.get("kis_base_url", ""),  # 프로필 '정보 변경'의 실전/모의 선택자 기본값용 (비밀 아님)
             "has_dart": bool(c.get("dart_key")),
             "account_mode": c.get("account_mode", auth_store.TRADING_MODE),
             "is_viewer": c.get("account_mode") == auth_store.VIEWER_MODE,
+            "is_timefolio": ec.get("account_mode") == auth_store.TIMEFOLIO_MODE,
+            "profiles": profiles, "active_profile_uid": eff,
+            "active_profile_kind": active_kind,
             "is_admin": bool(c.get("is_admin"))}  # 사장 피드백 2026-05-18: 코드변경 전체반영 권한 표시
+
+
+@app.get("/api/profiles")
+async def profiles_list(request: Request):
+    """통합 계정의 매매 프로필 목록 + 활성 프로필 (헤더 토글용)."""
+    uid = _uid_or_403(request)
+    return {"profiles": auth_store.list_profiles(uid),
+            "active_uid": auth_store.resolve_profile_uid(uid)}
+
+
+class ProfileActivateReq(BaseModel):
+    uid: int
+
+
+@app.post("/api/profiles/activate")
+async def profiles_activate(req: ProfileActivateReq, request: Request):
+    """토글 전환 — 본인 소유 프로필로만 전환 가능. 각 프로필 스웜은 독립이므로
+    전환은 보기/제어 대상만 바꾸며 다른 프로필의 매매 루프에 영향을 주지 않는다."""
+    uid = _uid_or_403(request)
+    if not auth_store.set_active_profile(uid, req.uid):
+        raise HTTPException(400, "전환할 수 없는 프로필입니다.")
+    return {"ok": True, "active_uid": auth_store.resolve_profile_uid(uid),
+            "profiles": auth_store.list_profiles(uid)}
 
 class PwChangeReq(BaseModel):
     current: str
@@ -446,6 +613,41 @@ class CredsReq(BaseModel):
     kis_app_secret: Optional[str] = None
     kis_account_no: Optional[str] = None
     kis_base_url: Optional[str] = None
+
+class AutoFolioRegisterReq(BaseModel):
+    # 사장 지시 2026-07-03: 대회 아이디·비밀번호는 선택 — 비우면 자격증명 없는 순수 페이퍼 계정.
+    contest_id: str = ""
+    password: Optional[str] = None
+    initial_cash: Optional[float] = None
+
+class AutoFolioAutoCycleReq(BaseModel):
+    enabled: bool
+
+class AutoFolioSecurityReq(BaseModel):
+    ticker: str
+    name: Optional[str] = None
+    market: Optional[str] = None
+    is_common_stock: Optional[bool] = None
+    listed_business_days: Optional[int] = None
+    avg_5d_trading_value_krw: Optional[float] = None
+    market_cap_krw: Optional[float] = None
+    sector: Optional[str] = None
+    market_sector_weight_pct: Optional[float] = None
+    flags: Optional[Any] = None
+    last_price: Optional[float] = None
+
+class AutoFolioOrderReq(BaseModel):
+    ticker: str
+    side: str
+    qty: int
+    price: Optional[float] = None
+    password: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = None
+
+class AutoFolioCycleReq(BaseModel):
+    targets: Optional[list[str]] = None
+    max_buys: int = 1
+    force_sell: bool = False
 
 class DirectiveReq(BaseModel):
     text: str
@@ -470,7 +672,12 @@ async def profile_password(req: PwChangeReq, request: Request):
 
 @app.post("/api/profile/credentials")
 async def profile_credentials(req: CredsReq, request: Request):
-    uid = _uid_or_403(request)
+    # 통합 계정: '정보 변경'은 활성(토글) 프로필의 KIS 자격증명을 갱신한다.
+    # 관전 계정은 프로필이 없어 자기 행이 그대로 대상(업그레이드 경로 유지).
+    login_uid = _uid_or_403(request)
+    uid = auth_store.resolve_profile_uid(login_uid)
+    if auth_store.is_timefolio(uid):
+        raise HTTPException(400, "타임폴리오 프로필에는 KIS 정보가 없습니다. 토글에서 KIS 프로필로 전환하세요.")
     ip = _client_ip(request)
     creds_cr = auth_store.get_user_credentials(uid)
     uname_cr = (creds_cr or {}).get("username", "")
@@ -517,6 +724,231 @@ async def profile_credentials(req: CredsReq, request: Request):
     return {"ok": True, "upgraded": upgrading_viewer,
             "account_mode": auth_store.TRADING_MODE}
 
+
+def _num(v, default=None):
+    if v is None or v == "":
+        return default
+    try:
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return default
+
+
+async def _autofolio_enrich_security(uid: int, ticker: str, price: Optional[float], meta: Optional[Dict[str, Any]]):
+    from Auto_folio.autofolio import contest_store
+    from Auto_folio.autofolio.naver_data import fetch_security_meta
+    ticker = str(ticker or "").strip().zfill(6)
+    merged: Dict[str, Any] = {}
+    stored = contest_store.get_security_meta(ticker) or {}
+    merged.update(stored)
+    if meta:
+        merged.update({k: v for k, v in dict(meta).items() if v is not None})
+    if price and price > 0:
+        merged["last_price"] = float(price)
+    try:
+        merged = fetch_security_meta(ticker, stored=merged)
+    except Exception as e:
+        logger.info("Auto_folio Naver enrichment skipped uid=%s ticker=%s: %s", uid, ticker, e)
+    if price and price > 0:
+        merged["last_price"] = float(price)
+    if merged:
+        merged["ticker"] = ticker
+        contest_store.upsert_security_meta(ticker, merged)
+    return float(price or merged.get("last_price") or 0.0), merged
+
+
+
+def _timefolio_public_account(uid: int) -> dict[str, Any]:
+    from Auto_folio.autofolio import contest_store
+    account = contest_store.get_account(uid)
+    if not account:
+        raise HTTPException(400, "타임폴리오 모의투자 계정이 없습니다. 먼저 가입하세요.")
+    return account
+
+
+def _timefolio_status(uid: int) -> dict[str, Any]:
+    account = _timefolio_public_account(uid)
+    portfolio = account.get("portfolio") or {}
+    trades = [t for t in (account.get("trades") or []) if t.get("accepted")]
+    return {
+        "current_state": "TIMEFOLIO",
+        "session": "TIMEFOLIO_MOCK",
+        "time_kst": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cycle_history_count": len(trades),
+        "trades_executed": len(trades),
+        "news_monitor": {"total_articles": 0},
+        "next_cycle_sec": None,
+        "strategy": {"name": "autofolio_naver", "label": "Auto_folio 네이버 사이클"},
+        "is_trading": True,
+        "is_running": False,
+        "is_viewer": False,
+        "is_timefolio": True,
+        "ops_feedback_enabled": False,
+        "api_cost": {"h": {"usd": 0.0, "calls": 0}, "d": {"usd": 0.0, "calls": 0},
+                     "m": {"usd": 0.0, "calls": 0}, "total": {"usd": 0.0, "calls": 0}, "mode": "h"},
+        "timefolio": {"contest_id": account.get("contest_id"), "total_eval": portfolio.get("total_eval"),
+                       "pnl_pct": portfolio.get("unrealized_pnl_pct"),
+                       "weekly_turnover_pct": portfolio.get("weekly_turnover_pct"),
+                       "weekly_turnover_ok": portfolio.get("weekly_turnover_ok")},
+    }
+
+
+def _timefolio_site_executor(uid: int):
+    def _exec(order: dict[str, Any]) -> dict[str, Any]:
+        from Auto_folio.autofolio.timefolio_exec import submit_order
+        return submit_order(uid, order, headless=True)
+    return _exec
+
+
+async def _timefolio_command(uid: int, message: str) -> dict[str, Any]:
+    import re
+    from Auto_folio.autofolio import contest_store
+    from Auto_folio.autofolio.naver_cycle import run_cycle, refresh_holdings
+    from Auto_folio.autofolio.timefolio_exec import sync_site_account
+    msg = (message or "").strip()
+    code_match = re.search(r"(?<!\d)(\d{6})(?!\d)", msg)
+    code = code_match.group(1) if code_match else None
+    lowered = msg.lower()
+    try:
+        if any(x in msg for x in ("가격갱신", "갱신", "refresh")):
+            res = sync_site_account(uid, headless=True)
+            text = "타임폴리오 사이트 보유/수익률 동기화 완료"
+        elif any(x in msg for x in ("전량매도", "전체매도", "모두 매도", "청산")):
+            res = run_cycle(uid, force_sell=True, max_buys=0, executor=_timefolio_site_executor(uid))
+            text = f"타임폴리오 전량매도 사이클 완료: 매도 {res.get('sold', 0)}건"
+        elif code and "매도" in msg:
+            account = _timefolio_public_account(uid)
+            pos = (account.get("positions") or {}).get(code)
+            if not pos:
+                text = f"{code} 보유수량이 없어 매도하지 않았습니다."
+                res = {"ok": False, "message": text}
+            else:
+                price, meta = await _autofolio_enrich_security(uid, code, None, None)
+                check = contest_store.check_order(uid, "sell", code, int(pos.get("qty") or 0), price, meta=meta)
+                if not check.get("ok"):
+                    res = {"ok": False, "rule_check": check}
+                else:
+                    site = _timefolio_site_executor(uid)({"ticker": code, "side": "sell", "qty": int(pos.get("qty") or 0), "price": price, "limit_price": price, "meta": meta})
+                    if site.get("accepted") and site.get("filled"):
+                        res = sync_site_account(uid, headless=True)
+                        res["site_execution"] = site
+                    else:
+                        res = {"ok": False, "accepted": False, "filled": False, "site_execution": site}
+                text = f"타임폴리오 {code} 매도 {'완료' if res.get('ok') else '거부'}"
+        elif code:
+            res = run_cycle(uid, targets=[code], max_buys=1, force_sell=False, executor=_timefolio_site_executor(uid))
+            text = f"타임폴리오 {code} 네이버 사이클 완료: 매수 {res.get('bought', 0)}건, 매도 {res.get('sold', 0)}건"
+        else:
+            res = sync_site_account(uid, headless=True)
+            text = "타임폴리오 명령을 접수했습니다. 종목코드 6자리, 매수/매도/전량매도/가격갱신 형태로 지시하면 주문 사이클에 반영됩니다."
+        await ws_mgr.send_to_uid(uid, {"type": "status", "state": "TIMEFOLIO", "message": text})
+        return {"ok": True, "response": text, "result": res}
+    except ValueError as e:
+        text = str(e)
+        await ws_mgr.send_to_uid(uid, {"type": "status", "state": "TIMEFOLIO", "message": text})
+        raise HTTPException(400, text)
+
+@app.post("/api/autofolio/register")
+async def autofolio_register(req: AutoFolioRegisterReq, request: Request):
+    uid = _autofolio_uid(request)
+    from Auto_folio.autofolio import contest_store
+    try:
+        account = contest_store.register(
+            uid, req.contest_id, req.password,
+            initial_cash=(req.initial_cash if req.initial_cash and req.initial_cash > 0 else contest_store.DEFAULT_INITIAL_CASH),
+            reset=False,
+        )
+        return {"ok": True, "account": account}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/autofolio/account")
+async def autofolio_account(request: Request):
+    uid = _autofolio_uid(request)
+    from Auto_folio.autofolio import contest_store
+    account = contest_store.get_account(uid)
+    return {"ok": bool(account), "account": account}
+
+
+@app.get("/api/autofolio/securities")
+async def autofolio_securities(request: Request):
+    _uid_or_403(request)
+    from Auto_folio.autofolio import contest_store
+    return {"securities": contest_store.list_security_meta()}
+
+
+@app.post("/api/autofolio/securities")
+async def autofolio_security_save(req: AutoFolioSecurityReq, request: Request):
+    _uid_or_403(request)
+    from Auto_folio.autofolio import contest_store
+    payload = req.dict(exclude_none=True)
+    meta = contest_store.upsert_security_meta(req.ticker, payload)
+    return {"ok": True, "security": meta}
+
+
+@app.post("/api/autofolio/order")
+async def autofolio_order(req: AutoFolioOrderReq, request: Request):
+    uid = _autofolio_uid(request)
+    side = (req.side or "").strip().lower()
+    if side not in ("buy", "sell"):
+        raise HTTPException(400, "side는 buy 또는 sell이어야 합니다.")
+    from Auto_folio.autofolio import contest_store
+    try:
+        price, meta = await _autofolio_enrich_security(uid, req.ticker, req.price, req.meta)
+        if auth_store.is_timefolio(uid):
+            check = contest_store.check_order(uid, side, req.ticker, req.qty, price, meta=meta)
+            if not check.get("ok"):
+                return {"ok": False, "accepted": False, "filled": False, "rule_check": check}
+            site = _timefolio_site_executor(uid)({"ticker": str(req.ticker).zfill(6), "side": side, "qty": req.qty, "price": price, "limit_price": price, "meta": meta})
+            if not site.get("accepted"):
+                return {"ok": False, "accepted": False, "filled": False, "pending": False, "rule_check": check, "site_execution": site}
+            from Auto_folio.autofolio.timefolio_exec import sync_site_account
+            synced = sync_site_account(uid, headless=True)
+            return {"ok": bool(site.get("filled")), "accepted": True, "filled": bool(site.get("filled")),
+                    "pending": bool(site.get("pending") or not site.get("filled")), "rule_check": check,
+                    "site_execution": site, "account": synced.get("account")}
+        return contest_store.place_order(uid, side, req.ticker, req.qty, price, password=req.password, meta=meta)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/autofolio/cycle")
+async def autofolio_cycle(req: AutoFolioCycleReq, request: Request):
+    uid = _autofolio_uid(request)
+    from Auto_folio.autofolio.naver_cycle import run_cycle
+    try:
+        executor = _timefolio_site_executor(uid) if auth_store.is_timefolio(uid) else None
+        return run_cycle(uid, targets=req.targets, max_buys=req.max_buys, force_sell=req.force_sell, executor=executor)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/autofolio/refresh")
+async def autofolio_refresh(request: Request):
+    uid = _autofolio_uid(request)
+    try:
+        if auth_store.is_timefolio(uid):
+            from Auto_folio.autofolio.timefolio_exec import sync_site_account
+            return sync_site_account(uid, headless=True)
+        from Auto_folio.autofolio.naver_cycle import refresh_holdings
+        return refresh_holdings(uid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/autofolio/auto_cycle")
+async def autofolio_auto_cycle(req: AutoFolioAutoCycleReq, request: Request):
+    """사장 지시 2026-07-03: 원클릭 모의투자 — 서버가 장중 자동으로 네이버 사이클을 돌려주는 opt-in."""
+    uid = _autofolio_uid(request)
+    from Auto_folio.autofolio import contest_store
+    try:
+        account = contest_store.set_auto_cycle(uid, req.enabled)
+        return {"ok": True, "account": account}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/profile/directives")
 async def profile_directives_list(request: Request):
     uid = _require_trading(request)
@@ -537,6 +969,23 @@ async def profile_directives_del(did: str, request: Request):
     sd.remove_directive(uid, did)
     return {"ok": True, "directives": sd.load(uid)}
 
+# ── 사용자 전략 (사장 지시 2026-07-03) — 채팅에서 STRATEGY 로 인식돼 저장된 전략 관리 ──
+@app.get("/api/profile/user_strategy")
+async def profile_user_strategy_get(request: Request):
+    uid = _require_trading(request)
+    from infra import user_strategy
+    return {"strategy": user_strategy.get_strategy(uid)}
+
+@app.delete("/api/profile/user_strategy")
+async def profile_user_strategy_del(request: Request):
+    uid = _require_trading(request)
+    import runtime
+    from infra import user_strategy
+    removed = user_strategy.clear_strategy(uid)
+    if removed:  # 전략 해제 = 운용지원실장 자동 튜닝 복원
+        runtime.set_ops_feedback(True, uid=uid, by="user_strategy_clear")
+    return {"ok": True, "removed": removed}
+
 @app.post("/api/profile/delete_account")
 async def profile_delete_account(req: DeleteAccountReq, request: Request):
     uid = _uid_or_403(request)
@@ -553,6 +1002,10 @@ async def profile_delete_account(req: DeleteAccountReq, request: Request):
         raise HTTPException(400, "ADMIN 계정은 탈퇴할 수 없습니다(단독 ADMIN 보호).")
     # Audit BEFORE deletion (need creds["username"])
     auth_store.audit("delete_account", username=creds["username"], ip=ip, outcome="ok", detail="")
+    # 통합 계정: 소유한 서브 프로필(실전/모의/타임폴리오)부터 정리한 뒤 마스터 행 삭제.
+    for _sub in auth_store.owned_profile_uids(uid):
+        await _decommission_uid(_sub)
+        auth_store.delete_user(_sub)
     await _decommission_uid(uid)   # 루프 정지 → 컨텍스트 제거 → profiles/·data/ 정리 (고아 부활·잔존 거래 방지)
     auth_store.delete_user(uid)
     resp = JSONResponse(content={"ok": True})
@@ -584,6 +1037,13 @@ async def admin_member_delete(req: AdminDeleteReq, request: Request):
         auth_store.audit("admin_delete_member", username=(req.username or "").strip(),
                          ip=_client_ip(request), outcome="fail", detail="admin_protected")
         raise HTTPException(400, "ADMIN 계정은 삭제할 수 없습니다(단독 ADMIN 보호).")
+    if target.get("owner_id"):
+        # 통합 계정의 서브 프로필 행 — 마스터 삭제 시 함께 정리된다. 개별 삭제는
+        # 소유자 데이터 정합이 깨질 수 있어 거부(ADMIN 보호가 아닌 정합 보호).
+        raise HTTPException(400, "통합 계정의 프로필 행입니다 — 마스터 계정을 삭제하면 함께 정리됩니다.")
+    for _sub in auth_store.owned_profile_uids(target["id"]):
+        await _decommission_uid(_sub)
+        auth_store.delete_user(_sub)
     await _decommission_uid(target["id"])   # 루프 정지 → 컨텍스트 제거 → profiles/·data/ 정리
     auth_store.delete_user(target["id"])
     auth_store.audit("admin_delete_member", username=target["username"],
@@ -597,14 +1057,26 @@ async def accounts():
     return {"accounts": auth_store.list_accounts()}
 
 @app.get("/health")
-async def health(): return {"status":"ok","service":"ArQuant v1.0","timestamp":datetime.now().isoformat()}
+async def health(): return {"status":"ok","service":"QuantInSight","timestamp":datetime.now().isoformat()}
 
 @app.get("/api/status")
 async def status(request: Request):
-    # Phase 2 멀티테넌트: 요청 유저(request.state.user_id)의 스왐 상태를 반환한다.
+    # Phase 2 멀티테넌트: 요청 유저의 활성(토글) 프로필 스왐 상태를 반환한다.
     auth_uid = _uid_or_403(request)
-    viewer = auth_store.is_viewer(auth_uid)
     uid = _read_uid(request)
+    if auth_store.is_timefolio(uid):
+        ctx = REGISTRY.get_or_create(uid)
+        s = ctx.swarm.get_status()
+        s["is_running"] = bool(ctx.task and not ctx.task.done())
+        s["is_viewer"] = False
+        s["is_timefolio"] = True
+        try:
+            tf = _timefolio_status(uid).get("timefolio") or {}
+            s["timefolio"] = tf
+        except Exception:
+            pass
+        return s
+    viewer = auth_store.is_viewer(auth_uid)
     ctx = REGISTRY.get_or_create(uid)
     s = ctx.swarm.get_status()
     # Expose whether THIS user's background task is actively running so the frontend can sync buttons.
@@ -633,15 +1105,25 @@ async def status(request: Request):
 
 @app.post("/api/start")
 async def start(req: Req, request: Request):
+    uid0 = _uid_or_403(request)
+    eff = auth_store.resolve_profile_uid(uid0)
+    if not auth_store.is_viewer(uid0) and auth_store.is_timefolio(eff):
+        await _start_uid(eff, req.directive)
+        return {"message": "🟢 타임폴리오 프로필 swarm 감시 시작"}
     uid = _require_trading(request)
     await _start_uid(uid, req.directive)
-    return {"message":"🟢 Arquant 감시 시작"}
+    return {"message":"🟢 감시 시작"}
 
 @app.post("/api/stop")
 async def stop(request: Request):
     # 사장 지시 2026-05-22: 즉시 중지 — stop_event 만으로는 진행 중 사이클이 끝까지 돌므로,
     # 실행 중인 asyncio 태스크를 취소해 LLM 호출·분석을 그 자리에서 중단한다.
     # Phase 2: 요청 유저의 루프만 멈춘다(다른 유저 무영향).
+    uid0 = _uid_or_403(request)
+    eff = auth_store.resolve_profile_uid(uid0)
+    if not auth_store.is_viewer(uid0) and auth_store.is_timefolio(eff):
+        await _stop_uid(eff)
+        return {"message": "🔴 타임폴리오 swarm 즉시 중지됨"}
     uid = _require_trading(request)
     await _stop_uid(uid)
     return {"message": "🔴 즉시 중지됨"}
@@ -651,6 +1133,11 @@ async def ceo_command(req: CeoReq, request: Request):
     # 사장 지시 2026-05-21: 저장 여부는 체크박스 대신 ceo_directive 안에서 에이전트가
     # 지시 내용·결과로 자동 판단해 standing_directive 로 저장한다(자동 판단 경로).
     # Phase 2: 요청 유저의 스왐에 지시를 전달한다.
+    uid0 = _uid_or_403(request)
+    eff = auth_store.resolve_profile_uid(uid0)
+    if not auth_store.is_viewer(uid0) and auth_store.is_timefolio(eff):
+        resp = await REGISTRY.get_or_create(eff).swarm.ceo_directive(req.message)
+        return {"response": resp}
     uid = _require_trading(request)
     resp = await REGISTRY.get_or_create(uid).swarm.ceo_directive(req.message)
     return {"response": resp}
@@ -750,10 +1237,11 @@ async def agents(request: Request):
 async def ops_feedback_get(request: Request):
     # 사장 지시 2026-05-20: 운용지원 토글은 프로필별 — 요청 유저 본인 계정 상태를 반환.
     import runtime
-    uid = getattr(request.state, "user_id", None)
+    login_uid = getattr(request.state, "user_id", None)
+    uid = _read_uid(request)  # 통합 계정: 활성 프로필 기준 (set 경로와 대칭)
     _admin = False
     try:
-        _admin = auth_store.is_admin(uid)
+        _admin = auth_store.is_admin(login_uid)
     except Exception:
         _admin = False
     st = runtime.ops_feedback_state(uid)
@@ -780,7 +1268,7 @@ async def ops_feedback_set(request: Request, req: dict):
 @app.get("/api/notif_settings")
 async def notif_settings_get(request: Request):
     import runtime
-    uid = getattr(request.state, "user_id", None)
+    uid = _read_uid(request)  # 통합 계정: 활성 프로필 기준 (set 경로와 대칭)
     return {"settings": runtime.notif_settings(uid)}
 
 @app.post("/api/notif_settings")
@@ -805,25 +1293,52 @@ def _uid_or_403(request: Request) -> int:
     return uid
 
 
+def _eff_uid(request: Request) -> int:
+    """세션(로그인) uid → 현재 토글된 매매 프로필 uid (통합 계정, 사장 지시 2026-07-20).
+    프로필이 없으면 자기 자신."""
+    return auth_store.resolve_profile_uid(_uid_or_403(request))
+
+
 def _read_uid(request: Request) -> int:
-    """조회 대상 uid. 관전 계정은 단독 ADMIN 계정, 거래 계정은 자기 자신."""
+    """조회 대상 uid. 관전 계정은 ADMIN 의 KIS 모의 프로필, 그 외엔 활성(토글) 프로필."""
     uid = _uid_or_403(request)
     if auth_store.is_viewer(uid):
         target = auth_store.admin_view_uid()
         if target is None:
             raise HTTPException(503, "관전할 ADMIN 계정을 찾을 수 없습니다.")
         return target
-    return uid
+    return auth_store.resolve_profile_uid(uid)
 
 
 def _require_trading(request: Request) -> int:
+    """KIS 매매 프로필 uid 를 반환. 관전/타임폴리오 활성 상태는 403."""
     uid = _uid_or_403(request)
-    # ADMIN(hh09080)은 관전 대상 계정이자 실제 운용 주체다. 계정 모드 마이그레이션이나
-    # 잘못된 프로필 값 때문에 실행/중지까지 잠기는 일이 없도록 관리자 권한을 우선한다.
     if auth_store.is_admin(uid):
+        # ADMIN(hh09080)은 관전 대상 계정이자 실제 운용 주체다. 계정 모드/토글 상태가
+        # 어긋나도 실행·중지까지 잠기는 일이 없도록 관리자 권한을 우선한다 — 활성
+        # 프로필이 KIS 가 아니면 KIS 프로필로 폴백.
+        eff = auth_store.resolve_profile_uid(uid)
+        if not auth_store.is_timefolio(eff):
+            return eff
+        for p in auth_store.list_profiles(uid):
+            if p["kind"] in (auth_store.PROFILE_KIS_REAL, auth_store.PROFILE_KIS_PAPER):
+                return int(p["uid"])
         return uid
     if auth_store.is_viewer(uid):
         raise HTTPException(403, "관전 모드에서는 조회만 가능합니다. 정보 변경에서 거래 계정으로 업그레이드하세요.")
+    eff = auth_store.resolve_profile_uid(uid)
+    if auth_store.is_timefolio(eff):
+        raise HTTPException(403, "타임폴리오 프로필에서는 Auto_folio 주문/사이클만 사용할 수 있습니다. 토글에서 KIS 프로필로 전환하세요.")
+    return eff
+
+
+def _autofolio_uid(request: Request) -> int:
+    """Auto_folio(타임폴리오) 데이터가 귀속되는 uid — 통합 계정이면 타임폴리오 프로필 uid,
+    없으면 로그인 uid(순수 페이퍼 하위호환)."""
+    uid = _uid_or_403(request)
+    for p in auth_store.list_profiles(uid):
+        if p["kind"] == auth_store.PROFILE_TIMEFOLIO:
+            return int(p["uid"])
     return uid
 
 
@@ -1069,6 +1584,14 @@ async def balance(request: Request):
     from main_swarm import record_equity, is_market_session_now
     auth_uid = _uid_or_403(request)
     uid = _read_uid(request)
+    if auth_store.is_timefolio(uid):
+        from Auto_folio.autofolio import contest_store
+        try:
+            from Auto_folio.autofolio.timefolio_exec import sync_site_account
+            sync_site_account(uid, headless=True)
+        except Exception as e:
+            logger.info("Timefolio site balance sync skipped uid=%s: %s", uid, e)
+        return contest_store.balance_snapshot(_timefolio_public_account(uid))
     ctx = REGISTRY.get_or_create(uid)
     try:
         snap = await ctx.broker.portfolio_holdings()
@@ -1108,7 +1631,11 @@ async def equity(request: Request, limit: int = 500, view: str = "realtime"):
     Phase 2: 요청 유저의 equity_curve 를 읽는다."""
     from main_swarm import get_equity_series
     v = view if view in ("realtime", "daily", "monthly") else "realtime"
-    ep = REGISTRY.get_or_create(_read_uid(request)).swarm.equity_path
+    uid = _read_uid(request)
+    if auth_store.is_timefolio(uid):
+        from Auto_folio.autofolio import contest_store
+        return {"series": contest_store.equity_series(_timefolio_public_account(uid), view=v, limit=limit), "view": v}
+    ep = REGISTRY.get_or_create(uid).swarm.equity_path
     return {"series": get_equity_series(ep, limit, v), "view": v}
 
 async def _attach_current_fallback(base: dict, broker) -> dict:
@@ -1135,6 +1662,14 @@ async def performance(request: Request):
     사장 지시 2026-05-28: 곡선 비어도 현재 총평가는 broker 폴백으로 항상 표시."""
     from main_swarm import performance_kpis
     uid = _read_uid(request)
+    if auth_store.is_timefolio(uid):
+        from Auto_folio.autofolio import contest_store
+        try:
+            from Auto_folio.autofolio.timefolio_exec import sync_site_account
+            sync_site_account(uid, headless=True)
+        except Exception as e:
+            logger.info("Timefolio site performance sync skipped uid=%s: %s", uid, e)
+        return contest_store.performance_snapshot(_timefolio_public_account(uid))
     ctx = REGISTRY.get_or_create(uid)
     base = performance_kpis(ctx.swarm.equity_path, uid=uid)
     out = await _attach_current_fallback(base, ctx.broker)
@@ -1176,6 +1711,40 @@ def _scorecard_for_uid(uid: int):
 async def api_scorecard(request: Request):
     """에이전트 성과 귀인 카드 — 요청 유저 기준(인증 필요)."""
     return _scorecard_for_uid(_read_uid(request))
+
+
+@app.get("/api/fundamental_research")
+async def api_fundamental_research(request: Request, code: str = "", limit: int = 100):
+    """ai-berkshire식 장기 펀더멘털 리서치 스냅샷 조회(advisory)."""
+    uid = _read_uid(request)
+    from infra import fundamental_research_store
+    if code:
+        row = fundamental_research_store.latest(uid, code)
+        return {"item": row}
+    return {"items": fundamental_research_store.list_snapshots(uid=uid, limit=max(1, min(int(limit or 100), 500)))}
+
+
+@app.post("/api/fundamental_research")
+async def api_record_fundamental_research(req: FundamentalResearchReq, request: Request):
+    """수동 ai-berkshire/Codex 리서치 결과를 advisory 스냅샷으로 저장."""
+    uid = _read_uid(request)
+    from infra import fundamental_research_store
+    from tools.fundamental_rigor import assess_fundamental_research
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    base = assess_fundamental_research(req.code, req.name or req.code, dart_text=req.memo, financial_text=req.memo, source=req.source)
+    for k in ("verdict", "business_quality_score", "valuation_margin_score", "moat_score", "management_score"):
+        v = getattr(req, k, None)
+        if v not in (None, ""):
+            base[k] = v
+    if req.thesis_invalidators:
+        base["thesis_invalidators"] = req.thesis_invalidators
+    if req.financial_checks:
+        base["financial_checks"] = req.financial_checks
+    if req.memo:
+        base["memo"] = req.memo[:2000]
+    base.update({"uid": uid, "ts": ts, "cycle_started_at": ts, "source": req.source or "manual_ai_berkshire"})
+    rid = fundamental_research_store.record_snapshot(base)
+    return {"ok": bool(rid), "id": rid, "item": base}
 
 
 @app.get("/api/benchmark")
@@ -1285,9 +1854,12 @@ async def strategy_set(req: dict, request: Request):
     return {"active": active}
 
 @app.get("/api/cycles")
-async def cycles(request: Request, limit: int = 50, offset: int = 0):
-    """Persisted analysis cycles (newest first). 사장 지시 2026-05-14 — 백테스트/장기 분석용."""
+async def cycles(request: Request, limit: int = 50, offset: int = 0, summary: int = 0):
+    """Persisted analysis cycles (newest first). 사장 지시 2026-05-14 — 백테스트/장기 분석용.
+    QuantInSight 이식(2026-07-18): summary=1 이면 사이클 탭 히스토리용 경량 목록(리포트 본문 제외)."""
     from infra import cycle_store
+    if summary:
+        return {"cycles": cycle_store.list_cycles_summary(limit, offset, uid=_read_uid(request))}
     return {"cycles": cycle_store.list_cycles(limit, offset, uid=_read_uid(request))}
 
 @app.get("/api/cycles/{cycle_id}")
@@ -1318,7 +1890,8 @@ async def ws_ep(ws: WebSocket):
     # 사장 지시 2026-05-21: 모바일 네이티브 클라이언트(?client=mobile)는 프로필 알림설정으로
     # 4종 푸시를 게이트한다. 웹(기본)은 전부 수신.
     client = (ws.query_params.get("client") or "web").strip().lower()
-    view_uid = auth_store.admin_view_uid() if auth_store.is_viewer(uid) else uid
+    view_uid = (auth_store.admin_view_uid() if auth_store.is_viewer(uid)
+                else auth_store.resolve_profile_uid(uid))
     if view_uid is None:
         await ws.close(code=1013)
         return
@@ -1336,6 +1909,15 @@ async def dash():
     # 대시보드 HTML은 항상 최신을 받도록 캐시 금지(파일은 작아 매 요청 디스크 읽기 부담 없음).
     p = SD / "index.html"
     content = p.read_text(encoding="utf-8") if p.exists() else "<h1>ArQuant v1.0</h1>"
+    return HTMLResponse(content=content, headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"})
+
+@app.get("/legacy", response_class=HTMLResponse)
+async def dash_legacy():
+    """구 대시보드 보존 경로 (QuantInSight 프레임 이관 2026-07-18) — 안전망.
+    새 UI(/)에 문제가 생겨도 여기서 기존 화면으로 모니터링을 계속할 수 있다."""
+    p = SD / "legacy.html"
+    content = p.read_text(encoding="utf-8") if p.exists() else "<h1>legacy 대시보드 없음</h1>"
     return HTMLResponse(content=content, headers={
         "Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"})
 
@@ -1378,6 +1960,39 @@ async def _auth_bootstrap():
             logging.getLogger("AUTH").warning("상시지시 시드 실패(계속): %s", _sde)
     except Exception as e:
         logging.getLogger("AUTH").warning("인증 부트스트랩 실패: %s", e)
+
+
+# ─── Auto_folio 자동 사이클 (사장 지시 2026-07-03: 원클릭 타임폴리오 모의투자) ─────
+# auto_cycle 을 켠 계정을 KR 정규장 동안 스웜과 같은 주기(PERIODIC_CYCLE_SEC=1시간)로
+# 네이버 사이클(TP/SL 매도 + 룰 통과 매수)을 돌려준다 — 사장 지시: ArQuant 계정 사이클은
+# 전부 1시간 단위, 1분 즉시반응 사이클은 ArcTrade 러너 전용.
+# timefolio 모드 계정은 스웜(TimefolioBroker)이 담당하므로 여기선 건너뛴다.
+@app.on_event("startup")
+async def _autofolio_auto_cycle_startup():
+    async def _loop():
+        await asyncio.sleep(15)  # 부팅 직후 인증 부트스트랩·스웜 재개와 겹치지 않게 지연
+        while True:
+            try:
+                from Auto_folio.autofolio import contest_store, sessions
+                from Auto_folio.autofolio.naver_cycle import run_cycle
+                if sessions.is_mock_kr_tradable(sessions.current_session()):
+                    for uid in contest_store.list_auto_cycle_uids():
+                        try:
+                            if auth_store.is_timefolio(uid):
+                                continue
+                            res = await asyncio.to_thread(run_cycle, uid)
+                            if res.get("bought") or res.get("sold"):
+                                await ws_mgr.send_to_uid(uid, {
+                                    "type": "status", "state": "TIMEFOLIO",
+                                    "message": (f"타임폴리오 자동 사이클: 매수 {res.get('bought', 0)}건 · "
+                                                f"매도 {res.get('sold', 0)}건")})
+                        except Exception as _ce:
+                            logger.info("autofolio 자동 사이클 실패 uid=%s: %s", uid, _ce)
+            except Exception as _e:
+                logger.warning("autofolio 자동 사이클 루프 오류(계속): %s", _e)
+            from config import PERIODIC_CYCLE_SEC
+            await asyncio.sleep(PERIODIC_CYCLE_SEC)
+    asyncio.create_task(_loop())
 
 
 # ─── 부팅 자동재개 — data/<uid>/.running 마커가 있는 유저별로 매매 루프를 다시 켠다 ───

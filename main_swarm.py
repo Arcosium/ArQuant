@@ -2324,30 +2324,37 @@ def cycle_health_warnings(exec_results: List[Dict]) -> List[str]:
     return warnings
 
 
-async def _llm_is_standing_directive(message: str, response: str) -> bool:
-    """사장 지시 2026-05-21: 사장 지시가 '앞으로 매 운용에 지속 적용할 상시 원칙'인지(STANDING)
-    아니면 '일회성 질문·조회·단발 명령'인지(ONESHOT) 경량 LLM으로 판단. 실패 시 보수적으로 False.
-    체크박스(수동 저장)를 대체하는 자동 판단기."""
+async def _llm_classify_directive(message: str, response: str) -> str:
+    """사장 지시 2026-05-21(2026-07-03 확장): 사장 채팅 메시지를 경량 LLM으로 3분류.
+    STRATEGY — 본인 매매 전략 서술(종목 선정 기준·매수/매도 규칙·지표 조건 등)을 이후 운용에 적용.
+    STANDING — 전략 서술까지는 아니나 매 운용에 지속 적용할 상시 원칙·정책.
+    ONESHOT  — 일회성 질문·현황 조회·단발 명령. 실패 시 보수적으로 ONESHOT(미저장)."""
     try:
         from config import MODEL_ASSIGNMENTS
-        from infra.deepseek_client import chat_completion, response_text
+        from infra.local_llm_client import chat_completion, response_text
         model = MODEL_ASSIGNMENTS.get("news_curator") or ""
-        sys_p = ("당신은 분류기입니다. 사장이 운용역에게 내린 지시가 '앞으로 매 운용에 지속 적용해야 할 "
-                 "상시 원칙·정책'인지, 아니면 '일회성 질문·현황 조회·단발 명령'인지 판단하세요. "
-                 "포트폴리오 비중·자산배분·매매규칙·익절/손절·금지/우선 종목·리스크 한도처럼 지속 적용할 "
-                 "원칙이면 STANDING. 단순 질문·현재 현황 조회·1회성 실행 요청이면 ONESHOT. "
-                 "오직 한 단어로만 답하세요: STANDING 또는 ONESHOT.")
-        usr_p = f"[사장 지시]\n{message}\n\n[운용역 응답 요지]\n{(response or '')[:600]}"
+        sys_p = ("당신은 분류기입니다. 사장이 운용역에게 보낸 메시지를 셋 중 하나로 분류하세요. "
+                 "STRATEGY: 사장이 '본인의 매매 전략'(종목 선정 기준, 매수/매도 규칙, 지표 조건, "
+                 "포트폴리오 구성 방식 등)을 서술하며 앞으로 그 전략대로 운용하라는 내용. "
+                 "STANDING: 전략 전체 서술은 아니지만 앞으로 매 운용에 지속 적용할 상시 원칙·정책 "
+                 "(포트폴리오 비중·자산배분·익절/손절·금지/우선 종목·리스크 한도 등 단편 규칙). "
+                 "ONESHOT: 단순 질문·현재 현황 조회·1회성 실행 요청. "
+                 "오직 한 단어로만 답하세요: STRATEGY 또는 STANDING 또는 ONESHOT.")
+        usr_p = f"[사장 메시지]\n{message}\n\n[운용역 응답 요지]\n{(response or '')[:600]}"
         d = await chat_completion(
             api_key="", model=model,
             messages=[{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}],
             max_tokens=8, temperature=0.0, timeout_sec=30, thinking=False,
         )
-        reply = response_text(d)
-        return "STANDING" in reply.upper()
+        reply = (response_text(d) or "").upper()
+        if "STRATEGY" in reply:
+            return "STRATEGY"
+        if "STANDING" in reply:
+            return "STANDING"
+        return "ONESHOT"
     except Exception as _e:
-        logger.warning(f"상시지시 분류 실패(보수적 미저장): {_e}")
-        return False
+        logger.warning(f"지시 분류 실패(보수적 ONESHOT): {_e}")
+        return "ONESHOT"
 
 
 class _OpsRouterMixin:
@@ -2408,7 +2415,9 @@ class _OpsRouterMixin:
 
     async def _auto_persist_directive(self, message: str, response: str) -> None:
         """사장 지시 2026-05-21: 체크박스 제거 — 지시가 '지속 적용 상시 원칙'인지 LLM이 판단해
-        활성 계정의 standing_directive 로 자동 저장한다. 질문·일회성·에러응답은 저장하지 않는다."""
+        활성 계정의 standing_directive 로 자동 저장한다. 질문·일회성·에러응답은 저장하지 않는다.
+        확장 2026-07-03: '본인 매매 전략' 서술(STRATEGY)이면 user_strategy 로 저장해 다음 사이클부터
+        계량분석팀장 평가에 적용하고, 운용지원실장 자동 튜닝을 끈다(전략과 자동 튜닝 충돌 방지)."""
         try:
             _auid, _ = self._active_actor()
             if _auid is None:
@@ -2417,13 +2426,24 @@ class _OpsRouterMixin:
                 return
             if (response or "").startswith("["):   # 에이전트 에러 응답이면 판단 보류
                 return
-            if not await _llm_is_standing_directive(message, response):
+            verdict = await _llm_classify_directive(message, response)
+            if verdict == "ONESHOT":
                 return
             text = message.strip()
             if text.startswith("@"):               # 선두 @멘션 토큰 제거
                 parts = text.split(None, 1)
                 text = parts[1] if len(parts) > 1 else ""
             if not text:
+                return
+            if verdict == "STRATEGY":
+                from infra import user_strategy
+                user_strategy.set_strategy(_auid, text, source="chat")
+                runtime.set_ops_feedback(False, uid=_auid, by="user_strategy")
+                await self._emit({"type": "agent_msg", "agent": "시스템",
+                                  "message": "🧭 위 메시지를 '사용자 전략'으로 인식해 저장했습니다 — 다음 사이클부터 "
+                                             "계량분석팀장 종목 평가에 이 전략을 적용하고, 운용지원실장 자동 튜닝을 "
+                                             "껐습니다. (프로필 › 지시사항 관리에서 전략 확인·삭제, 전략 삭제 시 "
+                                             "운용지원실장 재활성화)"})
                 return
             from infra.standing_directives import append_directive
             if append_directive(_auid, text):
@@ -3641,9 +3661,9 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
         주입해, 정적 질문이 아니라 '오늘 실제로 움직인 것'을 출발점으로 심층 검색하게 한다.
         세션 캐시(30분)지만 뉴스/지수 컨텍스트가 바뀌면 캐시를 무시하고 새로 검색.
         실패 시 빈 문자열 — fail-open.
-        모델 분담(사장 확인 2026-06-11): 이 search 단계 = macro_researcher(deepseek-v4-flash,
+        모델 분담(사장 확인 2026-06-11): 이 search 단계 = macro_researcher(Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf,
         Hermes 도구 tool-calling 필수라 pro 불가) → 최종 매크로 리포트·자산배분 '결정' =
-        macro_analyst(글로벌리서치팀장, deepseek-v4-pro)가 작성한다."""
+        macro_analyst(글로벌리서치팀장, Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf+thinking)가 작성한다."""
         cache_key = "KR" if is_kr_session(session) else ("US" if session == "US_TRADING" else "OFF")
         # 컨텍스트 시그니처 — 뉴스/지수가 실질적으로 바뀌면 캐시 무효화
         _ctx_sig = str(hash((cache_key, (news_digest or "")[:1500], (index_digest or "")[:600])))
@@ -4165,6 +4185,12 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
         return holdings
 
     async def _run_analysis_cycle(self, news_articles, user_directive, session, market_open: bool = False):
+        # 사장 지시 2026-07-09: 타임폴리오 계정은 완전 별개 사이클(대회 전용 리서치·자산배분).
+        # 채권/원자재/US 경로가 대회 적격룰에 전량 거부되던 문제의 구조적 해결 — KIS 계정
+        # (실전/모의)은 아래 기존 파이프라인을 1바이트도 바꾸지 않고 그대로 탄다.
+        if getattr(self.broker, "is_timefolio", False):
+            from timefolio_swarm import run_timefolio_cycle
+            return await run_timefolio_cycle(self, news_articles, user_directive, session, market_open)
         # 리팩터링 2026-05-27: 거대 단일 메서드를 단계별 헬퍼(_cyc_stage_*)로 분리.
         # 본문은 최상위 early-return 없는 선형 시퀀스이므로, 단계 간 공유 지역변수를
         # `cyc`(SimpleNamespace)에 담아 순서대로 호출만 한다 — 로직·순서·동작 1바이트 불변.
@@ -4205,6 +4231,9 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             # 그 제안을 사후관리실장이 주식 매도와 *종합*(finalize_sell)한다. 순서 = 슬리브 → finalize_sell.
             await self._cyc_stage_sleeves(cyc)
             await self._cyc_stage_finalize_sell(cyc)
+            # QuantInSight 이식(사장 지시 2026-07-18): 매수 대상별 위원회 심의(찬반토론+정직성
+            # 가드+결정론 게이트). 차단·회피 종목은 여기서 매수 대상에서 빠진다(매도 트랙 불간섭).
+            await self._cyc_stage_committee(cyc)
             await self._cyc_stage_build_orders(cyc)
             await self._cyc_stage_risk(cyc)
             await self._cyc_stage_execute(cyc)
@@ -4735,6 +4764,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 _quant_codes = [c for c in _quant_codes if _is_kr_code(c)]
             _quant_scores: Dict[str, int] = {}
             _quant_sigmas: Dict[str, float] = {}   # 사장 지시 2026-06-04 ②: 리스크기반 사이징용 변동성(σ20)
+            cyc.fundamental_research = getattr(cyc, "fundamental_research", {}) or {}
             _quant_sections: List[str] = []
             _entry_dirs: Dict[str, Dict[str, Any]] = {}  # 사장 피드백 #4: 진입가 directive 저장
             _sell_prices: Dict[str, Dict[str, Any]] = {}  # 사장 지시 2026-05-22: 보유종목 매도가 directive
@@ -4744,9 +4774,18 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 "MAX_BUY_VOLATILITY_PCT", "RSI_OVERBOUGHT_SKIP", "MIN_ADX_FOR_BUY",
                 "REQUIRE_FOREIGN_NET_BUY", "MAX_PRICE_EXTENSION_PCT", "MIN_QUANT_SCORE")}
             _strategy_block = format_strategy_param_block(_strat_params)
+            # 사장 지시 2026-07-03: 채팅으로 등록된 '사용자 전략'을 계량분석팀장 평가에 주입.
+            # 전략이 활성이면 결정론 채점을 우회한다 — 결정론 모드에선 점수가 파이썬 확정이라
+            # 전략이 점수에 반영될 길이 없기 때문(전략 삭제 시 원래 모드로 복귀).
+            try:
+                from infra.user_strategy import build_quant_block as _build_ustrat_block
+                _user_strategy_block = _build_ustrat_block(self.uid)
+            except Exception as _use:
+                logger.warning(f"[사용자전략] 로드 실패(미주입 진행): {_use}")
+                _user_strategy_block = ""
             # 사장 지시 2026-06-04: 결정론 점수 엔진 — DETERMINISTIC_SCORING이면 퀀트점수를 파이썬이 확정,
             # 계량분석팀장은 해설만(점수 파싱 안 함). 지표별 QIW·차원 DW·매크로%·뉴스감성으로 산정.
-            _det_scoring = bool(runtime.get("DETERMINISTIC_SCORING", uid=self.uid))
+            _det_scoring = bool(runtime.get("DETERMINISTIC_SCORING", uid=self.uid)) and not _user_strategy_block
             _qiw = {sig: runtime.get(key, uid=self.uid) for sig, key in (
                 ("rsi", "QIW_RSI"), ("macd", "QIW_MACD"), ("adx", "QIW_ADX"), ("vwap", "QIW_VWAP"),
                 ("vol", "QIW_VOL"), ("mom", "QIW_MOM"), ("cmf", "QIW_CMF"), ("flow", "QIW_FLOW"),
@@ -4770,6 +4809,25 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     _end = company_data.find("\n[", _idx + len(_stock_section_marker))
                     _stock_data = company_data[_idx:_end] if _end > _idx else company_data[_idx:_idx + 4000]
                 _per_dart_str = per_dart.get(_qcode, "")
+                _fundamental_research = None
+                _fundamental_prompt = ""
+                try:
+                    from tools.fundamental_rigor import assess_fundamental_research, format_research_for_prompt
+                    from infra import fundamental_research_store
+                    _fr_ts = _now_kst().strftime("%Y-%m-%d %H:%M:%S")
+                    _fundamental_research = assess_fundamental_research(
+                        _qcode, _qname, dart_text=_per_dart_str, financial_text=_per_dart_str,
+                        source="ai_berkshire_advisory")
+                    _fundamental_research.update({
+                        "uid": self.uid,
+                        "cycle_started_at": getattr(self.cycle_log, "started_at", None) or _fr_ts,
+                        "ts": _fr_ts,
+                    })
+                    fundamental_research_store.record_snapshot(_fundamental_research)
+                    cyc.fundamental_research[_qcode] = _fundamental_research
+                    _fundamental_prompt = format_research_for_prompt(_fundamental_research)
+                except Exception as _fre:
+                    logger.debug(f"[펀더멘털리서치] {_qcode} 적재 생략: {_fre}")
                 # 결정론 점수 산정(사장 지시 2026-06-04) — DETERMINISTIC_SCORING이면 파이썬이 점수 확정.
                 _det_score = None
                 _det_bd = None
@@ -4805,10 +4863,12 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 _base_prompt = (
                     f"[종목 단독 평가 — {_qrole}] {_qname}\n"
                     f"현재 세션: {session} / 최대 매수 종목 수 (참고): {runtime.get('MAX_TRADES_PER_CYCLE', uid=self.uid)}\n\n"
+                    + (f"{_user_strategy_block}\n\n" if _user_strategy_block else "")
                     + ("" if (_is_held or _det_score is not None) else f"{_strategy_block}\n\n")
                     + f"마켓센티먼트팀장 분석 발췌:\n{news_report[:1200]}\n\n"
                     f"종목 데이터:\n{_stock_data or '(데이터 부족)'}\n\n"
                     f"최근 DART 공시:\n{_per_dart_str or '(공시 없음)'}\n\n"
+                    f"장기 펀더멘털 리서치 참고(ai-berkshire 방식, advisory):\n{_fundamental_prompt or '(특이 리서치 없음)'}\n\n"
                     + _score_directive)
                 for _attempt in range(3):
                     try:
@@ -4853,7 +4913,14 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                         "ts": _sc_ts, "code": _qcode, "name": _qname,
                         "news_sentiment": parse_news_sentiment(news_report, _qcode, _qname),
                         "quant_score": _quant_scores.get(_qcode),
-                        "det_breakdown": _det_bd})
+                        "det_breakdown": _det_bd,
+                        "fundamental_verdict": (_fundamental_research or {}).get("verdict"),
+                        "business_quality_score": (_fundamental_research or {}).get("business_quality_score"),
+                        "moat_score": (_fundamental_research or {}).get("moat_score"),
+                        "management_score": (_fundamental_research or {}).get("management_score"),
+                        "valuation_margin_score": (_fundamental_research or {}).get("valuation_margin_score"),
+                        "thesis_invalidators": (_fundamental_research or {}).get("thesis_invalidators"),
+                    })
                 except Exception as _sce:
                     logger.debug(f"[스코어카드] 신호 적재 생략 {_qcode}: {_sce}")
                 # 사장 피드백 2026-05-15 (#4): 진입가 directive 파싱 (선택)
@@ -5051,6 +5118,25 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 # 사장 지시 2026-06-09 #2: thesis 상기는 _cyc_stage_sleeves 에서 포트폴리오기획팀장이
                 # 3매니저(사후관리·채권·원자재)에게 일괄 발화·보관(cyc.thesis_reminders). 여기선 주식분만 주입.
                 _thesis_reminder = (getattr(cyc, "thesis_reminders", {}) or {}).get("사후관리실장", "")
+                _fundamental_block = ""
+                try:
+                    from tools.fundamental_rigor import format_research_for_prompt
+                    from infra import fundamental_research_store
+                    _fr_lines = []
+                    _fr_map = getattr(cyc, "fundamental_research", {}) or {}
+                    for _h in (holdings or []):
+                        _hc = str(_h.get("code", "")).strip()
+                        if not _hc:
+                            continue
+                        _fr = _fr_map.get(_hc) or fundamental_research_store.latest(self.uid, _hc)
+                        _fp = format_research_for_prompt(_fr)
+                        if _fp:
+                            _fr_lines.append(f"- {_hc}: {_fp}")
+                    if _fr_lines:
+                        _fundamental_block = ("\n[장기 펀더멘털 리서치 참고 — ai-berkshire 방식, advisory]\n"
+                                              + "\n".join(_fr_lines) + "\n")
+                except Exception as _frbe:
+                    logger.debug(f"[펀더멘털리서치] 사후관리 주입 생략: {_frbe}")
                 # 사장 지시 2026-06-09 #1: 슬리브(채권·원자재) 매니저의 매도 제안을 사후관리실장이 종합한다.
                 _sleeve_prop_block = ""
                 _sp = getattr(cyc, "sleeve_sell_proposals", {}) or {}
@@ -5071,11 +5157,16 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     + (f"{_thesis_reminder}\n\n" if _thesis_reminder else "")
                     + f"검증된 글로벌 지수(수치는 이 스냅샷에서만 그대로 인용):\n{index_facts}\n\n"
                     + f"글로벌리서치팀장 매크로 보고:\n{macro_report}\n\n현재 보유 종목: {holdings_str}\n\n"
-                    f"보유기간 (Arquant 자체 관찰):\n{holding_period_str}\n\n"
+                    + (_fundamental_block + "\n" if _fundamental_block else "")
+                    + f"보유기간 (Arquant 자체 관찰):\n{holding_period_str}\n\n"
                     f"계량분석팀장 평가:\n{quant_report}\n\n마켓센티먼트팀장 평가:\n{news_report}\n\n"
                     + _sleeve_prop_block
                     + f"위 매크로 → 퀀트 → 뉴스 → 평가손익 순으로 가중해 보유 종목별로 매도/보유를 결정하십시오. "
                     f"{_hold_guide} 종목별 사유에 '시장이 닫혀 매매 불가' 같은 세션 추측을 쓰지 마십시오 (위 세션 안내가 사실). "
+                    + ("⚠️ 위 [장기 펀더멘털 리서치 참고]에서 QUALITY_VETO 또는 thesis invalidator가 있으면, "
+                       "단기 수급이 양호하더라도 thesis 훼손 여부를 매도/보유 사유에 명시하십시오. 이 블록은 advisory지만 "
+                       "장기 보유 명분을 약화시키는 증거입니다.\n"
+                       if _fundamental_block else "")
                     + ("⚠️ 포트폴리오기획팀장 thesis 가 위에 명시된 종목은 진입 사유·목표가·손절가·계획 보유기간을 "
                        "**강력 권고로 우선 반영**하십시오. 목표 미달·손절 미터치·계획 기간 미경과인 종목을 미세 손익만으로 "
                        "청산하는 것은 무계획 단타입니다 — 계획 유지가 원칙이며, 그럼에도 매도하려면 명확한 신호 변화 이유를 "
@@ -5100,6 +5191,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 self.cycle_log.log("RISK", "사후관리실장", pm_view)
                 await self._emit({"type":"agent_msg","agent":"사후관리실장","message":pm_view})
                 sell_directives = _parse_sell_decisions(pm_view)
+                cyc._pm_view = pm_view  # QuantInSight 이식(2026-07-18): 위원회 '보유 심의' 기록용 원문
                 # 사장 지시 2026-06-09 #1: 사후관리실장이 슬리브(채권·원자재) 코드를 매도결정에 포함하면
                 # 그대로 *종합*한다(구 strip 폐지). 슬리브 코드는 주식 매도 트랙(stock_holdings 기반)엔 안 걸리고,
                 # build_orders 가 슬리브 매도로 따로 조립한다 — 사후관리실장이 주식+슬리브 최종 종합권.
@@ -5359,6 +5451,128 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 logger.warning(f"[{spec.key}] 슬리브 스테이지 오류: {e}")
                 await self._emit({"type": "agent_msg", "agent": mgr_name,
                                   "message": f"⚠️ {spec.macro_keyword} 트랙 오류 — 이번 사이클 생략: {e}"})
+
+    async def _cyc_stage_committee(self, cyc):
+            """QuantInSight 위원회 심의 이식 (사장 지시 2026-07-18) — fail-open.
+
+            PASS 2 매수 대상별로: 출처검증 리포트 → 찬반토론(매수옹호역↔리스크반론역, 라운드
+            고정) → 주식운용실장 최종 결정(+claims 자진신고) → 결정론 게이트(체크리스트).
+            차단/회피/보류 판정 종목은 target_codes 에서 투명하게 제외한다. 보유 종목은
+            사후관리실장의 매도결정을 '보유 심의' 기록으로 재구성한다(추가 LLM 없음).
+            어떤 실패도 사이클을 막지 않는다 — 실패 시 심의 기록만 생략(매매 파이프라인 불변)."""
+            try:
+                from agents import committee as cmt
+                targets = list(getattr(cyc, "target_codes", None) or [])
+                holdings = (cyc.stock_holdings if getattr(cyc, "stock_holdings", None) is not None
+                            else getattr(cyc, "holdings", None)) or []
+                sell_directives = getattr(cyc, "sell_directives", {}) or {}
+                if not targets and not holdings:
+                    return
+                name_map = getattr(cyc, "name_map", {}) or {}
+                per_dart = getattr(cyc, "per_dart", {}) or {}
+                q_scores = getattr(cyc, "_quant_scores", {}) or {}
+                fr_map = getattr(cyc, "fundamental_research", {}) or {}
+                macro_report = getattr(cyc, "macro_report", "") or ""
+                _alloc = _parse_macro_stock_pct(macro_report)
+                macro_view = " ".join(macro_report.replace("\n", " ").split())[:220]
+                _min_qs = float(runtime.get("MIN_QUANT_SCORE", uid=self.uid) or 0)
+                _cyc_ratio = float(runtime.get("MAX_CYCLE_BUDGET_RATIO", uid=self.uid) or 0.25)
+                _base_w = _cyc_ratio / max(1, len(targets) or 1)
+
+                async def _prog(agent, msg):
+                    await self._emit({"type": "agent_msg", "agent": agent, "message": msg})
+
+                candidates, dropped = [], []   # dropped: (code, 사유)
+                _DEBATE_CAP = 3   # LLM 토론은 상위 N종목까지 — 그 이하는 결정론 심의(게이트는 전 종목)
+                for i, code in enumerate(targets):
+                    name = name_map.get(code, code)
+                    rep = cmt.build_report(
+                        code, name,
+                        quant_line=(f"결정론 퀀트점수 {q_scores.get(code)}/10"
+                                    if q_scores.get(code) is not None else ""),
+                        per_dart=per_dart.get(code, ""),
+                        news_excerpt=_extract_code_news(cyc.news_report, code, name)[:300],
+                        fundamental=fr_map.get(code))
+                    q_ex = _quant_ctx_for(getattr(cyc, "quant_report", ""), code, width=300)
+                    if i < _DEBATE_CAP:
+                        await self._emit({"type": "agent_msg", "agent": "주식운용실장",
+                            "message": f"🏛️ [{name}({code})] 위원회 심의 소집 — 찬반토론 후 최종 확정합니다."})
+                        opinions, dialogue, chief, llm_used = await cmt.deliberate_target(
+                            code, name, rep, quant_score=q_scores.get(code),
+                            quant_excerpt=q_ex,
+                            news_excerpt=_extract_code_news(cyc.news_report, code, name)[:300],
+                            macro_view=macro_view, progress=_prog)
+                    else:
+                        opinions, dialogue, chief, llm_used = await cmt.deliberate_target(
+                            code, name, rep, quant_score=q_scores.get(code),
+                            quant_excerpt=q_ex, news_excerpt="", macro_view=macro_view,
+                            progress=None)
+                    gate = cmt.run_gate(rep, q_scores.get(code), chief["confidence"],
+                                        min_quant_score=_min_qs, base_weight=_base_w)
+                    if gate.verdict == cmt.BLOCK:
+                        decision = "차단"
+                        dropped.append((code, "게이트 차단: " + "; ".join(
+                            c.detail for c in gate.checks if not c.passed)))
+                    elif chief["stance"] != cmt.BUY:
+                        decision = chief["stance"]
+                        dropped.append((code, f"주식운용실장 심의 결정 {chief['stance']}"))
+                    else:
+                        decision = "매수" if gate.verdict == cmt.PASS_V else "매수(비중축소)"
+                    candidates.append({
+                        "code": code, "name": name, "sector": rep.sector,
+                        "quant_score": q_scores.get(code), "decision": decision,
+                        "engine": ("llm" if llm_used else "deterministic"),
+                        "report": rep.to_dict(),
+                        "opinions": opinions, "dialogue": dialogue,
+                        "gate": gate.to_dict(),
+                    })
+                if dropped:
+                    _dset = {c for c, _ in dropped}
+                    cyc.target_codes = [c for c in targets if c not in _dset]
+                    await self._emit({"type": "agent_msg", "agent": "리스크관리실장",
+                        "message": "🚦 위원회 게이트 — 매수 제외: " + "; ".join(
+                            f"{name_map.get(c, c)}({c}) — {r}" for c, r in dropped)
+                            + f"\n최종 매수 대상: {', '.join(cyc.target_codes) or '없음'}"})
+
+                # ── 보유 심의 기록 (사후관리실장 매도결정 재구성 — 추가 LLM 없음) ──
+                pm_view = getattr(cyc, "_pm_view", "") or ""
+                reviews = []
+                for h in holdings:
+                    hc = str(h.get("code", "")).strip()
+                    if not hc or hc not in sell_directives:
+                        continue
+                    directive = str(sell_directives.get(hc, "보유")).strip()
+                    if directive == "보유":
+                        decision = "유지"
+                    elif directive == "전량":
+                        decision = "매도"
+                    else:
+                        decision = f"매도({directive})"
+                    reason = _quant_ctx_for(pm_view, hc, width=240) or ""
+                    if not reason:
+                        # pm_view 에서 종목명/코드가 든 문장 발췌 (없으면 지시값 자체가 사유)
+                        _nm_h = str(h.get("name", "") or "")
+                        for _sent in re.split(r"(?<=[.다요])\s+", pm_view):
+                            if hc in _sent or (_nm_h and _nm_h in _sent):
+                                reason = _sent.strip()[:240]; break
+                    reviews.append({
+                        "code": hc, "name": h.get("name", hc), "sector": "",
+                        "pnl_pct": round(float(h.get("pnl_pct") or 0.0), 2),
+                        "decision": decision, "reason": reason or f"사후관리실장 매도결정: {directive}",
+                        "dialogue": ([{"speaker": "사후관리실장", "role": "chief",
+                                       "text": (reason or f"매도결정: {directive}"),
+                                       "stance": decision}]),
+                    })
+
+                if candidates or reviews:
+                    cyc.committee = {
+                        "generated_at": getattr(self.cycle_log, "started_at", ""),
+                        "macro": {"view": macro_view, "equity_allocation": (_alloc if _alloc is not None else 0.7)},
+                        "candidates": candidates,
+                        "position_reviews": reviews,
+                    }
+            except Exception as _ce:
+                logger.warning(f"[위원회] 심의 스테이지 실패 — fail-open(매매 파이프라인 불변): {_ce}")
 
     async def _cyc_stage_build_orders(self, cyc):
             market_open = cyc.market_open
@@ -6013,12 +6227,21 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             # B-#2(2026-06-12): 종목 무관한 news_report 앞부분(센티 리포트=삼성으로 시작) 통째 주입 금지 —
             # 이 종목 단락만 발췌(없으면 빈 값). 타종목 사유 오염(003490 thesis 에 삼성 사유) 차단.
             news_brief = _extract_code_news(getattr(cyc, "news_report", "") or "", code, auth_name)[:600]
+            fundamental_brief = ""
+            try:
+                from infra import fundamental_research_store
+                from tools.fundamental_rigor import format_research_for_prompt
+                _fr = (getattr(cyc, "fundamental_research", {}) or {}).get(code) or fundamental_research_store.latest(self.uid, code)
+                fundamental_brief = format_research_for_prompt(_fr)
+            except Exception as _fre:
+                logger.debug(f"[펀더멘털리서치] thesis 주입 생략 {code}: {_fre}")
             fill_price = float(rec.get("fill_price") or rec.get("avg_cost") or 0.0)
             ccy = rec.get("fill_currency") or "KRW"
             prompt = (f"[plan 모드]\n종목: {disp_name}({code})\n체결가: {fill_price:,.2f} {ccy}\n"
                       f"매수 사유(주식운용실장): {buy_reason}\n\n"
                       f"계량팀 리포트 발췌:\n{quant_brief}\n\n"
                       f"이 종목({disp_name}) 뉴스 발췌:\n{news_brief or '(이 종목 관련 뉴스 없음)'}\n\n"
+                      f"장기 펀더멘털 리서치 참고(ai-berkshire 방식, advisory):\n{fundamental_brief or '(특이 리서치 없음)'}\n\n"
                       f"⚠️ 오직 이 종목({disp_name}/{code})의 매수 사유만 쓰십시오 — 다른 종목"
                       f"(예: 지수 1위 종목)의 뉴스·사유를 끌어오지 마십시오.\n"
                       f"이 매수의 thesis 를 4줄(목표가/손절가/계획 보유기간/진입 사유 요약)로만 응답하십시오.")
@@ -6173,10 +6396,41 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             await self._emit({"type":"cycle_complete","report":report,"trades_total":self._trades_executed})
             self._cycle_history.append(self.cycle_log.to_dict())
 
+            # ── QuantInSight 이식(2026-07-18): 위원회 기록에 체결 요약(portfolio) 채워넣기 ──
+            _committee = getattr(cyc, "committee", None)
+            if _committee is not None:
+                try:
+                    _orders_c, _sells_c = [], []
+                    _total = float(buying_power.get("total_eval") or 0.0) or 1.0
+                    for e in (exec_results or []):
+                        if not isinstance(e, dict):
+                            continue
+                        _side = str(e.get("side", "")).lower()
+                        _row = {"code": e.get("ticker") or e.get("code") or "",
+                                "name": e.get("name") or e.get("ticker") or e.get("code") or "",
+                                "qty": e.get("qty"), "price": e.get("price"),
+                                "ok": bool(e.get("ok", e.get("filled", False)))}
+                        try:
+                            _amt = float(e.get("qty") or 0) * float(e.get("price") or 0)
+                            _row["amount"] = _amt
+                            _row["weight"] = round(_amt / _total, 4)
+                        except (TypeError, ValueError):
+                            pass
+                        (_sells_c if _side in ("sell", "매도") else _orders_c).append(_row)
+                    _committee["portfolio"] = {
+                        "orders": _orders_c, "sells": _sells_c,
+                        "cash_weight": round(float(buying_power.get("cash") or 0.0) / _total, 4),
+                        "cash_note": (f"예수금 {float(buying_power.get('cash') or 0.0):,.0f}원 · "
+                                      f"총평가 {float(buying_power.get('total_eval') or 0.0):,.0f}원"),
+                    }
+                except Exception as _pe:
+                    logger.warning(f"[위원회] portfolio 요약 실패(기록은 유지): {_pe}")
+
             # ── Persist cycle to SQLite (사장 지시 2026-05-14 — 백테스트/장기 분석용) ──
             new_cycle_id = None
             try:
                 new_cycle_id = cycle_store.record_cycle({
+                    "committee": _committee,
                     "uid": self.uid,
                     "started_at": self.cycle_log.started_at,
                     "ended_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),

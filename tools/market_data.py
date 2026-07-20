@@ -15,6 +15,11 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 
+try:  # 공용 시세(EOD) 레이어 — pykrx/yfinance 우선 (사장 지시 2026-07-02), 실패 시 네이버 크롤 폴백
+    import arcmarket
+except ImportError:
+    arcmarket = None
+
 logger = logging.getLogger("MARKET_DATA")
 DATA_DIR = Path(__file__).parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -278,6 +283,25 @@ def fetch_stock_daily(code: str, years: int = 3) -> pd.DataFrame:
     """
     csv_path = DATA_DIR / f"daily_{code}.csv"
     stop_date = _get_csv_latest_date(csv_path)
+
+    # 1순위 arcmarket(pykrx/yfinance) — 성공하면 크롤 없이 같은 CSV 규격으로 누적
+    if arcmarket is not None:
+        try:
+            df = arcmarket.kr_daily(code, days=int(years * 365))
+            if df is not None and not df.empty:
+                if stop_date is not None:
+                    df = df[df.index >= pd.to_datetime(stop_date)]  # 당일 봉 upsert 갱신 유지
+                df = df.fillna(0)
+                rows = [{'date': d.strftime('%Y-%m-%d'), 'open': int(x['open']),
+                         'high': int(x['high']), 'low': int(x['low']),
+                         'close': int(x['close']), 'volume': int(x['volume'])}
+                        for d, x in df.iterrows()]
+                if rows:
+                    _append_csv(csv_path, rows, ['date', 'open', 'high', 'low', 'close', 'volume'])
+                    logger.info(f"[일봉] {code}: arcmarket {len(rows)}건 (pykrx/yfinance)")
+                    return pd.DataFrame(rows)
+        except Exception as e:
+            logger.warning(f"[일봉] {code} arcmarket 실패 — 네이버 폴백: {e}")
 
     result = []
     max_pages = int(years * 26) + 10

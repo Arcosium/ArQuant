@@ -58,9 +58,9 @@
 1. **로그아웃** — 기존 `/api/logout` 재사용.
 2. **비밀번호 변경** — 현재 비번 검증(argon2) → 신규 비번 정책 재검증 →
    `password_policy_error` 통과 시 argon2 해시 갱신.
-3. **정보 변경** — DeepSeek Key / KIS App Key / KIS App Secret /
+3. **정보 변경** — 로컬 LLM / KIS App Key / KIS App Secret /
    한국투자증권 계좌번호 / Base URL. 변경분만 제출. 저장 전 실검증
-   (`_validate_kis`, `_validate_deepseek` 재사용), 성공 시 저장 +
+   (`_validate_kis`, `_validate_local_llm` 재사용), 성공 시 저장 +
    활성 계정이면 런타임 재주입(`_activate_with_policy`). bidx 동시 갱신
    (계좌번호/Secret 변경 시 복구 인덱스도 재계산).
 4. **상시 지시사항 관리** — 활성 uid 기준 `infra/standing_directives.py`
@@ -71,7 +71,7 @@
 
 엔드포인트(세션 필요, `_PUBLIC_PATHS` 아님):
 - `POST /api/profile/password` `{current, new}`
-- `POST /api/profile/credentials` `{deepseek_api_key?, kis_app_key?, kis_app_secret?, kis_account_no?, kis_base_url?}`
+- `POST /api/profile/credentials` `{llm_key?, kis_app_key?, kis_app_secret?, kis_account_no?, kis_base_url?}`
 - `GET /api/profile/directives` → 목록
 - `POST /api/profile/directives` `{text}` → 추가
 - `DELETE /api/profile/directives/{id}` → 삭제
@@ -92,13 +92,13 @@
 - `POST /api/admin/members/delete` `{username}` (자기/단독ADMIN 거부)
 
 ### 4.4 복구 인자 변경 (보안)
-- 기존: `find_username_by_factors(kis_app_key, kis_app_secret, deepseek_api_key)`,
+- 기존: `find_username_by_factors(kis_app_key, kis_app_secret, llm_key)`,
   `reset_password_by_factors(username, …동일3…)`.
 - 변경: 인자 = **kis_account_no + kis_app_secret** (2개).
 - 스키마: `users`에 `kis_account_no_bidx` 컬럼 추가. **부팅 1회 멱등
   마이그레이션**으로 기존 행 백필(기존 `migrate_passwords_and_bidx`
   패턴·sentinel 재사용 방식). 기존 `kis_app_secret_bidx` 재사용,
-  `kis_app_key_bidx`/`deepseek_api_key_bidx`는 복구에서 미사용(컬럼은 유지).
+  `kis_app_key_bidx`/`llm_key_bidx`는 복구에서 미사용(컬럼은 유지).
 - 함수 시그니처 변경 + 호출부(`/api/recover_id`, `/api/recover_password`)
   요청 모델·검증을 2인자로. **열거 오라클 방지 불변식 유지**(정책
   검증을 인자 매칭보다 먼저).

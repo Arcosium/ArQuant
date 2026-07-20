@@ -1,6 +1,6 @@
 """
 NPS Swarm v1.0 - Base Agent
-DeepSeek-powered agent base class with dynamic model allocation.
+Local-LLM-powered agent base class with dynamic model allocation.
 """
 import json
 import logging
@@ -101,7 +101,7 @@ def _bump_rollup(cost_usd: float, ts: float) -> None:
 
 def _record_api_call(model: str, agent: str, prompt_tokens: int, completion_tokens: int,
                      ts: Optional[float] = None, uid: Optional[int] = None) -> float:
-    """DeepSeek usage → 모델 단가로 비용 추정 → 회전식 로그 + 영속 롤업에 적재."""
+    """Local LLM usage → 모델 단가로 비용 추정 → 회전식 로그 + 영속 롤업에 적재."""
     ts = ts if ts is not None else time.time()
     in_rate, out_rate = _MODEL_PRICING.get(model, _DEFAULT_PRICING)
     cost = (prompt_tokens / 1_000_000.0) * in_rate + (completion_tokens / 1_000_000.0) * out_rate
@@ -134,7 +134,7 @@ def cost_summary() -> Dict[str, Any]:
 
 class BaseAgent:
     """
-    Base agent class that communicates via the official DeepSeek API.
+    Base agent class that communicates via the local OpenAI-compatible LLM server.
     Each agent has a persona, system prompt, assigned LLM model, and tool set.
     """
 
@@ -199,7 +199,7 @@ class BaseAgent:
         messages.append({"role": "user", "content": user_content})
 
         try:
-            from infra.deepseek_client import chat_completion
+            from infra.local_llm_client import chat_completion
             data = await chat_completion(
                 api_key=self.api_key, model=self.model, messages=messages,
                 max_tokens=self.max_tokens, temperature=0.3, timeout_sec=300,

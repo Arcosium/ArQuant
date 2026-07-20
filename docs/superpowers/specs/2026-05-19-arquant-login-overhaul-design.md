@@ -37,24 +37,24 @@ Android: replicate the same icon treatment in `LoginScreen.kt`.
 ### §2 Account recovery (new public surface)
 Two new endpoints, mirrored in web overlay + Android `LoginScreen.kt`:
 
-- `POST /api/recover_id` — body `{kis_app_key, kis_app_secret, deepseek_api_key}`.
+- `POST /api/recover_id` — body `{kis_app_key, kis_app_secret, llm_key}`.
   On exact match of **all three** → returns `{username}`. No match → generic 404.
 - `POST /api/recover_password` — body `{username, kis_app_key, kis_app_secret,
-  deepseek_api_key, new_password}`. On exact match of all four → set new password
+  llm_key, new_password}`. On exact match of all four → set new password
   (policy-enforced, written via §6 hash path). One-step (no separate verify call).
 
 Both added to `_PUBLIC_PATHS`. Pydantic models `RecoverIdReq`, `RecoverPwReq`.
 
 **Matching = blind index (decided).** Fernet is non-deterministic, so add deterministic
 HMAC columns:
-- New `users` columns: `kis_app_key_bidx`, `kis_app_secret_bidx`, `deepseek_api_key_bidx` (TEXT).
+- New `users` columns: `kis_app_key_bidx`, `kis_app_secret_bidx`, `llm_key_bidx` (TEXT).
 - `bidx(value) = HMAC_SHA256(K, value.strip()).hexdigest()` where `K` is **HKDF-SHA256
   derived from the existing Fernet key** (`info="arquant-bidx-v1"`). No new secret to
   back up; documented coupling to the Fernet key.
 - Normalization MUST equal registration normalization: `.strip()` (matches
   `app.py:194-196` which `.strip()`s before storage).
 - Lookup: `SELECT username FROM users WHERE kis_app_key_bidx=? AND kis_app_secret_bidx=?
-  AND deepseek_api_key_bidx=?` (+ `username=?` for password reset). No bulk decrypt.
+  AND llm_key_bidx=?` (+ `username=?` for password reset). No bulk decrypt.
 - `upsert_user` computes and stores all three bidx on create/update.
 - Schema migration via `ALTER TABLE ADD COLUMN` following the existing `is_admin`
   migration pattern (`auth_store.py:172-181`); backfill in the one-shot startup
@@ -76,7 +76,7 @@ password policy is public and the submitted password is attacker-chosen, so
 "your password is weak" carries zero account/factor information.)
 
 **Accepted trade-off (confirmed by owner):** possession of a user's KIS App
-Key+Secret + DeepSeek key ⇒ account takeover. Rate-limit + audit are the compensating
+Key+Secret + 로컬 LLM key ⇒ account takeover. Rate-limit + audit are the compensating
 controls. Documented, not mitigated further in this pass.
 
 ### §3 Mobile badge placement — web only

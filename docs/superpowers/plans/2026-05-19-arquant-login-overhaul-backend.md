@@ -300,7 +300,7 @@ def test_new_columns_exist(fresh_auth):
     cols = {r[1] for r in con.execute("PRAGMA table_info(users)").fetchall()}
     con.close()
     assert {"password_hash", "kis_app_key_bidx",
-            "kis_app_secret_bidx", "deepseek_api_key_bidx"} <= cols
+            "kis_app_secret_bidx", "llm_key_bidx"} <= cols
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -314,7 +314,7 @@ In `infra/auth_store.py` `init()`, directly after the existing `if ADMIN_USERNAM
 
 ```python
         for _c in ("password_hash", "kis_app_key_bidx",
-                   "kis_app_secret_bidx", "deepseek_api_key_bidx"):
+                   "kis_app_secret_bidx", "llm_key_bidx"):
             if _c not in cols:
                 conn.execute(
                     f"ALTER TABLE users ADD COLUMN {_c} TEXT NOT NULL DEFAULT ''")
@@ -351,7 +351,7 @@ Append to `tests/test_auth_migration.py`:
 def test_upsert_stores_hash_and_bidx_not_plaintext(fresh_auth):
     uid = fresh_auth.upsert_user(
         username="alice", password="Sup3r$ecret!",
-        kis_app_key="AK", kis_app_secret="AS", deepseek_api_key="OR",
+        kis_app_key="AK", kis_app_secret="AS", llm_key="OR",
         kis_account_no="123-01", kis_base_url="", dart_key="", label="")
     import sqlite3
     con = sqlite3.connect(fresh_auth._DB_PATH); con.row_factory = sqlite3.Row
@@ -360,7 +360,7 @@ def test_upsert_stores_hash_and_bidx_not_plaintext(fresh_auth):
     assert r["password_hash"].startswith("$argon2id$")
     assert r["kis_app_key_bidx"] == fresh_auth.bidx("AK")
     assert r["kis_app_secret_bidx"] == fresh_auth.bidx("AS")
-    assert r["deepseek_api_key_bidx"] == fresh_auth.bidx("OR")
+    assert r["llm_key_bidx"] == fresh_auth.bidx("OR")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -372,7 +372,7 @@ Expected: FAIL (password_enc not empty / bidx empty)
 
 ```python
 def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: str,
-                deepseek_api_key: str, kis_account_no: str, kis_base_url: str,
+                llm_key: str, kis_account_no: str, kis_base_url: str,
                 dart_key: str = "", label: str = "", is_admin: bool = False) -> int:
     """username 기준 upsert. 비밀번호는 argon2id 해시로만 저장(password_enc 미사용),
     복구용 블라인드 인덱스도 함께 기록. user_id 반환.
@@ -387,14 +387,14 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
         password_hash=hash_password(password),
         kis_app_key_enc=encrypt(kis_app_key),
         kis_app_secret_enc=encrypt(kis_app_secret),
-        deepseek_api_key_enc=encrypt(deepseek_api_key),
+        llm_key_enc=encrypt(llm_key),
         kis_account_no_enc=encrypt(kis_account_no),
         kis_base_url=base_url,
         dart_key_enc=encrypt(dart_key) if (dart_key or "").strip() else "",
         label=label,
         kis_app_key_bidx=bidx(kis_app_key),
         kis_app_secret_bidx=bidx(kis_app_secret),
-        deepseek_api_key_bidx=bidx(deepseek_api_key),
+        llm_key_bidx=bidx(llm_key),
     )
     with _DB_LOCK, _connect() as conn:
         row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
@@ -402,29 +402,29 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
             uid = int(row["id"])
             conn.execute(
                 """UPDATE users SET password_hash=?, password_enc='',
-                   kis_app_key_enc=?, kis_app_secret_enc=?, deepseek_api_key_enc=?,
+                   kis_app_key_enc=?, kis_app_secret_enc=?, llm_key_enc=?,
                    kis_account_no_enc=?, kis_base_url=?, dart_key_enc=?, label=?,
-                   kis_app_key_bidx=?, kis_app_secret_bidx=?, deepseek_api_key_bidx=?,
+                   kis_app_key_bidx=?, kis_app_secret_bidx=?, llm_key_bidx=?,
                    last_login_at=?, last_validated_at=? WHERE id=?""",
                 (vals["password_hash"], vals["kis_app_key_enc"], vals["kis_app_secret_enc"],
-                 vals["deepseek_api_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
+                 vals["llm_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
                  vals["dart_key_enc"], vals["label"], vals["kis_app_key_bidx"],
-                 vals["kis_app_secret_bidx"], vals["deepseek_api_key_bidx"], now, now, uid),
+                 vals["kis_app_secret_bidx"], vals["llm_key_bidx"], now, now, uid),
             )
             return uid
         adm = 1 if (is_admin or username in ADMIN_USERNAMES) else 0
         cur = conn.execute(
             """INSERT INTO users (username, password_enc, password_hash,
-               kis_app_key_enc, kis_app_secret_enc, deepseek_api_key_enc,
+               kis_app_key_enc, kis_app_secret_enc, llm_key_enc,
                kis_account_no_enc, kis_base_url, dart_key_enc, label,
-               kis_app_key_bidx, kis_app_secret_bidx, deepseek_api_key_bidx,
+               kis_app_key_bidx, kis_app_secret_bidx, llm_key_bidx,
                is_admin, created_at, last_login_at, last_validated_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (username, "", vals["password_hash"], vals["kis_app_key_enc"],
-             vals["kis_app_secret_enc"], vals["deepseek_api_key_enc"],
+             vals["kis_app_secret_enc"], vals["llm_key_enc"],
              vals["kis_account_no_enc"], vals["kis_base_url"], vals["dart_key_enc"],
              vals["label"], vals["kis_app_key_bidx"], vals["kis_app_secret_bidx"],
-             vals["deepseek_api_key_bidx"], adm, now, now, now),
+             vals["llm_key_bidx"], adm, now, now, now),
         )
         return int(cur.lastrowid)
 ```
@@ -571,7 +571,7 @@ def test_one_shot_migration_is_idempotent(fresh_auth):
     import sqlite3
     con = sqlite3.connect(fresh_auth._DB_PATH)
     con.execute("UPDATE users SET password_hash='', password_enc=?, "
-                "kis_app_key_bidx='', kis_app_secret_bidx='', deepseek_api_key_bidx='' "
+                "kis_app_key_bidx='', kis_app_secret_bidx='', llm_key_bidx='' "
                 "WHERE id=?", (fresh_auth.encrypt("Migrate$99x"), uid))
     con.commit(); con.close()
     s1 = fresh_auth.migrate_passwords_and_bidx()
@@ -590,7 +590,7 @@ def test_migration_skips_row_with_corrupt_enc_no_data_loss(fresh_auth):
     con = sqlite3.connect(fresh_auth._DB_PATH)
     # legacy + CORRUPT password_enc (not valid Fernet), bidx cleared
     con.execute("UPDATE users SET password_hash='', password_enc='not-a-valid-fernet-token', "
-                "kis_app_key_bidx='', kis_app_secret_bidx='', deepseek_api_key_bidx='' "
+                "kis_app_key_bidx='', kis_app_secret_bidx='', llm_key_bidx='' "
                 "WHERE id=?", (uid,))
     con.commit(); con.close()
     stats = fresh_auth.migrate_passwords_and_bidx()
@@ -640,8 +640,8 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             "SELECT id, password_enc, password_hash, "
-            "kis_app_key_enc, kis_app_secret_enc, deepseek_api_key_enc, "
-            "kis_app_key_bidx, kis_app_secret_bidx, deepseek_api_key_bidx FROM users"
+            "kis_app_key_enc, kis_app_secret_enc, llm_key_enc, "
+            "kis_app_key_bidx, kis_app_secret_bidx, llm_key_bidx FROM users"
         ).fetchall()
         for r in rows:
             try:
@@ -666,7 +666,7 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                 if not (r["kis_app_key_bidx"] or ""):
                     enc_key = r["kis_app_key_enc"] or ""
                     enc_secret = r["kis_app_secret_enc"] or ""
-                    enc_or = r["deepseek_api_key_enc"] or ""
+                    enc_or = r["llm_key_enc"] or ""
                     if enc_key and enc_secret and enc_or:
                         dec_key = decrypt(enc_key)
                         dec_secret = decrypt(enc_secret)
@@ -679,7 +679,7 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                             continue
                         updates["kis_app_key_bidx"] = bidx(dec_key)
                         updates["kis_app_secret_bidx"] = bidx(dec_secret)
-                        updates["deepseek_api_key_bidx"] = bidx(dec_or)
+                        updates["llm_key_bidx"] = bidx(dec_or)
                         did_bidx = True
                     # enc 자체가 비어있는 경우(빈 enc) — bidx 백필 대상 아님, 통과
 
@@ -794,36 +794,36 @@ Expected: FAIL — no attribute `find_username_by_factors`
 
 ```python
 def find_username_by_factors(kis_app_key: str, kis_app_secret: str,
-                             deepseek_api_key: str) -> Optional[str]:
+                             llm_key: str) -> Optional[str]:
     """세 자격증명이 모두 정확히 일치하는 단일 유저의 아이디 반환(없으면 None).
     블라인드 인덱스 단일 인덱스 조회 — 전체 복호 없음."""
-    if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(deepseek_api_key)):
+    if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(llm_key)):
         return None
     init()
-    a, b, c = bidx(kis_app_key), bidx(kis_app_secret), bidx(deepseek_api_key)
+    a, b, c = bidx(kis_app_key), bidx(kis_app_secret), bidx(llm_key)
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
             "SELECT username FROM users WHERE kis_app_key_bidx=? AND "
-            "kis_app_secret_bidx=? AND deepseek_api_key_bidx=?", (a, b, c)).fetchone()
+            "kis_app_secret_bidx=? AND llm_key_bidx=?", (a, b, c)).fetchone()
     return row["username"] if row else None
 
 
 def reset_password_by_factors(username: str, kis_app_key: str, kis_app_secret: str,
-                              deepseek_api_key: str, new_password: str) -> bool:
+                              llm_key: str, new_password: str) -> bool:
     """비밀번호 정책을 먼저 검사(정책 위반 → ValueError, 팩터 정오와 무관 — 공격자가
     고른 입력의 약함만 노출, 계정/팩터 정보 무누설: enum 오라클 차단). 그다음 아이디+3팩터
     완전 일치 시에만 새 비밀번호로 재설정. 불일치 시 False(아무 것도 바꾸지 않음)."""
     perr = password_policy_error(new_password or "")
     if perr:
         raise ValueError(perr)
-    if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(deepseek_api_key)):
+    if not (_norm(kis_app_key) and _norm(kis_app_secret) and _norm(llm_key)):
         return False
     init()
-    a, b, c = bidx(kis_app_key), bidx(kis_app_secret), bidx(deepseek_api_key)
+    a, b, c = bidx(kis_app_key), bidx(kis_app_secret), bidx(llm_key)
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
             "SELECT id FROM users WHERE username=? AND kis_app_key_bidx=? AND "
-            "kis_app_secret_bidx=? AND deepseek_api_key_bidx=?",
+            "kis_app_secret_bidx=? AND llm_key_bidx=?",
             (_norm(username), a, b, c)).fetchone()
         if not row:
             return False
@@ -1061,16 +1061,16 @@ def client(tmp_path, monkeypatch):
 
 def test_recover_id_endpoint(client):
     r = client.post("/api/recover_id", json={
-        "kis_app_key": "AKz", "kis_app_secret": "ASz", "deepseek_api_key": "ORz"})
+        "kis_app_key": "AKz", "kis_app_secret": "ASz", "llm_key": "ORz"})
     assert r.status_code == 200 and r.json()["username"] == "zoe"
     bad = client.post("/api/recover_id", json={
-        "kis_app_key": "AKz", "kis_app_secret": "ASz", "deepseek_api_key": "NOPE"})
+        "kis_app_key": "AKz", "kis_app_secret": "ASz", "llm_key": "NOPE"})
     assert bad.status_code == 404
 
 def test_recover_password_endpoint(client):
     ok = client.post("/api/recover_password", json={
         "username": "zoe", "kis_app_key": "AKz", "kis_app_secret": "ASz",
-        "deepseek_api_key": "ORz", "new_password": "BrandN3w$pw"})
+        "llm_key": "ORz", "new_password": "BrandN3w$pw"})
     assert ok.status_code == 200 and ok.json()["ok"] is True
     assert client.post("/api/login", json={
         "username": "zoe", "password": "BrandN3w$pw"}).status_code == 200
@@ -1079,7 +1079,7 @@ def test_recover_password_policy_fail_is_audited_and_400(client, tmp_path):
     from infra import auth_store as A
     r = client.post("/api/recover_password", json={
         "username": "zoe", "kis_app_key": "AKz", "kis_app_secret": "ASz",
-        "deepseek_api_key": "ORz", "new_password": "weak"})
+        "llm_key": "ORz", "new_password": "weak"})
     assert r.status_code == 400
     import json as _j
     lines = (A._AUDIT_PATH).read_text(encoding="utf-8").strip().splitlines()
@@ -1091,23 +1091,23 @@ def test_recover_password_weak_pw_is_400_regardless_of_factors(client):
     # No 400/404 split on factor correctness for a weak password ⇒ no stealth oracle.
     bad = client.post("/api/recover_password", json={
         "username": "zoe", "kis_app_key": "WRONG", "kis_app_secret": "WRONG",
-        "deepseek_api_key": "WRONG", "new_password": "weak"})
+        "llm_key": "WRONG", "new_password": "weak"})
     assert bad.status_code == 400
     good_factors_weak = client.post("/api/recover_password", json={
         "username": "zoe", "kis_app_key": "AKz", "kis_app_secret": "ASz",
-        "deepseek_api_key": "ORz", "new_password": "weak"})
+        "llm_key": "ORz", "new_password": "weak"})
     assert good_factors_weak.status_code == 400
     # strong pw + wrong factors → 404 generic (no reset happened)
     strong_wrong = client.post("/api/recover_password", json={
         "username": "zoe", "kis_app_key": "WRONG", "kis_app_secret": "WRONG",
-        "deepseek_api_key": "WRONG", "new_password": "BrandN3w$pw"})
+        "llm_key": "WRONG", "new_password": "BrandN3w$pw"})
     assert strong_wrong.status_code == 404
 
 def test_client_ip_prefers_cf_connecting_ip(client):
     # CF-Connecting-IP must win over X-Forwarded-For for throttle keying / audit
     r = client.post("/api/recover_id",
                      headers={"CF-Connecting-IP": "9.9.9.9", "X-Forwarded-For": "1.1.1.1"},
-                     json={"kis_app_key":"AKz","kis_app_secret":"ASz","deepseek_api_key":"ORz"})
+                     json={"kis_app_key":"AKz","kis_app_secret":"ASz","llm_key":"ORz"})
     assert r.status_code == 200
     from infra import auth_store as A
     import json as _j
@@ -1136,12 +1136,12 @@ _PUBLIC_PATHS = {"/health", "/api/health", "/", "/favicon.ico",
 class RecoverIdReq(BaseModel):
     kis_app_key: str
     kis_app_secret: str
-    deepseek_api_key: str
+    llm_key: str
 class RecoverPwReq(BaseModel):
     username: str
     kis_app_key: str
     kis_app_secret: str
-    deepseek_api_key: str
+    llm_key: str
     new_password: str
 ```
 
@@ -1203,7 +1203,7 @@ and change the `auth_store.upsert_user(` call (lines 192-197) to drop `dart_key`
     uid = auth_store.upsert_user(
         username=username, password=req.password,
         kis_app_key=req.kis_app_key.strip(), kis_app_secret=req.kis_app_secret.strip(),
-        deepseek_api_key=req.deepseek_api_key.strip(), kis_account_no=req.kis_account_no.strip(),
+        llm_key=req.llm_key.strip(), kis_account_no=req.kis_account_no.strip(),
         kis_base_url=req.kis_base_url.strip())
     auth_store.audit("register", username=username, ip=ip, outcome="ok", detail="")
 ```
@@ -1216,7 +1216,7 @@ async def recover_id(req: RecoverIdReq, request: Request):
     ip = _client_ip(request)
     _throttle(_rl_recover, f"recid:{ip}")
     uname = auth_store.find_username_by_factors(
-        req.kis_app_key, req.kis_app_secret, req.deepseek_api_key)
+        req.kis_app_key, req.kis_app_secret, req.llm_key)
     auth_store.audit("recover_id", username=uname, ip=ip,
                      outcome=("ok" if uname else "fail"), detail="")
     if not uname:
@@ -1230,7 +1230,7 @@ async def recover_password(req: RecoverPwReq, request: Request):
     try:
         ok = auth_store.reset_password_by_factors(
             (req.username or "").strip(), req.kis_app_key, req.kis_app_secret,
-            req.deepseek_api_key, req.new_password)
+            req.llm_key, req.new_password)
     except ValueError as e:
         auth_store.audit("recover_password", username=(req.username or "").strip(),
                          ip=ip, outcome="fail", detail="policy")
