@@ -51,6 +51,10 @@ def indicator_signals(ind: Dict[str, Any]) -> Dict[str, float]:
         s["flow"] = _clamp(float(ind["flow"]))        # 사전 정규화 수급 신호
     if ind.get("high52_prox") is not None:
         s["high52"] = _clamp((float(ind["high52_prox"]) - 0.5) / 0.5)
+    if ind.get("leadlag") is not None:
+        s["leadlag"] = _clamp(float(ind["leadlag"]))   # 선행-후행 신호는 이미 -1..1 (사장 지시 2026-07-21)
+    if ind.get("vol_surge") is not None:
+        s["vol_surge"] = _clamp(float(ind["vol_surge"]))   # 거래량 급증: +100%(2배)→+1 (사장 지시 2026-07-21)
     return s
 
 

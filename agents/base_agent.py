@@ -14,122 +14,8 @@ from infra.error_log import record_error  # 사장 지시 2026-05-19 — 상세 
 logger = logging.getLogger("AGENT")
 KST = timezone(timedelta(hours=9))
 
-# 로컬 GGUF 서버는 호출당 외부 API 비용이 없다.
-_MODEL_PRICING: Dict[str, tuple[float, float]] = {}
-_DEFAULT_PRICING = (0.0, 0.0)
-
-_API_CALL_LOG: List[Dict] = []   # {ts, model, prompt_tokens, completion_tokens, cost_usd, agent}
-_API_LOG_CAP = 500
-
-# 사장 지시 2026-05-21: 비용 표시를 시간(/h)·일(/d)·월(/m)·총누적 으로 선택 가능하게.
-#   • /h(회전식 최근 1시간)는 위 인메모리 _API_CALL_LOG 로 충분(재시작 시 0부터).
-#   • /d·/m·총누적은 재시작에도 살아남아야 하므로 일/월/누적 버킷을 롤업 파일에 O(1) 갱신.
-#     (매 폴링마다 거대한 로그를 재집계하지 않도록 — base_agent 는 서버 프로세스 단일 writer.)
-_COST_ROLLUP_PATH = Path(__file__).resolve().parent.parent / "data" / "api_cost_rollup.json"
-_COST_DAY_KEEP = 90  # 일 버킷 보존 일수 (월/누적은 항상 보존)
-_cost_rollup: Optional[Dict[str, Any]] = None  # 지연 로드 캐시 (None=미로드)
-
-
-def get_api_cost_since(epoch_secs: float) -> float:
-    """epoch_secs 이후의 누적 API 비용(USD)."""
-    return sum(e.get("cost_usd", 0.0) for e in _API_CALL_LOG if e.get("ts", 0) >= epoch_secs)
-
-def get_api_cost_last_cycle(seconds_back: float = 3600.0) -> Dict[str, Any]:
-    """직전 사이클(또는 seconds_back초 동안)의 API 비용·호출 수."""
-    cut = time.time() - seconds_back
-    calls = [e for e in _API_CALL_LOG if e.get("ts", 0) >= cut]
-    return {"cost_usd": sum(e.get("cost_usd", 0.0) for e in calls),
-            "calls": len(calls),
-            "window_sec": seconds_back}
-
-def reset_api_cost_log():
-    _API_CALL_LOG.clear()
-
-
-# ── 영속 롤업 (일/월/누적) ──────────────────────────────────────────────────────
-
-def _load_cost_rollup() -> Dict[str, Any]:
-    base = {"total": {"usd": 0.0, "calls": 0}, "day": {}, "month": {}}
-    try:
-        if _COST_ROLLUP_PATH.exists():
-            d = json.loads(_COST_ROLLUP_PATH.read_text(encoding="utf-8"))
-            if isinstance(d, dict):
-                base["total"] = d.get("total") or base["total"]
-                base["day"] = d.get("day") or {}
-                base["month"] = d.get("month") or {}
-    except Exception as e:
-        logger.warning("api_cost_rollup 로드 실패: %s", e)
-    return base
-
-
-def _save_cost_rollup() -> None:
-    try:
-        _COST_ROLLUP_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _COST_ROLLUP_PATH.write_text(json.dumps(_cost_rollup, ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
-        logger.warning("api_cost_rollup 저장 실패: %s", e)
-
-
-def _ensure_rollup_loaded() -> None:
-    global _cost_rollup
-    if _cost_rollup is None:
-        _cost_rollup = _load_cost_rollup()
-
-
-def _reset_cost_rollup() -> None:
-    """인메모리 롤업 캐시 해제 → 다음 접근 시 파일에서 재로드 (테스트·재로드용)."""
-    global _cost_rollup
-    _cost_rollup = None
-
-
-def _bump_rollup(cost_usd: float, ts: float) -> None:
-    _ensure_rollup_loaded()
-    dt = datetime.fromtimestamp(ts, KST)
-    day, mon = dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m")
-    r = _cost_rollup
-    r["total"]["usd"] = round(r["total"]["usd"] + cost_usd, 8)
-    r["total"]["calls"] += 1
-    d = r["day"].setdefault(day, {"usd": 0.0, "calls": 0})
-    d["usd"] = round(d["usd"] + cost_usd, 8); d["calls"] += 1
-    m = r["month"].setdefault(mon, {"usd": 0.0, "calls": 0})
-    m["usd"] = round(m["usd"] + cost_usd, 8); m["calls"] += 1
-    if len(r["day"]) > _COST_DAY_KEEP:
-        for k in sorted(r["day"])[:-_COST_DAY_KEEP]:
-            r["day"].pop(k, None)
-    _save_cost_rollup()
-
-
-def _record_api_call(model: str, agent: str, prompt_tokens: int, completion_tokens: int,
-                     ts: Optional[float] = None, uid: Optional[int] = None) -> float:
-    """Local LLM usage → 모델 단가로 비용 추정 → 회전식 로그 + 영속 롤업에 적재."""
-    ts = ts if ts is not None else time.time()
-    in_rate, out_rate = _MODEL_PRICING.get(model, _DEFAULT_PRICING)
-    cost = (prompt_tokens / 1_000_000.0) * in_rate + (completion_tokens / 1_000_000.0) * out_rate
-    _API_CALL_LOG.append({"ts": ts, "model": model, "agent": agent, "uid": uid,
-                          "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                          "cost_usd": cost})
-    if len(_API_CALL_LOG) > _API_LOG_CAP:
-        del _API_CALL_LOG[:len(_API_CALL_LOG) - _API_LOG_CAP]
-    _bump_rollup(cost, ts)
-    return cost
-
-
-def cost_summary() -> Dict[str, Any]:
-    """우상단 표시용 — 시간(/h, 회전식)·일(/d)·월(/m)·총누적 비용·호출 수."""
-    _ensure_rollup_loaded()
-    now = time.time()
-    cut = now - 3600.0
-    hcalls = [e for e in _API_CALL_LOG if e.get("ts", 0) >= cut]
-    dt = datetime.fromtimestamp(now, KST)
-    r = _cost_rollup
-    d = r["day"].get(dt.strftime("%Y-%m-%d"), {"usd": 0.0, "calls": 0})
-    m = r["month"].get(dt.strftime("%Y-%m"), {"usd": 0.0, "calls": 0})
-    return {
-        "h": {"usd": sum(e.get("cost_usd", 0.0) for e in hcalls), "calls": len(hcalls)},
-        "d": {"usd": d["usd"], "calls": d["calls"]},
-        "m": {"usd": m["usd"], "calls": m["calls"]},
-        "total": {"usd": r["total"]["usd"], "calls": r["total"]["calls"]},
-    }
+# 사장 지시 2026-07-21: LLM 비용 추적·표시 로직 전면 제거(로컬 GGUF 서버라 호출당 외부 비용 없음).
+# 우상단 비용 배지·/api/cost_mode·롤업 파일 배관을 모두 삭제했다.
 
 
 class BaseAgent:
@@ -170,10 +56,28 @@ class BaseAgent:
         # ── Cost-reduction knobs ──────────────────────────────────────────
         self.max_tokens = AGENT_MAX_TOKENS.get(model_key, AGENT_MAX_TOKENS.get(role, 2048))
         self.history_turns = AGENT_HISTORY_TURNS
+        # Coresight RAG 주입 대상: 프롬프트에 query_coresight 툴 줄이 주입된 에이전트
+        # (= admin 게이트를 이미 통과한 macro/news/post-manager). query_coresight 가
+        # 내부에서 admin 재검증하므로 이중 방어. 비대상이면 None → 주입 안 함.
+        self.coresight_uid = self.uid if "query_coresight" in (system_prompt or "") else None
 
     def register_tool_function(self, name: str, func: Callable):
         """Register a callable function that can be invoked as a tool."""
         self._tool_functions[name] = func
+
+    async def _coresight_context(self, message: str) -> str:
+        """이 메시지에 관련된 Coresight 과거 지식을 검색해 주입용 블록으로 반환.
+        admin 미대상·오류·빈결과면 '' (에이전트 루프 절대 안 죽인다, fail-soft)."""
+        if not getattr(self, "coresight_uid", None):
+            return ""
+        try:
+            from tools.coresight_rag import query_coresight
+            out = await query_coresight((message or "")[:500], top_k=3, uid=self.coresight_uid)
+            if out and not any(k in out for k in ("비활성", "찾지 못했", "설정 오류")):
+                return "[Coresight 과거 지식 — 참고]\n" + out
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[{self.name}] Coresight 주입 실패(무시): {e}")
+        return ""
 
     async def think(self, message: str, context: Optional[str] = None) -> str:
         """
@@ -191,6 +95,11 @@ class BaseAgent:
         # Add trailing conversation history only (was: last 10 messages → now last N, default 3)
         for h in self.conversation_history[-self.history_turns:]:
             messages.append(h)
+
+        # Coresight RAG (opt-in·admin·fail-soft): 이 메시지 관련 과거 지식을 context 에 병합
+        cs_block = await self._coresight_context(message)
+        if cs_block:
+            context = f"{context}\n\n{cs_block}" if context else cs_block
 
         user_content = message
         if context:
@@ -227,9 +136,11 @@ class BaseAgent:
                     f"[{self.name}] 빈 응답 (status=200, finish_reason={_fr}, "
                     f"prompt_tok={_u0.get('prompt_tokens')}, completion_tok={_u0.get('completion_tokens')}, "
                     f"max_tokens={self.max_tokens}) → max_tokens 상향 후 1회 재시도")
-                # ceiling 16000 — 큰 base(예: kimi 12000)에서도 재시도가 'base보다
-                # 큰' 진짜 상향이 되도록 (8000이면 base 12000보다 작아 무의미했음).
-                _retry_max = min(max(self.max_tokens * 2, 4000), 16000)
+                # ceiling 2026-07-21 16000→64000(사장 지시): 추론 ON 에이전트 base 가
+                # 64000 이라 16000 실링은 '상향'이 아니라 오히려 삭감이었다. 로컬 모델 추론이
+                # 1.1k~10.7k 로 길어 빈 응답의 주원인이 예산 부족인 만큼, 재시도는 확실히
+                # 더 큰 예산으로 간다(슬롯 131072 이내).
+                _retry_max = min(max(self.max_tokens * 2, 4000), 64000)
                 try:
                     _d2 = await chat_completion(
                         api_key=self.api_key, model=self.model, messages=messages,
@@ -246,16 +157,6 @@ class BaseAgent:
                 except Exception as _re:
                     record_error(self.name, _re, context=(
                         f"빈응답 재시도 예외 | model={self.model} | max_tokens={_retry_max}"), uid=self.uid)
-
-            # 사장 피드백 2026-05-15: API 사용량 → 비용 추정 → 회전식 로그 + 영속 롤업 적재
-            try:
-                _usage = (data.get("usage") or {})
-                _pt = int(_usage.get("prompt_tokens", 0) or 0)
-                _ct = int(_usage.get("completion_tokens", 0) or 0)
-                _record_api_call(self.model, self.name, _pt, _ct, uid=self.uid)
-            except Exception as _ue:
-                # 클린코드 2026-05-19: 비용 추적 실패가 debug라 운영에서 안 보였음 → warning 승격.
-                logger.warning(f"[{self.name}] 사용량 추적 실패: {type(_ue).__name__}: {_ue!r}")
 
             # Update history (bounded — only the last few exchanges are ever resent anyway)
             self.conversation_history.append({"role": "user", "content": user_content})

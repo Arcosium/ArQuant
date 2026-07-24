@@ -13,7 +13,7 @@ def client(tmp_path, monkeypatch):
                  ("_FERNET_RAW", None), ("_BIDX_KEY", None)]:
         monkeypatch.setattr(a, n, v, raising=False)
     a.init()
-    uid = a.upsert_user("u1", "OldPassw0rd!!", "AK", "AS", "OR", "5012345601",
+    uid = a.upsert_user("u1", "OldPassw0rd!!", "AK", "AS", "5012345601",
                          "https://openapi.koreainvestment.com:9443")
     tok = a.create_session(uid)
     import infra.standing_directives as sd
@@ -79,7 +79,7 @@ def admin_client(tmp_path, monkeypatch):
                  ("_FERNET_RAW", None), ("_BIDX_KEY", None)]:
         monkeypatch.setattr(a, n, v, raising=False)
     a.init()
-    uid = a.upsert_user("hh09080", "AdminPassw0rd!!", "AK", "AS", "OR", "5012345601",
+    uid = a.upsert_user("hh09080", "AdminPassw0rd!!", "AK", "AS", "5012345601",
                          "https://openapi.koreainvestment.com:9443", is_admin=True)
     tok = a.create_session(uid)
     import infra.standing_directives as sd

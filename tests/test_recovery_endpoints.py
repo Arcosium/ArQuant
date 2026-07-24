@@ -10,7 +10,7 @@ def client(tmp_path, monkeypatch):
                  ("_BIDX_KEY", None)]:
         monkeypatch.setattr(A, n, v, raising=False)
     A.init()
-    A.upsert_user("zoe", "Orig$pass99", "AKz", "ASz", "ORz", "1-1", "", "", "")
+    A.upsert_user("zoe", "Orig$pass99", "AKz", "ASz", "1-1", "", "", "")
     from server.app import app
     return TestClient(app)
 

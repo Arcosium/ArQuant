@@ -26,7 +26,7 @@ def _mk(tmp_path, monkeypatch):
 
 def test_members_requires_admin(tmp_path, monkeypatch):
     a = _mk(tmp_path, monkeypatch)
-    uid = a.upsert_user("normal", "Passw0rd!!xx", "AK", "AS", "OR", "1",
+    uid = a.upsert_user("normal", "Passw0rd!!xx", "AK", "AS", "1",
                          "https://openapi.koreainvestment.com:9443")
     tok = a.create_session(uid)
     import server.app as app_mod
@@ -36,9 +36,9 @@ def test_members_requires_admin(tmp_path, monkeypatch):
 
 def test_admin_list_and_delete(tmp_path, monkeypatch):
     a = _mk(tmp_path, monkeypatch)
-    admin = a.upsert_user("hh09080", "Passw0rd!!xx", "AK", "AS", "OR", "1",
+    admin = a.upsert_user("hh09080", "Passw0rd!!xx", "AK", "AS", "1",
                           "https://openapi.koreainvestment.com:9443", is_admin=True)
-    victim_uid = a.upsert_user("victim", "Passw0rd!!xx", "AK2", "AS2", "OR2", "2",
+    victim_uid = a.upsert_user("victim", "Passw0rd!!xx", "AK2", "AS2", "2",
                                "https://openapivts.koreainvestment.com:29443")
     tok = a.create_session(admin)
     import server.app as app_mod
@@ -70,7 +70,7 @@ def test_admin_list_and_delete(tmp_path, monkeypatch):
 
 def test_delete_nonexistent_returns_404(tmp_path, monkeypatch):
     a = _mk(tmp_path, monkeypatch)
-    admin = a.upsert_user("hh09080", "Passw0rd!!xx", "AK", "AS", "OR", "1",
+    admin = a.upsert_user("hh09080", "Passw0rd!!xx", "AK", "AS", "1",
                           "https://openapi.koreainvestment.com:9443", is_admin=True)
     tok = a.create_session(admin)
     import server.app as app_mod

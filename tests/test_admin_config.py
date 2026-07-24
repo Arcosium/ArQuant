@@ -6,8 +6,21 @@
 import importlib
 from pathlib import Path
 
+import pytest
+
 import infra.admin_config as ac
 import config
+
+
+@pytest.fixture(autouse=True)
+def _isolate_admin_config(tmp_path, monkeypatch):
+    """실 data/admin_config.json 격리 (2026-07-22).
+
+    admin_config._PATH 는 QUANTINSIGHT_DATA_DIR 을 타지 않는 하드코딩 경로라, 격리 없이
+    pytest 를 돌리면 아래 _reset() 이 **사장의 라이브 ADMIN 설정**(에이전트 모델 오버라이드·
+    뉴스 크롤 주기)을 실제로 초기화해 버린다. _PATH 는 _read()/set_config() 가 호출 시점에
+    읽는 모듈 전역이므로 여기 한 곳만 갈아끼우면 전 경로가 tmp 로 간다."""
+    monkeypatch.setattr(ac, "_PATH", tmp_path / "admin_config.json")
 
 
 def _reset():

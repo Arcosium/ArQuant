@@ -1,8 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+
+def _clean_site_msg(text: str, cap: int = 140) -> str:
+    """사이트 응답 문자열을 로그 한 줄로 정제(사장 지시 2026-07-21) — 페이지 표 덤프가 새어들어도
+    의미 있는 오류 문구만 뽑아 표시하고, 없으면 앞부분만 잘라 로그가 깨지지 않게 한다."""
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not s:
+        return "확인 안 됨"
+    for pat in (r"\[TMS\][^.]{0,120}", r"[^ ]*섹터[^.]{0,90}한도[^.]{0,60}",
+                r"여유\s*부족[^.]{0,80}", r"규칙\s*위반[^.]{0,80}", r"미접수[^.]{0,60}", r"미체결[^.]{0,60}"):
+        m = re.search(pat, s)
+        if m:
+            return m.group(0).strip()[:cap]
+    return s[:cap]
 
 from infra.kis_broker import OrderDraft
 from Auto_folio.autofolio import contest_store
@@ -265,7 +280,7 @@ class TimefolioBroker:
                     "qty": qty, "price": price,
                     "result": f"Timefolio 주문 {state}: {ticker} {side} {qty}주"}
         return {"ok": False, "accepted": False, "filled": False, "qty": qty, "price": price,
-                "result": f"Timefolio 주문 실패: {res.get('result') or 'unknown'}"}
+                "result": f"Timefolio 주문 실패: {_clean_site_msg(res.get('result'))}"}
 
     async def place_order(self, order: OrderDraft) -> str:
         """기존 문자열 인터페이스 (KIS 파이프라인 호환) — place_order_ex 의 얇은 래퍼."""

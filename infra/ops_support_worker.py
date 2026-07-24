@@ -744,15 +744,20 @@ def _handle_param_tuning(plan: Dict[str, Any], actor_uid: Optional[int], role: s
             _review_lines = []
             for _k, _v in _to_review.items():
                 _cur = runtime.get(_k, uid=int(actor_uid))
+                # 사장 지시 2026-07-21: proposed == current(예: true→true)는 실제 변경이 없으므로
+                # 승인 대기함에 넣지 않는다(혼란스러운 no-op 승인 요청 방지).
+                if _v == _cur:
+                    continue
                 policy_approval_inbox.enqueue(int(actor_uid), _k, _v, _cur, rationale)
                 _review_lines.append(f"  • {_k}: {_cur} → {_v}")
-            import main_swarm
-            main_swarm.log_response_event({
-                "source": "system_event", "type": "agent_msg",
-                "agent": display,
-                "message": ("🔐 [정책 변경 승인 요청] 토요일 점검에서 아래 정책 플래그 변경을 제안합니다 — "
-                            "대시보드 '정책 변경 승인 대기'에서 승인해야 적용됩니다:\n" + "\n".join(_review_lines)),
-            }, uid=int(actor_uid))
+            if _review_lines:   # 실제 변경 제안이 있을 때만 승인 요청 알림
+                import main_swarm
+                main_swarm.log_response_event({
+                    "source": "system_event", "type": "agent_msg",
+                    "agent": display,
+                    "message": ("🔐 [정책 변경 승인 요청] 토요일 점검에서 아래 정책 플래그 변경을 제안합니다 — "
+                                "대시보드 '정책 변경 승인 대기'에서 승인해야 적용됩니다:\n" + "\n".join(_review_lines)),
+                }, uid=int(actor_uid))
         except Exception as e:
             logger.warning(f"정책 승인 회부 실패: {e}")
     # 사장 지시 2026-06-09 #7 — cycle 에서 회부된 weekly-tier 제안을 토요일 검증 큐에 적재 + 고지.

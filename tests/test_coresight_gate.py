@@ -35,6 +35,22 @@ def isolated_directives(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def no_external_coresight(monkeypatch):
+    """query_coresight 의 **외부 소스**(ArcAI.ve 위키 HTTP :8080 · arcembed 임베딩 :8765)를 끊는다.
+
+    .env 의 CORESIGHT_RAG_MODE=hybrid 때문에 운영에선 _rank_hybrid 가 돈다. 이 테스트들이
+    검증하려는 건 'admin 게이트 통과 후 CORESIGHT_PATH 의 매칭 파일이 결과에 나온다'인데,
+    라이브 위키가 떠 있으면 위키 가중치(2.0) 항목들이 top_k 를 채워 tmp 파일이 밀려나
+    결과가 **네트워크 상태에 따라** 달라졌다(전체 실행에서 실패한 원인).
+    hybrid 경로는 그대로 태우되(운영 모드 유지) 외부 소스만 '미가용'으로 만들면,
+    코드의 fail-soft 폴백까지 함께 검증되면서 결정론적이 된다."""
+    import tools.coresight_rag as cr
+    monkeypatch.setattr(cr, "_wiki_search", lambda *a, **k: [])
+    monkeypatch.setattr(cr, "_arcembed", lambda: None)
+    return cr
+
+
+@pytest.fixture
 def admin_uid():
     return 1
 
@@ -86,7 +102,7 @@ async def test_query_coresight_nonadmin_no_exception(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_query_coresight_admin_path_no_crash(monkeypatch, tmp_path):
+async def test_query_coresight_admin_path_no_crash(monkeypatch, tmp_path, no_external_coresight):
     """관리자 활성 계정 → admin 경로 진입. Coresight 파일 없어도 크래시 없음."""
     import tools.coresight_rag as cr
 
@@ -101,7 +117,8 @@ async def test_query_coresight_admin_path_no_crash(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_query_coresight_admin_finds_matching_file(monkeypatch, tmp_path):
+async def test_query_coresight_admin_finds_matching_file(monkeypatch, tmp_path,
+                                                         no_external_coresight):
     """관리자 활성 계정 + 매칭 파일 → 검색 결과 반환."""
     import tools.coresight_rag as cr
     import config as _cfg

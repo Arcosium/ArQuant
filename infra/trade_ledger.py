@@ -260,6 +260,59 @@ def apply_fill(uid, *, ticker: str, side: str, qty, price=None, ccy: str = None,
     return True
 
 
+def recent_loss_streak(uid) -> int:
+    """가장 최근 매도부터 연속된 손실 **거래** 횟수(회로차단용, 사장 지시 2026-07-21).
+    승리 거래(또는 매도 없음)를 만나면 중단. 원장 fills 는 시간순 append 라 역순 순회.
+
+    ⚠️ 부분체결 보정 (사장 지시 2026-07-22): 종전엔 **체결(fill) 단위**로 셌다. 매도 주문 하나가
+    호가에 잘려 여러 조각으로 체결되면 조각마다 손실이 찍혀, 경제적으로는 한 번의 매도가
+    '연속 손절 N회'가 됐다 — 실측(uid2): 148070 매도 1건이 13조각으로 나뉘어 streak 18 을
+    만들었고(합계 -72,098원 = 1억 계좌의 -0.07%) 임계값 3 을 넘겨 **신규 매수가 전면 차단**됐다.
+    이 가드의 취지는 '전략이 연속으로 깨지고 있다'이지 '주문이 잘게 잘렸다'가 아니다.
+
+    그래서 **연속된 같은 종목 매도를 한 거래로 묶어** 실현손익을 합산한 뒤 센다.
+    같은 종목을 되산 뒤 다시 판 것은 별개 거래이므로, 사이에 그 종목 **매수**가 있으면 묶음을 끊는다.
+    """
+    led = load(uid)
+    if led is None:
+        return 0
+    streak = 0
+    cur_ticker = None          # 현재 묶고 있는 매도 종목
+    cur_realized = 0.0
+    cur_open = False           # 묶음 진행 중 여부
+
+    def _close(realized: float) -> bool:
+        """묶음 1건 확정 → 손실이면 streak+1(계속), 아니면 중단 신호(False)."""
+        nonlocal streak
+        if realized < 0:
+            streak += 1
+            return True
+        return False
+
+    for f in reversed(led.get("fills") or []):
+        side = str(f.get("side") or "").lower()
+        tkr = str(f.get("ticker") or "")
+        if side == "buy":
+            # 같은 종목 재매수 = 그 앞쪽 매도는 별개 거래 → 진행 중인 묶음을 여기서 확정한다.
+            if cur_open and tkr == cur_ticker:
+                if not _close(cur_realized):
+                    return streak
+                cur_open, cur_ticker, cur_realized = False, None, 0.0
+            continue
+        if side != "sell" or f.get("realized") is None:
+            continue
+        if cur_open and tkr == cur_ticker:
+            cur_realized += _f(f.get("realized"))       # 같은 매도의 다른 조각 — 합산
+            continue
+        if cur_open:                                    # 종목이 바뀜 = 앞 묶음 확정
+            if not _close(cur_realized):
+                return streak
+        cur_ticker, cur_realized, cur_open = tkr, _f(f.get("realized")), True
+    if cur_open:
+        _close(cur_realized)
+    return streak
+
+
 def realized_stats(uid, fx: float = 0.0) -> dict:
     """원장 fills 의 권위 실현손익(매도 'realized' 필드)을 KR/US 분리 집계 — 운용지원실장 피드백용
     (버그 E·F3, 2026-06-18). trade_log 부분체결 재방출 이중계상 비의존(멱등 원장). USD 는 fx 로 원화환산.

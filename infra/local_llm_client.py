@@ -23,8 +23,16 @@ _THINK_SUFFIX = "+thinking"
 # 400/401/402/422 같은 영구 오류는 재시도하지 않고 즉시 실패한다.
 _RETRYABLE_STATUS = (429, 500, 503)
 _MAX_ATTEMPTS = 3
-_LOCAL_LLM_GRACE_SEC = int(os.environ.get("LOCAL_LLM_GRACE_SEC", "1800"))
-_LOCAL_LLM_TIMEOUT_SEC = int(os.environ.get("LOCAL_LLM_TIMEOUT_SEC", "900"))
+# 사장 지시 2026-07-22 상향 (900→1800 / 1800→3600).
+# 이 두 값은 config.AGENT_MAX_TOKENS 의 pro 티어 예산과 **짝을 이뤄야 한다** — 예산이 타임아웃보다
+# 길면 예산을 다 쓰는 생성이 구조적으로 완주하지 못하고, 재시도는 토큰 0부터 다시 시작해 그레이스만
+# 태우다 최종 실패한다(2026-07-22 관측: 24h 재시도 13회·최종 실패 4회, 전부 thinking ON 에이전트).
+#   실측 디코드 53 t/s · pro 예산 40000 → 755초 소요.
+#   TIMEOUT 1800 = 2.4배 여유(GPU 경합·프롬프트 길이 변동 흡수).
+#   GRACE   3600 = 타임아웃의 2배 — 모델 재기동 중 끊긴 경우 재시도 1회를 보장한다.
+# 예산을 다시 올릴 일이 있으면 여기 타임아웃도 같이 올릴 것.
+_LOCAL_LLM_GRACE_SEC = int(os.environ.get("LOCAL_LLM_GRACE_SEC", "3600"))
+_LOCAL_LLM_TIMEOUT_SEC = int(os.environ.get("LOCAL_LLM_TIMEOUT_SEC", "1800"))
 
 
 class LocalLLMError(RuntimeError):

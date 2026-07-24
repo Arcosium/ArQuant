@@ -250,7 +250,6 @@ def init() -> None:
                 password_enc TEXT NOT NULL,   -- DEPRECATED: 항상 '' (비밀번호는 password_hash=argon2id). 하위호환 위해 컬럼만 유지
                 kis_app_key_enc TEXT NOT NULL,
                 kis_app_secret_enc TEXT NOT NULL,
-                llm_key_enc TEXT NOT NULL,
                 kis_account_no_enc TEXT NOT NULL,
                 kis_base_url TEXT NOT NULL,
                 dart_key_enc TEXT NOT NULL DEFAULT '',
@@ -272,22 +271,18 @@ def init() -> None:
         # ── 마이그레이션: is_admin 컬럼 (사장 피드백 2026-05-18) ──
         # CREATE TABLE IF NOT EXISTS 는 기존 DB에 컬럼을 추가하지 못하므로 ALTER 로 보강.
         cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
-        legacy_llm_encs = ["open" + "router_key_enc", "deep" + "seek_api_key_enc"]
-        legacy_llm_bidxs = ["open" + "router_key_bidx", "deep" + "seek_api_key_bidx"]
-        for legacy_enc in legacy_llm_encs:
-            if legacy_enc in cols and "llm_key_enc" not in cols:
-                conn.execute(f"ALTER TABLE users RENAME COLUMN {legacy_enc} TO llm_key_enc")
-                cols.remove(legacy_enc); cols.add("llm_key_enc")
-                break
-        for legacy_bidx in legacy_llm_bidxs:
-            if legacy_bidx in cols and "llm_key_bidx" not in cols:
-                conn.execute(f"ALTER TABLE users RENAME COLUMN {legacy_bidx} TO llm_key_bidx")
-                cols.remove(legacy_bidx); cols.add("llm_key_bidx")
-                break
-        if "llm_key_enc" not in cols:
-            conn.execute("ALTER TABLE users ADD COLUMN llm_key_enc TEXT NOT NULL DEFAULT ''")
-            cols.add("llm_key_enc")
-            logger.info("auth_store 마이그레이션: users.llm_key_enc 컬럼 추가")
+        # 2026-07: 로컬 LLM 전환으로 per-user LLM 키(구 DeepSeek/OpenRouter) 폐기.
+        # 남아있던 llm_key_enc/bidx (및 더 옛 이름) 컬럼을 기존 DB에서 제거.
+        for _dead in ("llm_key_enc", "llm_key_bidx",
+                      "open" + "router_key_enc", "open" + "router_key_bidx",
+                      "deep" + "seek_api_key_enc", "deep" + "seek_api_key_bidx"):
+            if _dead in cols:
+                try:
+                    conn.execute(f"ALTER TABLE users DROP COLUMN {_dead}")
+                    cols.discard(_dead)
+                    logger.info("auth_store 마이그레이션: users.%s 컬럼 제거(로컬 LLM 전환)", _dead)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("auth_store 마이그레이션: %s 제거 실패 — %s", _dead, e)
         if "is_admin" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
             logger.info("auth_store 마이그레이션: users.is_admin 컬럼 추가")
@@ -306,7 +301,7 @@ def init() -> None:
         else:
             conn.execute("UPDATE users SET is_admin=0")
         for _c in ("password_hash", "kis_app_key_bidx",
-                   "kis_app_secret_bidx", "llm_key_bidx",
+                   "kis_app_secret_bidx",
                    "kis_account_no_bidx"):
             if _c not in cols:
                 conn.execute(
@@ -332,7 +327,7 @@ def username_exists(username: str) -> bool:
 
 
 def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: str,
-                llm_key: str, kis_account_no: str, kis_base_url: str,
+                kis_account_no: str, kis_base_url: str,
                 dart_key: str = "", label: str = "", is_admin: bool = False,
                 account_mode: str = TRADING_MODE) -> int:
     """username 기준 upsert. 비밀번호는 argon2id 해시로만 저장(password_enc 미사용),
@@ -349,14 +344,12 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
         password_hash=hash_password(password),
         kis_app_key_enc=encrypt(kis_app_key),
         kis_app_secret_enc=encrypt(kis_app_secret),
-        llm_key_enc=encrypt(llm_key),
         kis_account_no_enc=encrypt(kis_account_no),
         kis_base_url=base_url,
         dart_key_enc=encrypt(dart_key) if (dart_key or "").strip() else "",
         label=label,
         kis_app_key_bidx=bidx(kis_app_key),
         kis_app_secret_bidx=bidx(kis_app_secret),
-        llm_key_bidx=bidx(llm_key),
         kis_account_no_bidx=bidx(kis_account_no),
     )
     with _DB_LOCK, _connect() as conn:
@@ -365,32 +358,32 @@ def upsert_user(username: str, password: str, kis_app_key: str, kis_app_secret: 
             uid = int(row["id"])
             conn.execute(
                 """UPDATE users SET password_hash=?, password_enc='',
-                   kis_app_key_enc=?, kis_app_secret_enc=?, llm_key_enc=?,
+                   kis_app_key_enc=?, kis_app_secret_enc=?,
                    kis_account_no_enc=?, kis_base_url=?, dart_key_enc=?, label=?,
-                   kis_app_key_bidx=?, kis_app_secret_bidx=?, llm_key_bidx=?,
+                   kis_app_key_bidx=?, kis_app_secret_bidx=?,
                    kis_account_no_bidx=?,
                    account_mode=?, last_login_at=?, last_validated_at=? WHERE id=?""",
                 (vals["password_hash"], vals["kis_app_key_enc"], vals["kis_app_secret_enc"],
-                 vals["llm_key_enc"], vals["kis_account_no_enc"], vals["kis_base_url"],
+                 vals["kis_account_no_enc"], vals["kis_base_url"],
                  vals["dart_key_enc"], vals["label"], vals["kis_app_key_bidx"],
-                 vals["kis_app_secret_bidx"], vals["llm_key_bidx"],
+                 vals["kis_app_secret_bidx"],
                  vals["kis_account_no_bidx"], account_mode, now, now, uid),
             )
             return uid
         adm = 1 if (is_admin or username in ADMIN_USERNAMES) else 0
         cur = conn.execute(
             """INSERT INTO users (username, password_enc, password_hash,
-               kis_app_key_enc, kis_app_secret_enc, llm_key_enc,
+               kis_app_key_enc, kis_app_secret_enc,
                kis_account_no_enc, kis_base_url, dart_key_enc, label,
-               kis_app_key_bidx, kis_app_secret_bidx, llm_key_bidx,
+               kis_app_key_bidx, kis_app_secret_bidx,
                kis_account_no_bidx,
                is_admin, account_mode, created_at, last_login_at, last_validated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (username, "", vals["password_hash"], vals["kis_app_key_enc"],
-             vals["kis_app_secret_enc"], vals["llm_key_enc"],
+             vals["kis_app_secret_enc"],
              vals["kis_account_no_enc"], vals["kis_base_url"], vals["dart_key_enc"],
              vals["label"], vals["kis_app_key_bidx"], vals["kis_app_secret_bidx"],
-             vals["llm_key_bidx"], vals["kis_account_no_bidx"],
+             vals["kis_account_no_bidx"],
              adm, account_mode, now, now, now),
         )
         return int(cur.lastrowid)
@@ -404,7 +397,6 @@ def _row_to_creds(row: sqlite3.Row) -> Dict[str, Any]:
         "password_hash": row["password_hash"] if "password_hash" in row.keys() else "",
         "kis_app_key": decrypt(row["kis_app_key_enc"]),
         "kis_app_secret": decrypt(row["kis_app_secret_enc"]),
-        "llm_key": decrypt(row["llm_key_enc"]),
         "kis_account_no": decrypt(row["kis_account_no_enc"]),
         "kis_base_url": row["kis_base_url"],
         "dart_key": decrypt(row["dart_key_enc"]) if row["dart_key_enc"] else "",
@@ -657,7 +649,7 @@ def create_subprofile(owner_uid: int, kind: str, *, kis_app_key: str = "",
     mode = TIMEFOLIO_MODE if kind == PROFILE_TIMEFOLIO else TRADING_MODE
     uid = upsert_user(
         username=name, password=secrets.token_urlsafe(24) + "!",
-        kis_app_key=kis_app_key, kis_app_secret=kis_app_secret, llm_key="",
+        kis_app_key=kis_app_key, kis_app_secret=kis_app_secret,
         kis_account_no=kis_account_no,
         kis_base_url=(kis_base_url or "https://openapi.koreainvestment.com:9443"),
         label=f"{owner['username']} · {PROFILE_KIND_LABELS.get(kind, kind)}",
@@ -768,8 +760,8 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             "SELECT id, password_enc, password_hash, "
-            "kis_app_key_enc, kis_app_secret_enc, llm_key_enc, "
-            "kis_app_key_bidx, kis_app_secret_bidx, llm_key_bidx, "
+            "kis_app_key_enc, kis_app_secret_enc, "
+            "kis_app_key_bidx, kis_app_secret_bidx, "
             "kis_account_no_enc, kis_account_no_bidx FROM users"
         ).fetchall()
         for r in rows:
@@ -796,11 +788,9 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                 if not (r["kis_app_key_bidx"] or ""):
                     enc_key = r["kis_app_key_enc"] or ""
                     enc_secret = r["kis_app_secret_enc"] or ""
-                    enc_llm = r["llm_key_enc"] or ""
                     if enc_key and enc_secret:
                         dec_key = decrypt(enc_key)
                         dec_secret = decrypt(enc_secret)
-                        dec_llm = decrypt(enc_llm) if enc_llm else ""
                         if not (dec_key and dec_secret):
                             logger.error(
                                 "auth 마이그레이션: user_id=%s KIS enc 복호 실패 — bidx 백필 스킵",
@@ -808,8 +798,6 @@ def migrate_passwords_and_bidx() -> Dict[str, int]:
                             continue
                         updates["kis_app_key_bidx"] = bidx(dec_key)
                         updates["kis_app_secret_bidx"] = bidx(dec_secret)
-                        if dec_llm:
-                            updates["llm_key_bidx"] = bidx(dec_llm)
                         did_bidx = True
                     # enc 자체가 비어있는 경우(빈 enc) — bidx 백필 대상 아님, 통과
 
@@ -908,6 +896,46 @@ def list_members() -> List[Dict[str, Any]]:
     } for r in rows]
 
 
+# 회원관리 표시용 짧은 기능명 (사장 지시 2026-07-21).
+PROFILE_KIND_LABELS_SHORT = {PROFILE_KIS_REAL: "실전", PROFILE_KIS_PAPER: "모의",
+                             PROFILE_TIMEFOLIO: "타임폴리오"}
+
+
+def admin_member_overview() -> List[Dict[str, Any]]:
+    """ADMIN 회원관리용 — 로그인 계정(owner_id=0)만 보이고, 통합 계정의 서브 프로필은
+    마스터에 접혀 '활성 기능(실전/모의/타임폴리오)' 목록으로 표시된다(사장 지시 2026-07-21).
+    관전 계정은 functions=['관전'].
+
+    is_mock: 이 회원에게 **실전 매매 프로필이 없으면** True(= 모의/관전 전용). 계정 통합
+    (2026-07-21) 전에는 /api/admin/members 가 list_members() 를 태워 회원행의 Base URL 하나로
+    is_mock 을 내려줬는데, 통합 개편에서 이 라우트를 admin_member_overview() 로 갈아끼우며
+    키가 통째로 사라졌다 — 회귀다. 구 대시보드(server/static/legacy.html loadMembers())가
+    아직 m.is_mock 으로 '모의/실거래' 배지를 그리므로(undefined → 전원 '실거래' 오표시)
+    되살린다. 단, 통합 계정은 실전+모의를 동시에 가질 수 있어 '회원행 URL' 이 아니라
+    '실전 프로필 보유 여부'로 판정한다(현행 UI 는 functions 배지를 쓴다)."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, username, account_mode, is_admin FROM users "
+            "WHERE owner_id=0 OR owner_id IS NULL ORDER BY id ASC").fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        uid = int(r["id"])
+        mode = (r["account_mode"] if "account_mode" in r.keys() else TRADING_MODE)
+        kinds: set = set()
+        if mode == VIEWER_MODE:
+            funcs = ["관전"]
+        else:
+            kinds = {p["kind"] for p in list_profiles(uid)}
+            funcs = [PROFILE_KIND_LABELS_SHORT[k] for k in PROFILE_KIND_ORDER if k in kinds]
+            if not funcs:
+                funcs = ["관전"]   # 매매 프로필이 하나도 없으면 실질 관전
+        out.append({"id": uid, "username": r["username"],
+                    "is_admin": bool(r["is_admin"]), "functions": funcs,
+                    "is_mock": PROFILE_KIS_REAL not in kinds})
+    return out
+
+
 def change_password(user_id: int, current: str, new_password: str) -> bool:
     """현재 비번 검증 → 신규 정책 검사 → argon2 해시 갱신.
     현재 비번 불일치/정책 위반 → ValueError."""
@@ -924,7 +952,7 @@ def change_password(user_id: int, current: str, new_password: str) -> bool:
     return True
 
 
-def update_credentials(user_id: int, *, llm_key: Optional[str] = None,
+def update_credentials(user_id: int, *,
                         kis_app_key: Optional[str] = None,
                         kis_app_secret: Optional[str] = None,
                         kis_account_no: Optional[str] = None,
@@ -932,9 +960,6 @@ def update_credentials(user_id: int, *, llm_key: Optional[str] = None,
     """제공된 자격증명만 갱신(None=미변경). 변경분 enc + bidx 동시 재계산."""
     init()
     sets, params = [], []
-    if llm_key is not None:
-        sets += ["llm_key_enc=?", "llm_key_bidx=?"]
-        params += [encrypt(llm_key), bidx(llm_key)]
     if kis_app_key is not None:
         sets += ["kis_app_key_enc=?", "kis_app_key_bidx=?"]
         params += [encrypt(kis_app_key), bidx(kis_app_key)]
@@ -1029,7 +1054,7 @@ def bootstrap_from_env() -> Optional[int]:
     uid = upsert_user(
         username=bu, password=bp,
         kis_app_key=KIS_APP_KEY, kis_app_secret=KIS_APP_SECRET,
-        llm_key="", kis_account_no=KIS_ACCOUNT_NO,
+        kis_account_no=KIS_ACCOUNT_NO,
         kis_base_url=KIS_BASE_URL, dart_key=OPENDART_API_KEY or "",
         label="사장님 (.env 시드 · ADMIN)", is_admin=True,
     )

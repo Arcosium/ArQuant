@@ -97,38 +97,77 @@ def _semantic_index(path):
     return ix
 
 
+def _summary_of(fp):
+    try:
+        d = json.load(open(fp, encoding="utf-8"))
+        rk = (d.get("refined_knowledge") or {}) if isinstance(d, dict) else {}
+        return rk.get("summary") or (d.get("extracted_text", "")[:500]
+                                     if isinstance(d, dict) else "")
+    except Exception:
+        return ""
+
+
+def _wiki_search(query, top_k, base_url=None):
+    """ArcAI.ve Coresight 위키 하이브리드 검색(큐레이션 지식+세션 다이제스트). fail-soft→[]."""
+    import urllib.request as _u
+    base = (base_url or os.getenv("CORESIGHT_WIKI_URL", "http://127.0.0.1:8080")).rstrip("/")
+    try:
+        req = _u.Request(base + "/api/coresight/search_entries",
+                         data=json.dumps({"query": query}).encode(),
+                         headers={"Content-Type": "application/json"}, method="POST")
+        with _u.urlopen(req, timeout=4) as r:
+            return (json.loads(r.read()).get("entries") or [])[:top_k]
+    except Exception as e:
+        logger.debug("Coresight 위키 검색 실패(무시): %s", e)
+        return []
+
+
 def _rank_hybrid(query, keyword_results, path, top_k, mode):
-    """키워드 결과 + 시맨틱 검색을 RRF 로 병합. 실패 시 키워드 top_k."""
-    ae = _arcembed()
-    ix = _semantic_index(path)
-    if ae is None or ix is None:
-        return keyword_results[:top_k]
-    sem = ix.search(ae.embed(query), k=max(top_k * 3, 15))  # [(path, score, meta)]
-    kw_rank = {r["path"]: i for i, r in enumerate(keyword_results)}
-    sem_rank = {p: i for i, (p, s, m) in enumerate(sem)}
-    kw_by_path = {r["path"]: r for r in keyword_results}
+    """3소스 RRF 병합: 키워드(logs) + 시맨틱(logs) + 위키(큐레이션+세션). 실패분은 자동 제외."""
+    meta_by_id, ranks = {}, {"kw": {}, "sem": {}, "wiki": {}}
+
+    # 1) 키워드(logs) — 항상 있음
+    for i, r in enumerate(keyword_results):
+        ranks["kw"][r["path"]] = i
+        meta_by_id[r["path"]] = r
+
+    # 2) 시맨틱(logs) — arcembed 가용 시
+    ae, ix = _arcembed(), None
+    try:
+        ix = _semantic_index(path)
+    except Exception as e:
+        logger.debug("Coresight 시맨틱 인덱스 실패: %s", e)
+    if ae is not None and ix is not None:
+        for i, (p, s, m) in enumerate(ix.search(ae.embed(query), k=max(top_k * 3, 15))):
+            ranks["sem"][p] = i
+            meta_by_id.setdefault(p, {"title": os.path.basename(p).replace(".json", ""),
+                                      "score": 0, "summary": _summary_of(p), "path": p})
+
+    # 3) 위키(큐레이션+세션 다이제스트) — "둘 다" 병합. env CORESIGHT_RAG_WIKI=0 로 끔.
+    if os.getenv("CORESIGHT_RAG_WIKI", "1") != "0":
+        for i, e in enumerate(_wiki_search(query, max(top_k * 2, 10))):
+            wid = "wiki:" + str(e.get("source_file") or e.get("source_id") or e.get("title") or i)
+            ranks["wiki"][wid] = i
+            title = e.get("title") or e.get("source_name") or e.get("source_file") or "위키"
+            meta_by_id.setdefault(wid, {"title": "[위키] " + str(title), "score": 0,
+                                        "summary": (e.get("summary") or ""), "path": wid})
+
     if mode == "semantic":
-        order = [p for p, _, _ in sem]
-    else:  # hybrid RRF (k=60 관례)
-        order = sorted(set(kw_rank) | set(sem_rank),
-                       key=lambda p: 1.0 / (60 + kw_rank.get(p, 10**6))
-                       + 1.0 / (60 + sem_rank.get(p, 10**6)), reverse=True)
-    out = []
-    for p in order[:top_k]:
-        if p in kw_by_path:
-            out.append(kw_by_path[p])
-            continue
-        summary = ""
-        try:
-            d = json.load(open(p, encoding="utf-8"))
-            rk = (d.get("refined_knowledge") or {}) if isinstance(d, dict) else {}
-            summary = (rk.get("summary") or (d.get("extracted_text", "")[:500]
-                       if isinstance(d, dict) else ""))
-        except Exception:
-            pass
-        out.append({"title": os.path.basename(p).replace(".json", ""),
-                    "score": 0, "summary": summary, "path": p})
-    return out
+        cand = set(ranks["sem"]) | set(ranks["wiki"]) or set(ranks["kw"])
+    else:
+        cand = set(meta_by_id)
+
+    # 소스 가중치: 위키(큐레이션+세션다이제스트) > 시맨틱(logs) > 키워드(logs, 잡음 많음).
+    # coresight_logs 는 잡업로드라 키워드 매칭이 다수 spurious → 낮게. env 로 조정 가능.
+    _W = {"kw": float(os.getenv("CORESIGHT_W_KW", "0.7")),
+          "sem": float(os.getenv("CORESIGHT_W_SEM", "1.0")),
+          "wiki": float(os.getenv("CORESIGHT_W_WIKI", "2.0"))}
+
+    def rrf(cid):
+        return sum(_W[src] / (60 + ranks[src].get(cid, 10**6)) for src in ranks)
+
+    order = sorted(cand, key=rrf, reverse=True)
+    return [meta_by_id[cid] for cid in order[:top_k]]
 
 
 async def query_coresight(query: str, top_k: int = 5, uid: Optional[int] = None) -> str:

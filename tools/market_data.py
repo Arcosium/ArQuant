@@ -264,7 +264,14 @@ def format_indices_for_macro(data: Optional[Dict[str, Dict]] = None) -> str:
     rows, missing = [], []
     for key, d in data.items():
         if d["ok"]:
-            r = f"{d['rate']:+.2f}%" if d["rate"] is not None else "n/a"
+            # 등락률이 없을 때(WTI 등 일부 소스) 전일대비·현재가로 역산 — 'n/a' 를 LLM이
+            # '+0.70.00' 처럼 깨뜨려 인용하던 문제 방지(사장 지시 2026-07-21).
+            _rate = d["rate"]
+            if _rate is None and d.get("change") is not None and d.get("value"):
+                _prev = d["value"] - d["change"]
+                if _prev:
+                    _rate = d["change"] / _prev * 100.0
+            r = f"{_rate:+.2f}%" if _rate is not None else "n/a"
             c = f"{d['change']:+,.2f}" if d["change"] is not None else "n/a"
             rows.append(f"- {d['name']} ({key}): 현재가={d['value']:,.2f} | 전일대비={c} | 등락률={r}")
         else:
@@ -687,6 +694,23 @@ def compute_quant_indicators(code: str, daily=None, investor=None) -> dict:
     cmf = _cmf(daily, 20)
     if cmf is not None:
         out["cmf"] = cmf
+    # 거래량 급증(사장 지시 2026-07-21) — 당일 거래량 / 직전 20일 평균 - 1 (0=평균, +1=2배)
+    try:
+        _vol = daily['volume'].astype(float)
+        if len(_vol) >= 21:
+            _avg20 = float(_vol.iloc[-21:-1].mean())
+            if _avg20 > 0:
+                out["vol_surge"] = float(_vol.iloc[-1]) / _avg20 - 1.0
+    except Exception:
+        pass
+    # 갭업(사장 지시 2026-07-21) — 당일 시가 대비 전일 종가 %(추격 회피 필터용, 신호 아님)
+    try:
+        if len(daily) >= 2 and 'open' in daily.columns:
+            _pc = float(close.iloc[-2]); _to = float(daily['open'].astype(float).iloc[-1])
+            if _pc > 0:
+                out["gap_up_pct"] = (_to / _pc - 1.0) * 100.0
+    except Exception:
+        pass
     # flow — 외인+기관 순매수를 거래량 대비 비율로 정규화([-1,1] 사전정규화 신호)
     if investor is not None and len(investor) > 0:
         try:

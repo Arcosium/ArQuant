@@ -55,18 +55,32 @@ def test_consumer_hit_does_not_compute(monkeypatch):
     res = asyncio.run(o._shared_or_compute("macro_report", None, compute))
     assert res == "SHARED" and calls["n"] == 0
 
-def test_consumer_miss_falls_back_and_sets_flag(monkeypatch):
+def test_consumer_miss_falls_back_to_compute(monkeypatch):
+    """게시분이 전혀 없으면 대기 후 자체계산 — 단, 다음 단계까지 래치하지는 않는다."""
     _setup(monkeypatch, wait=0.05)
     o = _orch(False); calls, compute = _counter()
     res = asyncio.run(o._shared_or_compute("macro_report", None, compute))
     assert res == "COMPUTED" and calls["n"] == 1
-    assert o._producer_absent_this_cycle is True
 
-def test_consumer_absent_flag_short_circuits(monkeypatch):
-    _setup(monkeypatch, wait=10.0)
-    o = _orch(False); o._producer_absent_this_cycle = True
-    calls, compute = _counter()
-    res = asyncio.run(o._shared_or_compute("news_report", None, compute))
+def test_consumer_reuses_recent_publish_from_other_hour(monkeypatch):
+    """2026-07-22: :59 게시분을 :00 사이클이 hour_key 불일치만으로 버리고 재계산하던 문제.
+    SHARE_STALE_OK_SEC 안이면 시각이 달라도 재사용해야 한다."""
+    import time
+    store = _setup(monkeypatch, wait=0.05)
+    asyncio.run(store.publish("macro_report", "2026-06-08 09", "SHARED", None,
+                              uid=1, now=time.time()))
+    o = _orch(False); calls, compute = _counter()
+    res = asyncio.run(o._shared_or_compute("macro_report", None, compute))
+    assert res == "SHARED" and calls["n"] == 0
+
+def test_consumer_ignores_too_old_publish(monkeypatch):
+    """TTL 을 넘긴 게시분은 재사용하지 않는다(신선도 보호)."""
+    import time
+    store = _setup(monkeypatch, wait=0.05)
+    asyncio.run(store.publish("macro_report", "2026-06-08 09", "SHARED", None,
+                              uid=1, now=time.time() - 3 * 3600))
+    o = _orch(False); calls, compute = _counter()
+    res = asyncio.run(o._shared_or_compute("macro_report", None, compute))
     assert res == "COMPUTED" and calls["n"] == 1
 
 def test_share_disabled_always_computes(monkeypatch):
@@ -75,3 +89,25 @@ def test_share_disabled_always_computes(monkeypatch):
     res = asyncio.run(o._shared_or_compute("macro_report", None, compute))
     assert res == "COMPUTED" and calls["n"] == 1
     assert store.peek("macro_report", "2026-06-08 10", None) is None
+
+def test_absent_producer_latches_after_first_wait(monkeypatch):
+    """게시 이력이 전혀 없으면 = 생산자 부재 → 래치해 남은 단계는 즉시 자체계산.
+    (2026-07-22: 래치를 아예 없앴더니 부재 시 단계마다 420초씩 헛기다리는 회귀가 있었다.)"""
+    _setup(monkeypatch, wait=0.05)
+    o = _orch(False); calls, compute = _counter()
+    assert asyncio.run(o._shared_or_compute("macro_report", None, compute)) == "COMPUTED"
+    assert o._producer_absent_this_cycle is True
+    assert asyncio.run(o._shared_or_compute("news_report", None, compute)) == "COMPUTED"
+    assert calls["n"] == 2
+
+def test_slow_producer_does_not_latch(monkeypatch):
+    """게시 이력이 있으면(=생산자 살아있음, 이번 시각엔 아직 안 나옴) 래치하지 않는다 —
+    기다리는 편이 이득이다(자체계산은 같은 GPU 를 두고 생산자와 경합)."""
+    import time
+    store = _setup(monkeypatch, wait=0.05)
+    # TTL 밖(오래된) 게시 이력만 존재 → 재사용은 불가하지만 '생산자는 있다'는 신호
+    asyncio.run(store.publish("macro_report", "2026-06-08 08", "OLD", None,
+                              uid=1, now=time.time() - 10 * 3600))
+    o = _orch(False); calls, compute = _counter()
+    assert asyncio.run(o._shared_or_compute("macro_report", None, compute)) == "COMPUTED"
+    assert o._producer_absent_this_cycle is False

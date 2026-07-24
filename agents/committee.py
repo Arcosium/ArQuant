@@ -4,7 +4,7 @@ QuantInSight(:8777)의 세 모듈을 ArQuant 사이클에 이식했다:
   · research.py  → build_report(): 출처 태그가 달린 사실(fact) + 신용 레드플래그 +
                    정직성 가드레일(출처 없는 '사실'은 코드가 [미확인]으로 강등).
   · meeting.py   → deliberate_target(): 팀장 3인 발언(실제 사이클 보고 발췌)
-                   → 매수옹호역↔리스크반론역 찬반토론 N라운드
+                   → 매수 심사역↔리스크 심사역 찬반토론 N라운드
                    → 주식운용실장 최종 결정(+출처 없는 근거 자진신고 claims).
   · risk_gate.py → run_gate(): 결정론 게이트 — 모든 체크가 통과/차단 + 사유 + 근거를
                    남긴다(감사 가능성). LLM이 만장일치 '매수'여도 코드가 차단할 수 있다.
@@ -93,9 +93,15 @@ class GateResult:
 def build_report(code: str, name: str, *, sector: str = "",
                  quant_line: str = "", per_dart: str = "",
                  news_excerpt: str = "", fundamental: Optional[dict] = None,
-                 extra_claims: Optional[List[str]] = None) -> Report:
-    """사이클이 이미 수집한 실데이터(결정론 지표·DART 공시·뉴스 발췌)로 출처 태그 리포트를 만든다."""
+                 extra_claims: Optional[List[str]] = None,
+                 insight_excerpt: str = "") -> Report:
+    """사이클이 이미 수집한 실데이터(결정론 지표·DART 공시·뉴스 발췌)로 출처 태그 리포트를 만든다.
+    insight_excerpt: 기업리서치팀장이 종합한 기업 분석 리포트(사장 지시 2026-07-21) — 출처 있는 사실로 편입."""
     rep = Report(code=code, name=name, sector=sector or "")
+
+    if insight_excerpt:
+        rep.facts.append(Fact("기업리서치팀장 분석: " + " ".join(str(insight_excerpt).split())[:280],
+                              FACT, "기업리서치팀장(기업 분석자료)"))
 
     if quant_line:
         rep.facts.append(Fact(quant_line[:240], FACT, "KIS 시세·결정론 지표(자체 계산)"))
@@ -189,9 +195,9 @@ def ingest_claims(rep: Report, claims: List[dict]) -> None:
 
 # ── 회의 (meeting.py 이식) ─────────────────────────────────────────────────────
 _PERSONAS = {
-    "bull": ("매수옹호역", "주식운용실장 산하 서브에이전트. 역할상 무조건 매수를 옹호한다 — "
+    "bull": ("매수 심사역", "주식운용실장 산하 서브에이전트. 역할상 무조건 매수를 옹호한다 — "
                           "회의록에서 매수 논거를 찾아 최대한 강하게 주장하고, 반론역의 직전 논거를 반박한다."),
-    "bear": ("리스크반론역", "주식운용실장 산하 서브에이전트. 역할상 무조건 매수를 반대한다 — "
+    "bear": ("리스크 심사역", "주식운용실장 산하 서브에이전트. 역할상 무조건 매수를 반대한다 — "
                             "회의록에서 리스크 논거를 찾아 최대한 강하게 주장하고, 옹호역의 직전 논거를 반박한다."),
     "chief": ("주식운용실장", "회의록 전체(팀장 의견 + 찬반 토론)를 종합해 최종 결정을 내린다. "
                             "옹호/반론 중 더 논증이 튼튼한 쪽을 채택하되, 회피 의견의 근거가 사실(출처)에 "
@@ -304,6 +310,7 @@ async def deliberate_target(code: str, name: str, report: Report, *,
                             quant_score: Optional[int], quant_excerpt: str,
                             news_excerpt: str, macro_view: str,
                             select_rationale: str = "",
+                            insight_excerpt: str = "",
                             progress: Optional[Callable[[str, str], Awaitable[None]]] = None,
                             ) -> Tuple[List[dict], List[dict], dict, bool]:
     """매수 대상 1종목 위원회 심의 → (opinions, dialogue, chief 결정, llm_used).
@@ -333,8 +340,10 @@ async def deliberate_target(code: str, name: str, report: Report, *,
          news_excerpt or "이 종목 직접 뉴스 없음 — 시장 전반 분위기만 참고.",
          HOLD if not news_excerpt else BUY, 0.55),
         ("기업리서치팀장", "insight",
-         f"출처검증 리포트 기준 신용진단 '{report.credit_view}'. 미확인 비율 "
-         f"{report.unverified_ratio * 100:.0f}%.",
+         # 사장 지시 2026-07-21: 기업리서치팀장의 실제 기업 분석 리포트가 있으면 그것을 회의록에 앉힌다.
+         (" ".join(str(insight_excerpt).split())[:400] if insight_excerpt else
+          (f"출처검증 리포트 기준 신용진단 '{report.credit_view}'. 미확인 비율 "
+           f"{report.unverified_ratio * 100:.0f}%.")),
          AVOID if crit else (HOLD if report.red_flags else BUY), 0.65),
     ]
     for speaker, role, text, stance, conf in seeded:
@@ -346,9 +355,9 @@ async def deliberate_target(code: str, name: str, report: Report, *,
     # ④ 찬반 토론 (옹호 ↔ 반론) — 주장 → 반박 → 재반박 (라운드 수는 QIS 이식 고정 상수)
     for rnd in range(1, DEBATE_ROUNDS + 1):
         ask_bull = ("매수 논거를 제시하라." if rnd == 1
-                    else f"리스크반론역의 직전 논거를 반박하라. (라운드 {rnd})")
+                    else f"리스크 심사역의 직전 논거를 반박하라. (라운드 {rnd})")
         ask_bear = ("매수를 반대하는 논거를 제시하라." if rnd == 1
-                    else f"매수옹호역의 직전 논거를 반박하라. (라운드 {rnd})")
+                    else f"매수 심사역의 직전 논거를 반박하라. (라운드 {rnd})")
         for role, ask, fb in (("bull", ask_bull,
                                f"모멘텀·수급이 유효하다. 퀀트점수 {quant_score}는 무시할 수 없다."),
                               ("bear", ask_bear,
@@ -403,7 +412,7 @@ async def deliberate_sleeve_buy(code: str, name: str, *, sleeve_label: str,
                                 ) -> Tuple[List[dict], dict, bool]:
     """채권·원자재 슬리브 매수 후보 1건 위원회 심의.
 
-    매수옹호역↔리스크반론역 찬반토론 N라운드 → 슬리브운용실장(chief_label) 최종 매수/보류/회피.
+    매수 심사역↔리스크 심사역 찬반토론 N라운드 → 슬리브운용실장(chief_label) 최종 매수/보류/회피.
     주식 deliberate_target 과 달리 퀀트점수·정직성 게이트가 없고 자산배분 정합성·과다노출만
     다툰다. 어떤 실패도 사이클을 막지 않는다(호출부 fail-open). 반환 (dialogue, decision, llm_used)."""
     brief = _fmt_sleeve_brief(code, name, sleeve_label, macro_view, manager_rationale, weight_ctx, price)
@@ -421,9 +430,9 @@ async def deliberate_sleeve_buy(code: str, name: str, *, sleeve_label: str,
 
     for rnd in range(1, DEBATE_ROUNDS + 1):
         ask_bull = (f"이 {sleeve_label} ETF 매수(자산배분)를 옹호하는 논거를 제시하라."
-                    if rnd == 1 else f"리스크반론역의 직전 논거를 반박하라. (라운드 {rnd})")
+                    if rnd == 1 else f"리스크 심사역의 직전 논거를 반박하라. (라운드 {rnd})")
         ask_bear = (f"이 {sleeve_label} ETF 매수를 반대하는 논거를 제시하라."
-                    if rnd == 1 else f"매수옹호역의 직전 논거를 반박하라. (라운드 {rnd})")
+                    if rnd == 1 else f"매수 심사역의 직전 논거를 반박하라. (라운드 {rnd})")
         for role, ask, fb in (
                 ("bull", ask_bull,
                  f"매크로가 {sleeve_label} 비중 확대를 권고한다 — 자산배분상 매수가 정합적이다."),

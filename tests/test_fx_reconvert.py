@@ -42,7 +42,14 @@ class _Broker:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.get_event_loop() 를 쓰면 **테스트 순서에 따라** 깨진다: 앞서 실행된 테스트가
+    # asyncio.run() 을 한 번이라도 부르면(예: tests/test_app_per_uid_lifecycle.py,
+    # tests/test_balance_failed_read_carryforward.py) Runner 가 종료 시 set_event_loop(None)
+    # 을 호출해 policy 의 _set_called 가 True + 현재 루프 None 이 된다 → 이후 get_event_loop()
+    # 는 루프를 새로 만들지 않고 RuntimeError('There is no current event loop') 를 던진다
+    # (단독 실행 시엔 통과, 전체 실행 시엔 7건 전부 실패하던 원인).
+    # 자기 루프를 직접 확보해 주변 상태에 의존하지 않는다(3.12 에서 get_event_loop 는 deprecated).
+    return asyncio.run(coro)
 
 
 def test_idle_usd_off_default_alerts_only(monkeypatch):

@@ -44,7 +44,7 @@ _universe_cache: dict = {"mtime": None, "map": {}}
 
 
 def load_universe() -> Dict[str, str]:
-    """{code: name}. Lag_Trading 이 관리하는 KOSPI200+KOSDAQ150 CSV(같은 서버, 읽기 전용)를
+    """{code: name}. 자체 분봉 크롤러(market_bars)가 관리하는 KOSPI200+KOSDAQ150 CSV(읽기 전용)를
     기본으로 쓴다 — 대형·유동성 종목 위주라 대회 적격 필터와 궁합이 좋다. 없으면 빈 dict
     (후보는 뉴스 언급 + 보유 종목만으로 진행 — 사이클은 멈추지 않는다)."""
     path = Path(config.TIMEFOLIO_UNIVERSE_CSV)
@@ -68,7 +68,7 @@ def load_universe() -> Dict[str, str]:
 
 def movers_from_bars(universe: Dict[str, str], top_n: int = 12,
                      db_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Lag_Trading 분봉 DB(읽기 전용)에서 오늘의 상승 모멘텀 상위 종목을 뽑는다.
+    """자체 분봉 DB(market_bars 수집, 읽기 전용)에서 오늘의 상승 모멘텀 상위 종목을 뽑는다.
     KIS 거래대금 랭킹(kr_volume_rank)의 타임폴리오 대체재. DB 부재/장시작 직후 등
     실패 시 [] — 후보는 뉴스/보유로 폴백된다."""
     path = db_path or config.TIMEFOLIO_BARS_DB
@@ -329,8 +329,9 @@ def create_timefolio_strategist(injection=None):
 - 보유 종목은 손익이 아니라 **신호**로 판단 — 모멘텀 붕괴·악재면 손절, 추세 유지면 보유.
 - 시장 급락 신호가 뚜렷하면 현금 비중을 높이십시오 (주식 최소 0%까지 허용).
 
-## 응답 형식 — 자유 서술(간결히) 후 **마지막 두 줄은 반드시 이 형식** (다른 텍스트 없이):
-매도결정: 005930=전량, 000660=보유   ← 보유 종목 **전부** 나열. 값: 전량/절반/보유/매도주수(예: 30주). 보유 없으면 `매도결정: 없음`
+## 응답 형식 — 자유 서술(간결히, 마크다운 헤더 `#`/`##`·표 `|...|`·강조 `**` 금지 — 채팅 UI에서 깨짐)
+후 **마지막 두 줄은 반드시 이 형식** (다른 텍스트 없이):
+매도결정: 005930=전량, 000660=보유   ← 보유 종목 전부 나열. 값: 전량/절반/보유/매도주수(예: 30주). 보유 없으면 `매도결정: 없음`
 매수결정: 035420=9, 051910=5        ← 코드=목표비중%(1~9). 신규 매수 없으면 `매수결정: 없음`. 후보 목록에 있는 코드만.""",
     )
 
@@ -346,6 +347,16 @@ def get_strategist(orch):
         except Exception:  # noqa: BLE001
             pass
     return agent
+
+
+def _standing_block(orch) -> str:
+    """이 계정의 상시 지시사항 블록 (실패해도 사이클은 계속 — fail-open)."""
+    try:
+        from infra.standing_directives import build_orchestrator_directive_block
+        return build_orchestrator_directive_block(orch.uid) or ""
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[타임폴리오] 상시지시 로드 실패(uid=%s): %s — 사이클 계속", orch.uid, e)
+        return ""
 
 
 # ─── 사이클 본체 ─────────────────────────────────────────────────────────────
@@ -529,6 +540,9 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
         f"마켓센티먼트팀장 뉴스 분석:\n{(news_report or '(뉴스 없음)')[:2500]}\n\n"
         f"직전 사이클 결정: {prev_decision}\n"
         + (f"\n사장님 지시: {user_directive}\n" if user_directive else "")
+        # 2026-07-22: 대회 사이클은 상시지시를 전혀 읽지 않아, 대시보드에 등록한 지시가
+        # 타임폴리오 계정에만 조용히 무시됐다(KIS 경로는 _run_analysis_cycle 이 주입).
+        + _standing_block(orch)
         + "\n위 정보로 매도/매수를 결정하고, 마지막 두 줄에 `매도결정:`/`매수결정:` 을 형식대로 출력하십시오.")
     await orch._emit({"type": "agent_msg", "agent": STRATEGIST_NAME, "message": decision})
     orch.cycle_log.log("ORDER_DRAFTING", STRATEGIST_NAME, decision)
@@ -538,6 +552,47 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
     orch._timefolio_last_decision = (f"{started_at} 매도 {len(sells)}건/매수 {len(buys)}건 — "
                                      + "; ".join(f"{c}={d}" for c, d in list(sells.items())[:4])
                                      + " | " + "; ".join(f"{c}={w}%" for c, w in list(buys.items())[:4]))
+
+    # [5.5] 운용위원회 심의 (사장 지시 2026-07-21) — 대회 계정도 QIS 위원회 로직을 살린다.
+    #   전략가가 고른 매수 후보를 매수 심사역↔리스크 심사역 찬반토론 + 주식운용실장 종합에 올려
+    #   회의록을 기록(사이클 탭 '심의·근거 트리'에 표시)한다. 주식운용실장이 '회피'로 종합하면
+    #   그 매수만 취소한다. 대회 규정 리스크는 집행 직전 check_order 하드 게이트가 최종 담당하므로,
+    #   심의 실패는 절대 사이클을 막지 않는다(fail-open).
+    committee_record: Dict[str, Any] = {"candidates": [], "position_reviews": []}
+    if buys:
+        try:
+            import agents.committee as cmt
+            macro_view = "국내 투자대회(주식만) — 지수 스냅샷·뉴스 감성 참조"
+            async def _cprog(agent, msg):
+                await orch._emit({"type": "agent_msg", "agent": agent, "message": msg})
+            _dropped: List[str] = []
+            for code in list(buys.keys()):
+                nm = (meta_map.get(code) or {}).get("name") or universe.get(code, code)
+                sector = (meta_map.get(code) or {}).get("sector") or ""
+                qs = quant_scores.get(code)
+                q_excerpt = next((ln for ln in quant_lines if code in ln), "")
+                rep = cmt.build_report(
+                    code, nm, sector=sector,
+                    quant_line=(f"퀀트점수 {qs}/10" if qs is not None else ""),
+                    news_excerpt=(news_report or "")[:400])
+                opinions, dialogue, chief, llm_used = await cmt.deliberate_target(
+                    code, nm, rep, quant_score=qs, quant_excerpt=q_excerpt,
+                    news_excerpt=(news_report or "")[:400], macro_view=macro_view,
+                    select_rationale="타임폴리오 전략가 매수 후보", progress=_cprog)
+                _stance = chief.get("stance")
+                decision = ("매수" if _stance == cmt.BUY else ("회피" if _stance == cmt.AVOID else "보류"))
+                committee_record["candidates"].append({
+                    "code": code, "name": nm, "sector": sector, "quant_score": qs,
+                    "decision": decision, "engine": ("llm" if llm_used else "결정론"),
+                    "opinions": opinions, "dialogue": dialogue, "report": rep.to_dict()})
+                if _stance == cmt.AVOID:
+                    _dropped.append(code)
+            for code in _dropped:
+                buys.pop(code, None)
+                orch.cycle_log.log("ORDER_DRAFTING", "주식운용실장",
+                                   f"{code} — 운용위원회 종합 '회피'로 매수 취소")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[타임폴리오] 위원회 심의 생략(fail-open): %s", e)
 
     # [6] 주문 조립 (결정론 — 대회 한도 선반영)
     prices: Dict[str, float] = {}
@@ -621,6 +676,7 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
             "risk_report": "타임폴리오 대회 룰 게이트(check_order+섹터게이트) 적용",
             "quant_report": quant_report[:8000], "news_report": (news_report or "")[:8000],
             "final_report": report[:8000],
+            "committee": (committee_record if committee_record["candidates"] else None),
             "bp_cash": cash, "bp_total_eval": total_eval,
             "bp_pnl_ratio": float(bp.get("pnl_ratio") or 0.0)})
     except Exception as e:  # noqa: BLE001

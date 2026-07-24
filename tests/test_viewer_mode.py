@@ -24,7 +24,7 @@ def store(tmp_path, monkeypatch):
 
 def _create(store, username, mode="trading"):
     return store.upsert_user(
-        username, "Passw0rd!!xx", "", "", "", "",
+        username, "Passw0rd!!xx", "", "", "",
         "https://openapi.koreainvestment.com:9443", account_mode=mode,
     )
 
