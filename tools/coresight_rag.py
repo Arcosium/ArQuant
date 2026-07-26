@@ -115,7 +115,9 @@ def _wiki_search(query, top_k, base_url=None):
         req = _u.Request(base + "/api/coresight/search_entries",
                          data=json.dumps({"query": query}).encode(),
                          headers={"Content-Type": "application/json"}, method="POST")
-        with _u.urlopen(req, timeout=4) as r:
+        # 15s: 임베딩 서비스가 온디맨드(유휴 10분 뒤 언로드, 2026-07-26)라 콜드 로드 ~10초가
+        # 걸린다. 4s 였을 때는 그 첫 검색이 조용히 빈 결과로 떨어져 위키 소스가 RRF 에서 빠졌다.
+        with _u.urlopen(req, timeout=15) as r:
             return (json.loads(r.read()).get("entries") or [])[:top_k]
     except Exception as e:
         logger.debug("Coresight 위키 검색 실패(무시): %s", e)
