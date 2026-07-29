@@ -7,8 +7,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).parent
-# 공용 환경을 먼저 읽고, ArQuant 전용 비밀값은 저장소의 git-ignored .env로 덮어쓴다.
-load_dotenv("/home/opc/projects/.env")
+# 공용 환경(KRX_ID/KRX_PW 등)을 먼저 읽고, 전용 비밀값은 저장소의 git-ignored .env로 덮어쓴다.
+# 경로는 BASE_DIR 기준 — 구 Oracle 절대경로(/home/opc)는 심링크에 기대던 지뢰였다.
+load_dotenv(BASE_DIR.parent / ".env")
 load_dotenv(BASE_DIR / ".env", override=True)
 
 # ─── API Keys ───────────────────────────────────────────────────────────────
@@ -21,12 +22,9 @@ OPENDART_API_KEY = os.getenv("OPENDART_API_KEY", "")
 # 사장 피드백 2026-05-15 (8차): Tavily 제거 — alibaba/tongyi-deepresearch가 검색 + 분류 + 리서치 통합 담당
 
 # ─── Coresight RAG Paths ────────────────────────────────────────────────────
-CORESIGHT_PATH = os.getenv("CORESIGHT_PATH", "/home/opc/ArcAI.ve/coresight_logs")
-CORESIGHT_CHROMA_PATH = os.getenv("CORESIGHT_CHROMA_PATH", "/home/opc/ArcAI.ve/chroma_db")
-
-# ─── Legacy Code Paths ──────────────────────────────────────────────────────
-LEGACY_AUTOTRADING_PATH = Path("/home/opc/projects/매매자동화")
-LEGACY_KRX_SIMULATOR_PATH = Path("/home/opc/projects/KRX Quant Simulator")
+_ARCAIVE = BASE_DIR.parent / "ArcAI.ve"
+CORESIGHT_PATH = os.getenv("CORESIGHT_PATH", str(_ARCAIVE / "coresight_logs"))
+CORESIGHT_CHROMA_PATH = os.getenv("CORESIGHT_CHROMA_PATH", str(_ARCAIVE / "chroma_db"))
 
 # ─── Local LLM model assignments (by agent role) ────────────────────────────
 # URL은 설치 시에만 지정한다. 예: http://127.0.0.1:8080/v1
@@ -58,14 +56,21 @@ MODEL_ASSIGNMENTS = {
     # ── 결정(pro 티어, reasoning ON) ──
     # 사장 원칙 2026-06-10: '주관이 들어가 결정을 내리는' 에이전트는 추론 켬.
     "chief_orchestrator": _PRO,   # 총괄·종목선정(2패스 결정)
-    "macro_analyst": _PRO,        # 글로벌리서치팀장 자산배분 권고='결정'
     "post_manager": _PRO,         # 사후관리실장 매도 결정
     "ops_support": _PRO,          # 운용지원실장 파라미터 튜닝 결정
     "bond_manager": _PRO,         # 채권운용실장 슬리브 ETF 매매 결정
     "commodity_manager": _PRO,    # 원자재운용실장 슬리브 ETF 매매 결정
     # ── 분석/리서치/도구(flash 티어, reasoning OFF) ──
+    # 사장 지시 2026-07-22: macro_analyst 를 _PRO → _FLASH 로 내린다.
+    # 2026-06-10 원칙("결정 내리는 에이전트는 추론 켬")에 따라 '자산배분 권고=결정'으로 분류했으나,
+    # 실제 프롬프트를 보면 리서치는 tools.global_search.deep_research 가 **미리** 수행하고,
+    # 이 에이전트는 검증된 지수표·리서치 결과를 받아 고정 3블록(요약·비중·리스크)으로 옮겨 적는
+    # **작문** 작업이다. 결정 성분은 합 100%인 네 숫자뿐. 2026-07-22 관측: 500토큰짜리 보고서를
+    # 쓰겠다고 CoT 를 34,671토큰 태우고 타임아웃에 잘렸다(사이클 30분 정체).
+    "macro_analyst": _FLASH,
     "quant_analyst": _FLASH,
     "news_analyst": _FLASH,
+    "insight_analyst": _FLASH,    # 기업리서치팀장 — 기업 분석자료 리서치·요약(사장 지시 2026-07-21)
     "news_curator": _FLASH,
     # macro_researcher 는 Hermes web_search/web_extract(tool-calling)를 써야 한다 — reasoning
     # OFF 평문 슬러그 유지(tool-calling 안정성). (Qwen3.6-A3B 는 로컬 LLM 에서 도구호출 지원.)
@@ -73,6 +78,7 @@ MODEL_ASSIGNMENTS = {
     "trader": _FLASH,
     "risk_guard": _FLASH,
     "fund_planner": _FLASH,       # thesis 자문(veto 폐지) — 자문성이라 flash
+    "compliance": _FLASH,         # 컴플라이언스실장 — 반려는 결정론 코드, LLM은 @멘션 설명만(사장 지시 2026-07-22)
 }
 
 # ─── Risk Management Constants ──────────────────────────────────────────────
@@ -87,23 +93,38 @@ US_BUY_FAIL_STREAK_LIMIT = 2
 # ─── LLM Cost-Reduction Knobs ───────────────────────────────────────────────
 # Per-agent output token caps (replaces uniform 4096). Risk/Policy emit short
 # structured JSON; analysts need more room.
+# 2026-07-21 상향(사장 지시): thinking ON 에이전트(_PRO 6종)만 64000. 로컬 모델의 추론
+# 길이는 1.1k~10.7k 로 분포가 넓어 예산이 작으면 추론이 예산을 다 쓰고 content 가 빈 채
+# 끝난다(실측: 같은 프롬프트가 64000 이면 6/6 정상, 12000 은 2/6, 8000 은 0/3). llama-server
+# 는 -c 524288/-np 4 라 슬롯당 131072 이고 KV 는 선할당이라 상한을 올려도 추가 메모리는 없다.
+# _FLASH(추론 OFF) 에이전트는 그대로 둔다 — 추론을 안 하므로 큰 예산이 무의미하다.
+#
+# 2026-07-22 하향(사장 지시) 64000 → 40000: **예산이 타임아웃보다 길어 완주 불가**였다.
+#   llama-server 실측 디코드 53 t/s → 64000토큰 = 1,208초인데 LOCAL_LLM_TIMEOUT_SEC 은 900초.
+#   예산을 다 쓰는 생성은 15분에 잘리고 재시도는 토큰 0부터 다시 시작 → GRACE 소진 후 최종 실패.
+#   실제로 24시간 동안 타임아웃 재시도 13회·최종 실패 4회(원자재운용실장·주식운용실장 등 전부 pro).
+#   40000 = 관측 추론 최대(10.7k)의 3.7배 여유이면서 53 t/s 로 755초 → 새 타임아웃(1800초) 안에
+#   2.4배 여유로 완주한다. 12000(2/6 실패)·8000(0/3) 과는 자릿수가 다르므로 빈 content 회귀 위험 없음.
+#   타임아웃/그레이스는 infra/local_llm_client.py 에서 함께 상향했다 — 둘은 같이 움직여야 한다.
 AGENT_MAX_TOKENS = {
-    "chief_orchestrator": 12000,  # Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf+thinking로 교체(2026-05-19) — 비-reasoning이라 자연 완료 시 즉시 반환,
+    "chief_orchestrator": 40000,  # Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf+thinking로 교체(2026-05-19) — 비-reasoning이라 자연 완료 시 즉시 반환,
                                   # 12000은 안전한 상한(2패스 결정 출력 충분히 수용, 잠식 없음).
-    "macro_analyst":      8000,   # 4000으로는 상세 매크로 리포트가 중간에 끊김 (2026-05-19 관측).
-                                  # 6000으로 상향하여 완결된 응답 보장.
+    "macro_analyst":       8000,   # thinking OFF 전환(2026-07-22)으로 CoT 소모가 없어졌다 — 순수 출력만.
+                                  # 계량분석팀장(8000)과 동일. 4000은 리포트가 중간에 끊겼던 이력(2026-05-19).
     "quant_analyst":      8000,   # 5500으로도 5개 섹션 + 점수/진입가 줄이 잘리는 사례 발생 → 8000으로 재상향
     "news_analyst":       5000,   # 2026-06-11 2600→5000: 뉴스 다발 사이클(40건 등)에서 ②시장분위기·③매크로 시사점 섹션이 중간에 잘림(cycle294=1750자 컷 관측). flash라 max_tokens=출력 전량.
+    "insight_analyst":    5000,   # 기업리서치팀장 — 기업 분석자료(펀더멘털·공시·리서치) 종목별 요약
     "news_curator":        600,   # 큐레이터는 번호 목록만 → 작게
     "macro_researcher":   8000,   # 매크로 리서치 — 시황·심리·정책 합성 응답
     "trader":             1500,   # 사장 피드백 (3차) — 자연어 보고용. 체결 결과 요약 + 매매 이유 정리
     "risk_guard":         2200,   # DART 공시 읽고 종목별 재심 + 사유
-    # policy_filter 폐지(2026-05-18)
-    "post_manager":      12000,   # Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf+thinking(2026-05-24 교체) — chief_orchestrator와 동일 모델·동일 토큰 한도
-    "ops_support":        8000,   # 코드 변경 JSON + 근거 설명 (사장 지시 2026-05-14 — 토큰 한도 상향)
+    # policy_filter 폐지(2026-05-18) → 반려 기능은 2026-07-22 컴플라이언스실장으로 부활(결정론)
+    "compliance":         1200,   # @멘션 정책 설명용 — 사이클 판정은 LLM 미사용
+    "post_manager":       40000,   # Qwen3.6-35B-A3B-Uncensored-Claude-Genesis-Q8_0.gguf+thinking(2026-05-24 교체) — chief_orchestrator와 동일 모델·동일 토큰 한도
+    "ops_support":        40000,   # 코드 변경 JSON + 근거 설명 (사장 지시 2026-05-14 — 토큰 한도 상향)
     "fund_planner":       1200,   # 사장 지시 2026-05-28 — 4줄(목표가/손절가/계획 보유/사유) 정형 출력 + 한 단락 보강
-    "bond_manager":       5000,   # 채권운용실장. 2026-06-10 pro 전환 후 2000→5000: pro=reasoning은 max_tokens에 CoT 포함이라 2000이면 본문이 잘림(391자 관측). CoT+결정문 여유 확보.
-    "commodity_manager":  5000,   # 원자재운용실장. 동일 사유(pro reasoning CoT 토큰 소모) → 5000.
+    "bond_manager":       40000,   # 채권운용실장. 2026-06-10 pro 전환 후 2000→5000: pro=reasoning은 max_tokens에 CoT 포함이라 2000이면 본문이 잘림(391자 관측). CoT+결정문 여유 확보.
+    "commodity_manager":  40000,   # 원자재운용실장. 동일 사유(pro reasoning CoT 토큰 소모) → 5000.
 }
 ENABLE_PROMPT_CACHE = False
 AGENT_HISTORY_TURNS = 3               # trailing history messages to resend (was 10)
@@ -111,6 +132,10 @@ AGENT_HISTORY_TURNS = 3               # trailing history messages to resend (was
 # Macro/DART recompute throttling (slow-moving inputs — don't regenerate every cycle)
 MACRO_CACHE_TTL_SEC = 30 * 60         # 30 min
 DART_CACHE_TTL_SEC  = 24 * 60 * 60    # 1 day
+# 뉴스 감성 리포트도 매크로와 같은 30분 공유 캐시(사장 지시 2026-07-21). 종전엔 캐시가 없어
+# 연속 사이클마다 마켓센티먼트팀장 LLM 을 새로 호출했다(모의 프로필 하룻밤 575회). 매크로와
+# 동일 정책 — 개장 사이클(market_open)에선 캐시를 무시하고 반드시 새로 분석한다.
+NEWS_CACHE_TTL_SEC  = 30 * 60         # 30 min
 
 # Analysis-cycle trigger tuning.
 # 감시/재료성 뉴스 트리거는 폐지 — 단순히 1시간마다 사이클 1회 + 한국/미국 장 개장 시 누적 뉴스로 1회.
@@ -121,6 +146,12 @@ PERIODIC_CYCLE_SEC      = 1 * 60 * 60 # run a cycle this often while a market is
 # — KIS TPS·뉴스 크롤 여유용 하한. 런타임/대시보드 '전략' 탭에서 프로필별 on/off·조정 가능.
 CONTINUOUS_CYCLES       = False
 CONTINUOUS_MIN_GAP_SEC  = 20
+# 연속 사이클 최소 '주기'(사장 지시 2026-07-21) — 시작~시작 간격의 하한. GAP 은 '끝난 뒤 대기'라
+# 사이클 자체가 짧으면 주기를 못 지킨다: US 정규장엔 KR 보유만 있는 프로필의 퀀트 대상이 0개라
+# (main_swarm 의 세션별 시장 필터) 사이클이 20초에 끝나 밤새 575회 공회전했다 — LLM 슬롯과 KIS
+# TPS 를 태우고 정작 US 시세는 rate-limit 으로 빈 응답이 됐다(2026-07-21 라이브). 짧게 끝난
+# 사이클은 이 주기 경계까지 기다렸다 재발화한다(긴 사이클은 종전대로 GAP 만 지키면 즉시).
+CONTINUOUS_MIN_CYCLE_SEC = 3 * 60     # 3 min
 HEADLINE_DEDUP_RATIO    = 0.85        # difflib ratio above which two headlines are "the same"
 NEWS_PREFILTER_TRIGGER  = 40          # 누적 헤드라인이 이 수를 넘으면 큐레이터로 사전 선별
 NEWS_PREFILTER_LIMIT    = 40          # 사전 선별 후 마켓센티먼트팀장에게 넘길 최대 헤드라인 수
@@ -240,7 +271,11 @@ COMMODITY_ETF_POOL_US = [
 # hh09080(ADMIN)이 시장 전역 분석(뉴스 분류·매크로 리서치·매크로 분석)을 사이클마다 1회
 # 산출·게시하고, 비관리자 계정은 그 결과를 공유받아 같은 LLM 호출을 중복하지 않는다.
 SHARE_MARKET_INTELLIGENCE = True   # 마스터 토글. False면 전 계정이 현행대로 각자 계산
-SHARE_PRODUCER_WAIT_SEC   = 120    # 소비자가 ADMIN 게시를 기다리는 단계별 최대 초(초과 시 자체계산 폴백)
+SHARE_PRODUCER_WAIT_SEC   = 420    # 소비자가 ADMIN 게시를 기다리는 단계별 최대 초(초과 시 자체계산 폴백)
+                                   # 2026-07-22: 120초는 생산자 매크로 게시보다 짧아 매번 타임아웃 → 전 단계 자체계산(사이클 21분)
+SHARE_STALE_OK_SEC        = 30*60  # 직전 게시분을 이 시간 안이면 재사용(매크로 캐시 TTL과 동일)
+QUANT_CONCURRENCY         = 2      # 종목별 계량분석 동시 실행 수(사장 지시 2026-07-22: 사이클 최대 병목)
+                                   # 태스크마다 전용 에이전트를 쓰므로 히스토리 누수 없음. 1이면 종전 순차.
 
 # When no target is affordable with available cash, look for a cheaper liquid name in whatever
 # market is tradeable right now (KR session → KRX volume rank; US session → the shortlist below).
@@ -356,6 +391,37 @@ SIZING_MAX_TILT        = 2.0          # 균등 대비 한 종목 최대/최소 �
 UNIVERSE_MIN_PRICE     = 0.0          # 현재가 < 이 값(원, US는 USD 별도 임계 미적용) 후보 배제 (0=off)
 UNIVERSE_MIN_TURNOVER  = 0.0          # 일거래대금 < 이 값 후보 배제 (0=off)
 UNIVERSE_EXCLUDE_LEVERAGED = True     # 레버리지/인버스/곱버스/ETN 후보 배제
+# ⑤ 그랜저 선행-후행(lead-lag) 신호 — 30분 지평 (사장 지시 2026-07-21)
+# 자체 분봉 크롤러(market_bars/, KOSPI200+KOSDAQ150)가 수집하는 bars.db 를 30분 버킷으로
+# 리샘플해 선행주→후행주 관계를 재구성한다. 선행주가 최근 30분 이상 시장대비 오르면 후행주에
+# 매수 우호 신호 → 계량 팩터(QIW_LEADLAG) + 매수후보 보강. (구 Lag_Trading 크롤러 이관·엔진 폐기)
+ENABLE_LEADLAG_SIGNAL  = True         # 선행-후행 신호 사용(매수 후보 보강 + 계량 팩터). 파라미터 토글.
+QIW_LEADLAG            = 8            # 계량 지표 가중치: 선행-후행(기본 편입). +면 선행주 상승 후행주 가점.
+LEADLAG_LOOKBACK_MIN   = 30           # 선행주 '최근 이동' 판별 창(분). 사이클 20분+ 감안 최소 30.
+LEADLAG_MIN_BUY_SIGNAL = 0.5          # 이 신호 이상인 후행주만 신규 매수 후보로 보강(0~1)
+# 비튜닝 상수 (운용지원·웹 조정 대상 아님 — 구조/데이터 경로)
+LEADLAG_BARS_DB        = os.getenv("LEADLAG_BARS_DB", str(BASE_DIR / "data" / "bars.db"))
+LEADLAG_LOOKBACK_DAYS  = 10           # 구조적 맵 학습 영업일 수
+LEADLAG_MIN_CONF       = 0.30         # 선행-후행 상관 임계(방향성 통과분만)
+LEADLAG_TOP_LEADERS    = 3            # 후행주당 선행주 상위 N
+LEADLAG_MAP_TTL_SEC    = 3600         # 구조적 맵 캐시 수명(초)
+LEADLAG_MOVE_SCALE_PCT = 1.0          # 선행주 잔차수익률 이 %면 신호 만점(1.0=1%)
+# ⑥ 추가 전략 파라미터 8종 (사장 지시 2026-07-21 후속 — 선행-후행 매도·상관분산·연속손절·
+#    거래량급증·개장마감회피·갭업회피·레짐전환·뉴스감쇠)
+ENABLE_LEADLAG_SELL    = True         # 선행주가 최근 30분+ 시장대비 급락하면 보유 후행주 부분매도(선행-후행 대칭)
+MAX_PORTFOLIO_CORRELATION = 0.75      # 보유종목과 30분 상관이 이 값 초과인 신규 후보 매수 제한(0=off, 분산)
+LOSS_STREAK_HALT       = 3            # 최근 실현매도가 N회 연속 손실이면 이번 사이클 신규매수 중단(0=off, 회로차단)
+QIW_VOLUME_SURGE       = 8            # 계량 지표 가중치: 거래량 급증(평균比). +면 거래량 동반 돌파에 가점.
+SKIP_OPEN_MIN          = 5            # 개장 후 이 분(分) 안에는 신규매수 회피(변동성 구간, 0=off)
+SKIP_CLOSE_MIN         = 5            # 마감 전 이 분(分) 안에는 신규매수 회피(0=off)
+MAX_GAP_UP_PCT         = 5.0          # 시가가 전일종가 대비 이 %+ 갭업한 종목 신규매수 제외(추격 회피, 0=off)
+REGIME_ADAPTIVE        = True         # KOSPI 추세(20일선 대비)로 방어/공격 파라미터 자동 틸트
+NEWS_DECAY_HOURS       = 24.0         # 이 시간(h) 초과된 뉴스는 감성 가중 감쇠(신선도, 0=off)
+# 레짐 틸트 비튜닝 상수 (REGIME_ADAPTIVE 강도)
+REGIME_TREND_LOOKBACK  = 20           # KOSPI 추세 판별 이동평균 일수
+REGIME_DEFENSIVE_QS_BUMP = 1          # 방어 레짐 시 MIN_QUANT_SCORE 가산(엄선)
+REGIME_DEFENSIVE_BUDGET_MULT = 0.7    # 방어 레짐 시 사이클 예산비율 배수
+REGIME_AGGRESSIVE_BUDGET_MULT = 1.15  # 공격 레짐 시 사이클 예산비율 배수(캡 1.0)
 # ④ 성과귀인 스코어카드 — 귀인 트레일링 윈도우(일)
 SCORECARD_WINDOW_DAYS  = 30
 
@@ -393,7 +459,7 @@ def strategy_param_catalog_text():
 # Keys here MUST match module-level constant names above (runtime.get() falls back to those).
 STRATEGY_TUNABLE_KEYS = [
     # 연속 사이클(단타) — 사장 지시 2026-07-20
-    "CONTINUOUS_CYCLES", "CONTINUOUS_MIN_GAP_SEC",
+    "CONTINUOUS_CYCLES", "CONTINUOUS_MIN_GAP_SEC", "CONTINUOUS_MIN_CYCLE_SEC",
     "PER_ORDER_BUDGET_RATIO", "PER_ORDER_BUDGET_OVERSHOOT", "MAX_CYCLE_BUDGET_RATIO", "MIN_CASH_BUFFER",
     "MACRO_DEPLOY_FLOOR_ENABLED", "PER_ORDER_BUDGET_FLOOR_RATIO", "MAX_CYCLE_BUDGET_FLOOR_RATIO",
     "ENABLE_DILUTION_GATE", "ENABLE_IC_SIZING",
@@ -406,7 +472,12 @@ STRATEGY_TUNABLE_KEYS = [
     "ENABLE_COST_EDGE_GATE", "MIN_NET_EDGE_PCT",
     # (B) 결정론 점수 엔진 — 퀀트 지표 가중치 + 차원 가중치 + 토글 (사장 지시 2026-06-04, QW_* 대체)
     "QIW_RSI", "QIW_MACD", "QIW_ADX", "QIW_VWAP", "QIW_VOL", "QIW_MOM", "QIW_CMF", "QIW_FLOW", "QIW_HIGH52",
+    "QIW_LEADLAG", "QIW_VOLUME_SURGE",
     "DW_QUANT", "DW_NEWS", "DW_MACRO", "DETERMINISTIC_SCORING",
+    # 그랜저 선행-후행 신호 + 추가 전략 8종 (사장 지시 2026-07-21)
+    "ENABLE_LEADLAG_SIGNAL", "LEADLAG_LOOKBACK_MIN", "LEADLAG_MIN_BUY_SIGNAL",
+    "ENABLE_LEADLAG_SELL", "MAX_PORTFOLIO_CORRELATION", "LOSS_STREAK_HALT",
+    "SKIP_OPEN_MIN", "SKIP_CLOSE_MIN", "MAX_GAP_UP_PCT", "REGIME_ADAPTIVE", "NEWS_DECAY_HOURS",
     # 제도권 파이프라인 4기능 (사장 지시 2026-06-04)
     "MAX_BUY_NAMES", "POSITION_SIZING_MODE", "SIZING_TILT_STRENGTH", "SIZING_MAX_TILT",
     "UNIVERSE_MIN_PRICE", "UNIVERSE_MIN_TURNOVER", "UNIVERSE_EXCLUDE_LEVERAGED",
@@ -420,7 +491,8 @@ STRATEGY_TUNABLE_KEYS = [
     "ENABLE_NXT_EXTENDED_HOURS", "ENABLE_NXT_PRE_MARKET", "ENABLE_NXT_AFTER_MARKET",
     "EXT_HOURS_LIMIT_SLIPPAGE_PCT", "EXT_HOURS_MAX_PREMIUM_PCT",
     # ADMIN 인텔리전스 공유 (사장 지시 2026-06-08)
-    "SHARE_MARKET_INTELLIGENCE", "SHARE_PRODUCER_WAIT_SEC",
+    "SHARE_MARKET_INTELLIGENCE", "SHARE_PRODUCER_WAIT_SEC", "SHARE_STALE_OK_SEC",
+    "QUANT_CONCURRENCY",
     # 채권 ETF 자동매매 (사장 지시 2026-06-08)
     "ENABLE_BOND_ETF", "BOND_TARGET_MAX_PCT", "BOND_REBALANCE_BAND_PCT",
     "BOND_PER_CYCLE_RATIO",
@@ -463,6 +535,10 @@ STRATEGY_KEY_META = {
     "CONTINUOUS_MIN_GAP_SEC":     {"label": "연속 사이클 최소 간격", "type": "int", "unit": "초",
                                    "help": "연속 사이클 사이 최소 대기(초). KIS 초당 거래건수·뉴스 크롤 여유용 하한.",
                                    "min": 5, "max": 600, "step": 5, "group": "사이클"},
+    "CONTINUOUS_MIN_CYCLE_SEC":   {"label": "연속 사이클 최소 주기", "type": "int", "unit": "초",
+                                   "help": "연속 사이클의 시작~시작 최소 주기. 사이클이 이보다 빨리 끝나면 "
+                                           "이 경계까지 기다렸다 재발화(빈 사이클 공회전 방지). 0=제한없음",
+                                   "min": 0, "max": 3600, "step": 30, "group": "사이클"},
     "PER_ORDER_BUDGET_RATIO":     {"label": "1주문 예수금 사용 비율", "type": "pct_ratio", "unit": "%",
                                    "help": "한 번 매수 시 예수금의 최대 X%까지 사용 (예: 10 = 예수금의 10%)",
                                    "min": 1, "max": 100, "step": 1, "group": "사이징"},
@@ -546,6 +622,10 @@ STRATEGY_KEY_META = {
                                    "help": "외인+기관 순매수 가중치. +면 순매수 우호", "min": -50, "max": 50, "step": 1, "group": "퀀트 지표 가중치"},
     "QIW_HIGH52":                 {"label": "지표 가중치: 52주 신고가 근접", "type": "int", "unit": "",
                                    "help": "신고가 근접 가중치. +면 신고가 모멘텀 우호", "min": -50, "max": 50, "step": 1, "group": "퀀트 지표 가중치"},
+    "QIW_LEADLAG":                {"label": "지표 가중치: 선행-후행(그랜저)", "type": "int", "unit": "",
+                                   "help": "선행주가 최근 30분(≥) 시장대비 오르면 후행주 가점(+). 자체 분봉(market_bars) 기반 30분 지평 신호", "min": -50, "max": 50, "step": 1, "group": "퀀트 지표 가중치"},
+    "QIW_VOLUME_SURGE":           {"label": "지표 가중치: 거래량 급증", "type": "int", "unit": "",
+                                   "help": "당일 거래량이 20일 평균 대비 급증하면 가점(+, 거래량 동반 돌파). 음수면 급증 회피", "min": -50, "max": 50, "step": 1, "group": "퀀트 지표 가중치"},
     # 차원 가중치 + 토글
     "DW_QUANT":                   {"label": "차원 가중치: 퀀트(기술)", "type": "int", "unit": "",
                                    "help": "최종 점수에서 퀀트(지표) 차원 비중(signed)", "min": -100, "max": 100, "step": 5, "group": "점수 차원"},
@@ -555,6 +635,40 @@ STRATEGY_KEY_META = {
                                    "help": "매크로 권고 주식비중 차원(signed). +면 강세 매크로일수록 가점", "min": -100, "max": 100, "step": 5, "group": "점수 차원"},
     "DETERMINISTIC_SCORING":      {"label": "결정론 점수 사용(끄면 구 LLM 채점)", "type": "bool",
                                    "help": "ON=퀀트점수를 파이썬이 결정론적으로 산정(일관). OFF=구 LLM 정성 채점으로 롤백", "group": "점수 차원"},
+    # 그랜저 선행-후행 신호 (사장 지시 2026-07-21)
+    "ENABLE_LEADLAG_SIGNAL":      {"label": "선행-후행 신호 사용(그랜저 30분)", "type": "bool",
+                                   "help": "ON이면 선행주가 최근 30분+ 시장대비 오른 후행주를 매수 후보로 보강 + 계량 팩터 반영. 자체 분봉(market_bars) 기반",
+                                   "group": "선행-후행"},
+    "LEADLAG_LOOKBACK_MIN":       {"label": "선행주 최근 이동 판별 창(분)", "type": "int", "unit": "분",
+                                   "help": "선행주가 '최근에 올랐다'를 볼 창(분). 사이클이 20분+ 걸리므로 최소 30분",
+                                   "min": 30, "max": 180, "step": 10, "group": "선행-후행"},
+    "LEADLAG_MIN_BUY_SIGNAL":     {"label": "선행-후행 매수 보강 문턱(0~1)", "type": "pct_raw", "unit": "",
+                                   "help": "후행주 신호가 이 값 이상일 때만 신규 매수 후보로 보강(올리면 강한 신호만·보수적)",
+                                   "min": 0.0, "max": 1.0, "step": 0.05, "group": "선행-후행"},
+    "ENABLE_LEADLAG_SELL":        {"label": "선행-후행 매도(선행주 급락→후행주)", "type": "bool",
+                                   "help": "ON이면 선행주가 최근 30분+ 시장대비 급락한 보유 후행주를 절반 부분매도(선행-후행 대칭 방어)",
+                                   "group": "선행-후행"},
+    "MAX_PORTFOLIO_CORRELATION":  {"label": "포트폴리오 상관 상한(신규매수 제한)", "type": "pct_raw", "unit": "",
+                                   "help": "신규 후보의 30분 수익률 상관이 보유종목 중 이 값을 초과하면 매수 제외(분산). 0=제한없음",
+                                   "min": 0.0, "max": 1.0, "step": 0.05, "group": "리스크"},
+    "LOSS_STREAK_HALT":           {"label": "연속 손절 매수중단 (회로차단)", "type": "int", "unit": "회",
+                                   "help": "최근 실현매도가 이 횟수만큼 연속 손실이면 이번 사이클 신규매수 중단. 0=제한없음",
+                                   "min": 0, "max": 10, "step": 1, "group": "리스크"},
+    "SKIP_OPEN_MIN":              {"label": "개장 후 매수회피 시간(분)", "type": "int", "unit": "분",
+                                   "help": "장 개장 후 이 분 안에는 신규매수 회피(개장 변동성 구간). 0=제한없음",
+                                   "min": 0, "max": 60, "step": 5, "group": "매매 타이밍"},
+    "SKIP_CLOSE_MIN":             {"label": "마감 전 매수회피 시간(분)", "type": "int", "unit": "분",
+                                   "help": "장 마감 전 이 분 안에는 신규매수 회피. 0=제한없음",
+                                   "min": 0, "max": 60, "step": 5, "group": "매매 타이밍"},
+    "MAX_GAP_UP_PCT":             {"label": "매수 허용 최대 갭업(%)", "type": "pct_raw", "unit": "%",
+                                   "help": "시가가 전일종가 대비 이 % 초과 갭업한 종목은 신규매수 제외(추격 회피). 0=제한없음",
+                                   "min": 0.0, "max": 30.0, "step": 0.5, "group": "종목 필터"},
+    "NEWS_DECAY_HOURS":           {"label": "뉴스 신선도 감쇠 시간(h)", "type": "pct_raw", "unit": "시간",
+                                   "help": "이 시간을 초과한 뉴스는 감성 가중이 지수 감쇠(오래된 뉴스가 계속 가점되는 것 방지). 0=감쇠없음",
+                                   "min": 0.0, "max": 168.0, "step": 6.0, "group": "종목 필터"},
+    "REGIME_ADAPTIVE":            {"label": "레짐 자동전환(KOSPI 추세)", "type": "bool",
+                                   "help": "ON이면 KOSPI가 20일선 아래(약세)면 방어(엄선·예산축소), 위(강세)면 공격(예산확대)으로 자동 틸트",
+                                   "group": "레짐 대응"},
     # (C) 레짐 대응
     "MACRO_STOCK_GATE_ENABLED":   {"label": "매크로 주식비중 매수게이트", "type": "bool",
                                    "help": "ON이면 매크로 권고 주식비중 ≤ 현재 주식 평가비중일 때 신규 매수평가를 건너뜀(매도/관리만)",
@@ -604,6 +718,12 @@ STRATEGY_KEY_META = {
     "SHARE_PRODUCER_WAIT_SEC":    {"label": "공유 대기 타임아웃", "type": "int", "unit": "초",
                                    "help": "공유받는 계정이 생산 계정의 게시를 기다리는 최대 초. 초과하면 자체 계산(생산자 부재 대응)",
                                    "min": 10, "max": 600, "step": 10, "group": "비용"},
+    "SHARE_STALE_OK_SEC":         {"label": "공유 분석 재사용 허용 시간", "type": "int", "unit": "초",
+                                   "help": "직전 시각에 게시된 매크로·뉴스 분석을 이 시간 안이면 재사용. 올리면 LLM 호출↓, 내리면 신선도↑",
+                                   "min": 0, "max": 3600, "step": 300, "group": "비용"},
+    "QUANT_CONCURRENCY":          {"label": "계량분석 동시 실행 수", "type": "int", "unit": "개",
+                                   "help": "종목별 계량분석을 몇 개씩 동시에 돌릴지. 올리면 사이클이 짧아지고 로컬 LLM 슬롯을 더 씀(1=순차)",
+                                   "min": 1, "max": 4, "step": 1, "group": "비용"},
     # 채권 ETF 자동매매 (사장 지시 2026-06-08)
     "ENABLE_BOND_ETF":         {"label": "채권 ETF 자동매매(채권운용실장)", "type": "bool",
                                 "help": "켜면 매크로 채권 비중 권고를 채권 ETF 매수/매도로 실현. 끄면 채권 트랙 전체 스킵.",
@@ -691,6 +811,19 @@ STRATEGY_KEY_EFFECT = {
     "QIW_CMF": "+면 매집(자금유입) 가점·분산 감점. 음수면 반대.",
     "QIW_FLOW": "+면 외인·기관 순매수에 가점. 음수면 반대(역행).",
     "QIW_HIGH52": "+면 52주 신고가 근접에 가점(모멘텀). 음수면 고점 회피.",
+    "QIW_LEADLAG": "+면 선행주(그랜저)가 최근 30분+ 오른 후행주에 가점(선행-후행 추종). 0이면 선행-후행 무시.",
+    "ENABLE_LEADLAG_SIGNAL": "켜면 선행-후행 신호로 후행주 매수후보 보강 + 계량 팩터 반영(30분 지평), 끄면 미사용.",
+    "LEADLAG_LOOKBACK_MIN": "올리면 더 오래된 선행주 이동까지 반영(느린 추종), 내리면 최신 이동만(단, 최소 30분).",
+    "LEADLAG_MIN_BUY_SIGNAL": "올리면 강한 선행-후행 신호만 신규 매수(보수적), 내리면 폭넓게 보강.",
+    "QIW_VOLUME_SURGE": "+면 거래량 급증(돌파)에 가점(추세추종). 음수면 급증 회피(과열 경계).",
+    "ENABLE_LEADLAG_SELL": "켜면 선행주 급락 시 보유 후행주 부분매도(선행-후행 대칭 방어), 끄면 매도 신호 미사용.",
+    "MAX_PORTFOLIO_CORRELATION": "내리면 보유와 비슷한 종목 매수 강하게 제한(분산·방어), 올리면 허용(집중). 0=제한없음.",
+    "LOSS_STREAK_HALT": "내리면 연속손절 몇 번에 바로 매수중단(방어·급락장), 올리면 손실 감내. 0=제한없음.",
+    "SKIP_OPEN_MIN": "올리면 개장 변동성 구간을 더 오래 피함(안정), 0=제한없음.",
+    "SKIP_CLOSE_MIN": "올리면 마감 임박 매수를 더 오래 피함(종가 왜곡 회피), 0=제한없음.",
+    "MAX_GAP_UP_PCT": "내리면 작은 갭업도 추격매수 회피(보수), 올리면 갭 추격 허용. 0=제한없음.",
+    "NEWS_DECAY_HOURS": "내리면 최신 뉴스만 감성 반영(신선도↑), 올리면 오래된 뉴스도 유지. 0=감쇠없음.",
+    "REGIME_ADAPTIVE": "켜면 KOSPI 약세장엔 방어(엄선·예산↓)·강세장엔 공격(예산↑)으로 자동 전환, 끄면 고정.",
     "DW_QUANT": "올리면 최종 점수에서 기술(지표) 비중↑.",
     "DW_NEWS": "올리면 뉴스 감성 비중↑. 음수면 호재일수록 감점(역발상).",
     "DW_MACRO": "올리면 매크로 레짐 비중↑(강세 매크로 가점·약세 감점). 음수면 역발상.",
@@ -719,6 +852,8 @@ STRATEGY_KEY_EFFECT = {
     "ENABLE_NXT_AFTER_MARKET": "켜면 애프터마켓(15:50–20:00) NXT 매매, 끄면 해당 구간 매매 안 함.",
     "EXT_HOURS_LIMIT_SLIPPAGE_PCT": "올리면 시간외 지정가를 현재가에서 더 멀리(체결확률↑·슬리피지↑), 내리면 가깝게.",
     "SHARE_MARKET_INTELLIGENCE": "켜면 ADMIN이 매크로·뉴스 분석을 1회만 하고 다른 계정이 공유(LLM 비용↓), 끄면 계정마다 각자 계산.",
+    "QUANT_CONCURRENCY": "올리면 종목별 계량분석을 더 많이 동시 실행(사이클 단축), 내리면 LLM 슬롯 점유↓(1=순차).",
+    "SHARE_STALE_OK_SEC": "직전 시각에 게시된 매크로·뉴스 분석을 이 시간 안이면 재사용(중복 LLM 호출 방지).",
     "SHARE_PRODUCER_WAIT_SEC": "올리면 ADMIN 분석을 더 오래 기다림(공유 적중↑), 내리면 빨리 자체계산으로 전환(지연↓).",
     "ENABLE_BOND_ETF": "켜면 매크로 채권 권고를 채권 ETF로 실현(자산배분 충실), 끄면 채권 매매 안 함.",
     "BOND_TARGET_MAX_PCT": "올리면 채권에 더 많이 배분 허용, 내리면 채권 상한 축소.",
@@ -740,6 +875,7 @@ STRATEGY_KEY_EFFECT = {
 # (OPS_PROTECTED_KEYS 는 tier 와 무관하게 ops 자율변경 불가 — partition_protected 가 먼저 처리.)
 STRATEGY_WEEKLY_TIER_KEYS = {
     "QIW_RSI", "QIW_MACD", "QIW_ADX", "QIW_VWAP", "QIW_VOL", "QIW_MOM", "QIW_CMF", "QIW_FLOW", "QIW_HIGH52",
+    "QIW_LEADLAG", "QIW_VOLUME_SURGE",
     "DW_QUANT", "DW_NEWS", "DW_MACRO", "DETERMINISTIC_SCORING",
     "POSITION_SIZING_MODE", "SIZING_TILT_STRENGTH", "SIZING_MAX_TILT",
     "UNIVERSE_MIN_PRICE", "UNIVERSE_MIN_TURNOVER", "UNIVERSE_EXCLUDE_LEVERAGED",
@@ -766,7 +902,11 @@ STRATEGY_DEFAULTS = {
     "REQUIRE_FOREIGN_NET_BUY": False, "MAX_PRICE_EXTENSION_PCT": 0,
     "ENABLE_COST_EDGE_GATE": True, "MIN_NET_EDGE_PCT": 0.8,
     "QIW_RSI": 5, "QIW_MACD": 10, "QIW_ADX": 8, "QIW_VWAP": 8, "QIW_VOL": 8,
-    "QIW_MOM": 12, "QIW_CMF": 8, "QIW_FLOW": 12, "QIW_HIGH52": 8,
+    "QIW_MOM": 12, "QIW_CMF": 8, "QIW_FLOW": 12, "QIW_HIGH52": 8, "QIW_LEADLAG": 8, "QIW_VOLUME_SURGE": 8,
+    "ENABLE_LEADLAG_SIGNAL": True, "LEADLAG_LOOKBACK_MIN": 30, "LEADLAG_MIN_BUY_SIGNAL": 0.5,
+    "ENABLE_LEADLAG_SELL": True, "MAX_PORTFOLIO_CORRELATION": 0.75, "LOSS_STREAK_HALT": 3,
+    "SKIP_OPEN_MIN": 5, "SKIP_CLOSE_MIN": 5, "MAX_GAP_UP_PCT": 5.0,
+    "REGIME_ADAPTIVE": True, "NEWS_DECAY_HOURS": 24.0,
     "DW_QUANT": 60, "DW_NEWS": 25, "DW_MACRO": 15,
     "DETERMINISTIC_SCORING": True, "MACRO_STOCK_GATE_ENABLED": True,
     "MAX_BUY_NAMES": 8, "POSITION_SIZING_MODE": "risk_weighted",
@@ -790,12 +930,27 @@ APP_PORT = int(os.getenv("APP_PORT", "8500"))
 # ─── Timefolio 대회 전용 사이클 (timefolio_swarm.py — 사장 지시 2026-07-09) ────
 # account_mode=timefolio 계정만 쓰는 파라미터. KIS 파이프라인과 무관.
 TIMEFOLIO_UNIVERSE_CSV = os.getenv(
-    "TIMEFOLIO_UNIVERSE_CSV", "/home/arcosium/projects/Lag_Trading/data/universe.csv")
+    "TIMEFOLIO_UNIVERSE_CSV", str(BASE_DIR / "data" / "universe.csv"))   # market_bars 크롤러가 갱신
 TIMEFOLIO_BARS_DB = os.getenv(
-    "TIMEFOLIO_BARS_DB", "/home/arcosium/projects/Lag_Trading/data/bars.db")   # 읽기 전용(모멘텀 스크린)
+    "TIMEFOLIO_BARS_DB", str(BASE_DIR / "data" / "bars.db"))   # 읽기 전용(모멘텀 스크린), market_bars 수집
 TIMEFOLIO_MOVERS_TOP = int(os.getenv("TIMEFOLIO_MOVERS_TOP", "12"))            # 분봉 모멘텀 상위 N
 TIMEFOLIO_MAX_CANDIDATES = int(os.getenv("TIMEFOLIO_MAX_CANDIDATES", "16"))    # 적격 스크리닝 입력 상한
 TIMEFOLIO_FINALISTS = int(os.getenv("TIMEFOLIO_FINALISTS", "8"))               # 퀀트·LLM에 올릴 후보 상한
 TIMEFOLIO_MAX_BUYS_PER_CYCLE = int(os.getenv("TIMEFOLIO_MAX_BUYS_PER_CYCLE", "3"))
 TIMEFOLIO_SMALLCAP_BUDGET_PCT = float(os.getenv("TIMEFOLIO_SMALLCAP_BUDGET_PCT", "27"))  # 룰 30% - 버퍼
 TIMEFOLIO_CASH_FLOOR_PCT = float(os.getenv("TIMEFOLIO_CASH_FLOOR_PCT", "2"))   # 최소 현금 유보(주문 거부 방지)
+
+# ─── 타임폴리오 대회 규정으로 고정되는 전략 파라미터 (사장 지시 2026-07-21) ────────
+# 타임폴리오 프로필은 (대회 규정과 충돌하는) 아래 파라미터를 웹·운용지원으로 바꿀 수 없다.
+# 규정: 국내(KOSPI/KOSDAQ) 주식만·단일종목 15%·소형주 30%·정규장. 그 외 전략 파라미터와
+# 운용지원(자동 튜닝)은 자유롭게 조정 가능하다(runtime.set_strategy 가 이 값으로 강제 클램프).
+TIMEFOLIO_LOCKED_PARAMS = {
+    "CONSERVATIVE_STOCK_RATIO": 0.15,    # 단일종목 비중 상한 = 대회 15%
+    "ALLOW_US_STOCKS": False,            # 대회 = 국내주식만
+    "ALLOW_DERIVATIVES": False,
+    "ENABLE_BOND_ETF": False,            # 대회 = 주식만(채권·원자재 트랙 없음)
+    "ENABLE_COMMODITY_ETF": False,
+    "ENABLE_NXT_EXTENDED_HOURS": False,  # 대회 = 정규장(NXT 시간외 없음)
+    "ENABLE_NXT_PRE_MARKET": False,
+    "ENABLE_NXT_AFTER_MARKET": False,
+}

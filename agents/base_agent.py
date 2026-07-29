@@ -158,6 +158,12 @@ class BaseAgent:
                     record_error(self.name, _re, context=(
                         f"빈응답 재시도 예외 | model={self.model} | max_tokens={_retry_max}"), uid=self.uid)
 
+            # 사장 지시(재발 2026-07-29): 마크다운 굵게(`**`)는 채팅 UI에서 그대로 노출된다.
+            # 프롬프트 금지만으로는 로컬 모델이 계속 쓰므로 여기서 결정론적으로 제거한다
+            # (히스토리에 넣기 전에 지워 다음 턴이 `**` 를 흉내내지 않게 한다).
+            from infra.local_llm_client import strip_markdown_emphasis
+            reply = strip_markdown_emphasis(reply)
+
             # Update history (bounded — only the last few exchanges are ever resent anyway)
             self.conversation_history.append({"role": "user", "content": user_content})
             self.conversation_history.append({"role": "assistant", "content": reply})

@@ -41,6 +41,9 @@ FACT, ESTIMATE, UNVERIFIED = "사실", "추정", "미확인"
 BUY, HOLD, AVOID = "매수", "보류", "회피"
 PASS_V, REDUCE, BLOCK = "통과", "축소", "차단"
 _STANCES = (BUY, HOLD, AVOID)
+# 보유 매도 심의 스탠스 (사장 지시 2026-07-29) — 그대로 사후관리 매도지시(sell_directives)가 된다.
+KEEP, HALF, ALL = "유지", "절반", "전량"
+_SELL_STANCES = (KEEP, HALF, ALL)
 
 # 공시·뉴스 텍스트에서 결정론으로 잡는 신용 레드플래그 키워드 (QIS research.py 사상)
 _CRIT_KEYWORDS = ("관리종목", "거래정지", "상장폐지", "감사의견 거절", "의견거절",
@@ -202,6 +205,13 @@ _PERSONAS = {
     "chief": ("주식운용실장", "회의록 전체(팀장 의견 + 찬반 토론)를 종합해 최종 결정을 내린다. "
                             "옹호/반론 중 더 논증이 튼튼한 쪽을 채택하되, 회피 의견의 근거가 사실(출처)에 "
                             "기반하면 보수적으로 판단한다."),
+    # 보유 매도 심의 (사장 지시 2026-07-29) — 매도 판단을 사후관리실장 단독이 아닌 찬반토론으로.
+    "keep": ("유지 심사역", "사후관리실장 산하 서브에이전트. 역할상 무조건 '계속 보유'를 옹호한다 — "
+                          "매수 논거가 아직 유효한 이유·매도의 기회비용·거래비용을 근거로 주장하고, "
+                          "매도 심사역의 직전 논거를 반박한다."),
+    "sell": ("매도 심사역", "사후관리실장 산하 서브에이전트. 역할상 무조건 '지금 매도'를 주장한다 — "
+                          "손절·익절 규율, 훼손된 투자논거, 더 나은 대안을 근거로 주장하고, "
+                          "유지 심사역의 직전 논거를 반박한다."),
 }
 
 _MEETING_RULES = """회의 규칙:
@@ -236,7 +246,8 @@ async def _turn(role: str, brief: str, dialogue: List[dict], ask: str,
                 want_stance: bool, want_claims: bool = False,
                 thinking: Optional[bool] = None,
                 name_override: Optional[str] = None,
-                persona_override: Optional[str] = None) -> Optional[dict]:
+                persona_override: Optional[str] = None,
+                stances: Optional[tuple] = None) -> Optional[dict]:
     """한 발언(턴) LLM 호출 → {"text", "stance"?, "confidence"?, "claims"?} | None(실패).
     name_override/persona_override: 슬리브 심의 등에서 chief 를 채권·원자재운용실장으로
     바꿔 부를 때 시스템 프롬프트의 직책·역할 설명을 치환한다(주식 심의 경로엔 미영향)."""
@@ -245,11 +256,12 @@ async def _turn(role: str, brief: str, dialogue: List[dict], ask: str,
         name = name_override
     if persona_override:
         persona = persona_override
+    _st = tuple(stances or _STANCES)
     if want_stance and want_claims:
-        fmt = ('{"발언":"결정 근거 2~3문장", "스탠스":"매수|보류|회피", "확신":0~100, '
+        fmt = ('{"발언":"결정 근거 2~3문장", "스탠스":"' + "|".join(_st) + '", "확신":0~100, '
                '"claims":[{"text":"제공 사실 밖 주장(있을 때만)","fact_ref":null}]}')
     elif want_stance:
-        fmt = '{"발언":"...", "스탠스":"' + "|".join(_STANCES) + '", "확신":0~100}'
+        fmt = '{"발언":"...", "스탠스":"' + "|".join(_st) + '", "확신":0~100}'
     else:
         fmt = '{"발언":"..."}'
     try:
@@ -273,7 +285,7 @@ async def _turn(role: str, brief: str, dialogue: List[dict], ask: str,
         # 턴 텍스트 캡 400→600, 브로드캐스트 절단도 호출부에서 완화.
         out: Dict[str, Any] = {"text": text[:600]}
         if want_stance:
-            if d.get("스탠스") not in _STANCES:
+            if d.get("스탠스") not in _st:
                 return None
             out["stance"] = d["스탠스"]
             try:
@@ -458,6 +470,89 @@ async def deliberate_sleeve_buy(code: str, name: str, *, sleeve_label: str,
         llm_used = True
     dialogue.append({"speaker": chief_label, "role": "chief", "text": r["text"], "stance": r["stance"]})
     await _emit(chief_label, f"[{name} {sleeve_label} 심의 결정] {r['stance']} — {r['text'][:400]}")
+    return dialogue, {"stance": r["stance"], "text": r["text"],
+                      "confidence": float(r.get("confidence", 0.6))}, llm_used
+
+
+# ── 보유 매도 심의 (사장 지시 2026-07-29) ────────────────────────────────────────
+def _fmt_sell_brief(code: str, name: str, *, qty: int, pnl_pct: float, hold_days,
+                    manager_view: str, thesis: str, quant_excerpt: str,
+                    news_excerpt: str, macro_view: str, chief_label: str) -> str:
+    _hd = f"{float(hold_days):.1f}일" if hold_days is not None else "미상"
+    return f"""[심의 대상 — 보유 포지션] {name} ({code})
+[보유] {int(qty or 0):,}주 · 평가손익 {float(pnl_pct or 0.0):+.2f}% · 보유기간 {_hd}
+[{chief_label} 1차 판단·근거]
+{(manager_view or '(없음)')[:1200]}
+[매수 당시 계획(thesis)] {(thesis or '(없음)')[:400]}
+[계량분석 발췌] {quant_excerpt or '(없음)'}
+[뉴스 발췌] {news_excerpt or '(없음)'}
+[매크로] {macro_view or '(없음)'}
+※ 결론은 반드시 '유지 | 절반 | 전량' 중 하나다. '절반'은 부분 익절/리스크 축소, '전량'은 청산이다."""
+
+
+async def deliberate_position_sell(code: str, name: str, *, qty: int, pnl_pct: float,
+                                   hold_days=None, manager_view: str = "",
+                                   thesis: str = "", quant_excerpt: str = "",
+                                   news_excerpt: str = "", macro_view: str = "",
+                                   chief_label: str = "사후관리실장",
+                                   fallback_directive: str = KEEP,
+                                   progress: Optional[Callable[[str, str], Awaitable[None]]] = None,
+                                   ) -> Tuple[List[dict], dict, bool]:
+    """보유 1종목 매도 심의 — 유지 심사역 ↔ 매도 심사역 N라운드 → 사후관리실장 최종 결정.
+
+    사장 지시 2026-07-29: 매도 판단이 사후관리실장 단독이던 것을 매수 심의와 동일한 찬반토론
+    구조로 바꾼다. 결정 스탠스(유지|절반|전량)는 **그대로 매도지시가 되어 실주문에 반영**된다.
+    LLM 실패는 사이클을 막지 않는다 — 그 턴만 결정론 폴백, 최종 실패면 `fallback_directive`
+    (사후관리실장 1차 판단)를 그대로 유지한다(매도 누락 금지 원칙).
+    반환 (dialogue, {stance, text, confidence}, llm_used)."""
+    brief = _fmt_sell_brief(code, name, qty=qty, pnl_pct=pnl_pct, hold_days=hold_days,
+                            manager_view=manager_view, thesis=thesis,
+                            quant_excerpt=quant_excerpt, news_excerpt=news_excerpt,
+                            macro_view=macro_view, chief_label=chief_label)
+    _chief_persona = (f"보유 포지션 사후관리를 총괄하는 {chief_label}이다. 유지/매도 찬반토론을 종합해 "
+                      "이 포지션을 '유지·절반·전량' 중 어떻게 할지 최종 결정한다 — "
+                      "손절·익절 규율과 투자논거 훼손 여부를 함께 본다.")
+    dialogue: List[dict] = []
+    llm_used = False
+
+    async def _emit(agent: str, msg: str):
+        if progress:
+            try:
+                await progress(agent, msg)
+            except Exception:
+                pass
+
+    for rnd in range(1, DEBATE_ROUNDS + 1):
+        ask_keep = ("이 포지션을 계속 보유해야 하는 논거를 제시하라."
+                    if rnd == 1 else f"매도 심사역의 직전 논거를 반박하라. (라운드 {rnd})")
+        ask_sell = ("이 포지션을 지금 매도해야 하는 논거를 제시하라."
+                    if rnd == 1 else f"유지 심사역의 직전 논거를 반박하라. (라운드 {rnd})")
+        for role, ask, fb in (
+                ("keep", ask_keep,
+                 f"평가손익 {float(pnl_pct or 0.0):+.1f}% — 매수 논거가 깨졌다는 근거가 없다면 회전비용만 늘어난다."),
+                ("sell", ask_sell,
+                 f"평가손익 {float(pnl_pct or 0.0):+.1f}% — 규율대로 이익은 확정하고 손실은 끊어야 한다.")):
+            r = await _turn(role, brief, dialogue, ask, False, thinking=False)
+            if r:
+                llm_used = True
+            else:
+                r = {"text": fb}
+            dialogue.append({"speaker": _PERSONAS[role][0], "role": role,
+                             "text": r["text"], "round": rnd})
+            await _emit(_PERSONAS[role][0], f"[{name} 매도심의 R{rnd}] {r['text'][:200]}")
+
+    r = await _turn("chief", brief, dialogue,
+                    "찬반토론을 종합해 이 포지션을 어떻게 할지 최종 결정하라(유지|절반|전량).",
+                    True, thinking=False, stances=_SELL_STANCES,
+                    name_override=chief_label, persona_override=_chief_persona)
+    if r is None:
+        _fb = str(fallback_directive or KEEP).strip()
+        r = {"text": f"{chief_label} 1차 판단 유지 — LLM 심의 불가로 결정론 폴백('{_fb}').",
+             "stance": (_fb if _fb in _SELL_STANCES else KEEP), "confidence": 0.6}
+    else:
+        llm_used = True
+    dialogue.append({"speaker": chief_label, "role": "chief", "text": r["text"], "stance": r["stance"]})
+    await _emit(chief_label, f"[{name} 매도심의 결정] {r['stance']} — {r['text'][:400]}")
     return dialogue, {"stance": r["stance"], "text": r["text"],
                       "confidence": float(r.get("confidence", 0.6))}, llm_used
 

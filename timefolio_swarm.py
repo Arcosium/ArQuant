@@ -18,6 +18,7 @@ LLM 은 2회: 마켓센티먼트(뉴스) + 타임폴리오운용실장(매도/�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sqlite3
@@ -359,6 +360,86 @@ def _standing_block(orch) -> str:
         return ""
 
 
+# ─── 접수(미체결) 주문 체결 확인 ──────────────────────────────────────────────
+# 상대호가 주문은 제출 직후 '접수(미체결)'이고 사이트가 나중에 채운다. 그 체결을 관측하는
+# 주체가 없어 원장·거래내역이 비고 화면엔 '실패'만 남았다(사장 보고 2026-07-29).
+# 다음 사이클 시작 시 사이트 권위 보유수량과 대조해 체결분을 확정한다.
+
+def _pending_path(uid: int):
+    from infra import user_paths
+    return user_paths.user_dir(uid) / "tf_pending_orders.json"
+
+
+def _load_pending(uid: int) -> List[Dict]:
+    try:
+        p = _pending_path(uid)
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _save_pending(uid: int, rows: List[Dict]) -> None:
+    try:
+        _pending_path(uid).write_text(json.dumps(rows or [], ensure_ascii=False, indent=2),
+                                      encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[타임폴리오 uid=%s] 미체결 주문 저장 실패: %s", uid, e)
+
+
+def resolve_pending(pending: List[Dict], holdings: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """(체결확정, 아직미결) — 순수 함수. 사이트 보유수량이 주문 방향대로 움직였으면 체결로 본다.
+
+    체결 수량은 `|현재수량 − 주문직전수량|` 을 주문수량으로 캡한다(부분체결·외부거래 방어).
+    반대 방향으로 움직였거나 변화가 없으면 아직 미결로 남긴다. 3사이클 지나면 포기(취소 추정)."""
+    held = {str(h.get("code") or "").zfill(6): int(float(h.get("qty") or 0)) for h in (holdings or [])}
+    done, still = [], []
+    for p in (pending or []):
+        code = str(p.get("ticker") or "").zfill(6)
+        before = int(p.get("before_qty") or 0)
+        now = held.get(code, 0)
+        delta = (now - before) if p.get("side") == "buy" else (before - now)
+        if delta > 0:
+            done.append({**p, "fill_qty": min(int(delta), int(p.get("qty") or 0))})
+        elif int(p.get("age", 0)) + 1 >= 3:
+            continue          # 3사이클 무변화 = 사이트가 취소한 것으로 보고 폐기
+        else:
+            still.append({**p, "age": int(p.get("age", 0)) + 1})
+    return done, still
+
+
+async def _confirm_pending_fills(orch, ms, uid: int, holdings: List[Dict]) -> None:
+    pending = _load_pending(uid)
+    if not pending:
+        return
+    try:
+        done, still = resolve_pending(pending, holdings)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[타임폴리오 uid=%s] 미체결 대조 실패(무시): %s", uid, e)
+        return
+    for p in done:
+        qty, code, side = int(p.get("fill_qty") or 0), str(p.get("ticker")), str(p.get("side"))
+        price = float(p.get("price") or 0.0)
+        orch._trades_executed += 1
+        rec = {"ticker": code, "side": side, "qty": qty, "order_qty": int(p.get("qty") or 0),
+               "result": f"Timefolio 지연 체결 확인: {code} {side} {qty}주", "accepted": True,
+               "filled": True, "ok": True, "fill_price": price, "fill_currency": "KRW",
+               "avg_cost": price}
+        orch._trade_log.append({"ts": ms._now_kst_iso(), **rec})
+        try:
+            ms.trade_ledger.apply_fill(uid, ticker=code, side=side, qty=qty, price=price,
+                                       ccy="KRW", avg_cost=price, note="timefolio_pending_confirm")
+        except Exception as le:  # noqa: BLE001
+            logger.warning("[타임폴리오 원장 uid=%s] 지연체결 반영 실패 %s: %s", uid, code, le)
+        await orch._emit({"type": "trade_executed",
+                          "message": f"✅ 체결 확인(대회) — {code} {'매수' if side == 'buy' else '매도'} {qty}주 "
+                                     f"(직전 사이클 접수분)",
+                          "ticker": code, "side": side, "qty": qty, "filled": True,
+                          "fill_price": price, "fill_currency": "KRW", "avg_cost": price,
+                          "trades_total": orch._trades_executed})
+    if done or len(still) != len(pending):
+        _save_pending(uid, still)
+
+
 # ─── 사이클 본체 ─────────────────────────────────────────────────────────────
 
 async def run_timefolio_cycle(orch, news_articles, user_directive, session, market_open: bool = False):
@@ -411,6 +492,10 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
     orch.cycle_log.log("DATA_COLLECTION", "시스템",
                        f"타임폴리오 계좌: 총평가 {total_eval:,.0f}원 · 현금 {cash:,.0f}원({cash / total_eval * 100:.0f}%)"
                        f" · 보유 {len(holdings)}종목 · 주간회전율 {turnover:.1f}%")
+    # [1b] 직전 사이클의 '접수(미체결)' 주문 체결 확인 — 상대호가 주문은 제출 직후엔 미체결이고
+    # 사이트가 나중에 채운다. 종전엔 그 체결을 아무도 관측하지 않아 원장·거래내역이 영영 비고
+    # (잔고만 변함), 화면엔 '실패'로 남았다 (사장 보고 2026-07-29).
+    await _confirm_pending_fills(orch, ms, uid, holdings)
 
     # [2] 뉴스 분석 (LLM #1) — 기존 마켓센티먼트팀장 재사용, KR 대회 관점 지시만 추가
     orch.current_state = ms.SwarmState.NEWS_ANALYSIS
@@ -615,8 +700,20 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
     orch.current_state = ms.SwarmState.EXECUTION
     exec_results: List[Dict] = []
     from infra.kis_broker import OrderDraft
+    _pending_new: List[Dict] = []
+    _held_now = {str(h.get("code") or "").zfill(6): int(float(h.get("qty") or 0)) for h in holdings}
+    # 아직 사이트에서 작동 중인 주문과 같은 종목·방향은 재제출하지 않는다 — 사이트가
+    # '[TMS] 오류: 전량 청산 주문 작동 시 추가 청산 불가'로 거부하거나(7/24), 둘 다 체결되면
+    # 이중 매도가 된다(7/22 252990). 체결은 위 _confirm_pending_fills 가 확정한다.
+    _still_working = {(str(p.get("ticker") or "").zfill(6), str(p.get("side")))
+                      for p in _load_pending(uid)}
     for od in sell_orders + buy_orders:
         code, side, qty = od["code"], od["side"], int(od["qty"])
+        if (str(code).zfill(6), side) in _still_working:
+            _skip = f"{code} {side} — 직전 사이클 주문이 사이트에서 아직 작동 중(미체결) → 재제출 생략"
+            orch.cycle_log.log("EXECUTION", "시스템", _skip)
+            await orch._emit({"type": "agent_msg", "agent": STRATEGIST_NAME, "message": f"⏳ {_skip}"})
+            continue
         try:
             draft = OrderDraft(ticker=code, side=side, qty=qty,
                                limit_price=od.get("price") or None,
@@ -624,11 +721,18 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
             res = await broker.place_order_ex(draft)
         except Exception as e:  # noqa: BLE001
             res = {"ok": False, "accepted": False, "filled": False, "result": f"주문 예외: {e}"}
+        # ok = '접수됨'(체결 여부 무관). 상대호가 접수는 실패가 아니다 — 사이트가 나중에 채운다.
         rec = {"ticker": code, "side": side, "qty": int(res.get("qty") or qty), "order_qty": qty,
                "result": str(res.get("result") or ""), "accepted": bool(res.get("accepted")),
-               "filled": bool(res.get("filled")), "ok": bool(res.get("filled")),
+               "filled": bool(res.get("filled")), "ok": bool(res.get("accepted")),
+               "pending": bool(res.get("accepted") and not res.get("filled")),
                "fill_price": float(res.get("price") or od.get("price") or 0.0),
                "fill_currency": "KRW", "avg_cost": float(od.get("price") or 0.0)}
+        if rec["pending"]:
+            _pending_new.append({"ticker": str(code).zfill(6), "side": side,
+                                 "qty": rec["qty"], "price": rec["fill_price"],
+                                 "before_qty": _held_now.get(str(code).zfill(6), 0),
+                                 "ts": ms._now_kst_iso(), "age": 0})
         exec_results.append(rec)
         orch.cycle_log.log("EXECUTION", "시스템", f"{code} {side} x{qty} → {rec['result']}")
         if rec["accepted"]:
@@ -651,12 +755,17 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
                               "fill_price": rec["fill_price"], "fill_currency": "KRW",
                               "avg_cost": rec["avg_cost"], "trades_total": orch._trades_executed})
 
+    # 접수(미체결) 주문은 다음 사이클이 사이트 보유수량과 대조해 체결을 확정한다.
+    if _pending_new:
+        _save_pending(uid, _load_pending(uid) + _pending_new)
+
     # [8] 보고 + 영속화 (결정론 템플릿 — 사실만)
     orch.current_state = ms.SwarmState.REPORT
     filled_n = sum(1 for e in exec_results if e.get("filled"))
+    pending_n = sum(1 for e in exec_results if e.get("pending"))
     failed_n = sum(1 for e in exec_results if not e.get("accepted"))
     report = (f"타임폴리오 사이클 — 매도 {len(sell_orders)}건/매수 {len(buy_orders)}건 계획, "
-              f"체결 {filled_n}건, 실패 {failed_n}건. "
+              f"체결 {filled_n}건, 접수대기 {pending_n}건, 실패 {failed_n}건. "
               f"총평가 {total_eval:,.0f}원 · 현금 {cash / total_eval * 100:.0f}% · 회전율 {turnover:.1f}%. "
               f"적격 후보 {len(eligible)}종목 (부적격 제외 {len(rejected)}종목).")
     orch.cycle_log.final_report = report

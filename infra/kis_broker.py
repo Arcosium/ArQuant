@@ -58,6 +58,15 @@ def _sanitize_overseas(krw, stock, exrt, *, min_valid_exrt: float = 500.0):
     return krw, stock
 
 
+def _real_usdkrw() -> float:
+    """실환율(USD/KRW). 모르면 0.0 — 모르면 지어내지 않는다."""
+    try:
+        from tools.market_data import get_usdkrw
+        return float(get_usdkrw(0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
 def kr_net_valuation(scts_eval: float, cash_d2: float, cash_d1: float,
                      prev_settled: Optional[float] = None):
     """현재 평가액(국내 구성) = 국내 유가증권평가액 + D+2 예수금. (해외 외화평가총액은 호출부에서 더한다)
@@ -828,7 +837,10 @@ class KISBroker:
         _kr_total = self._num(snap["buying_power"]["total_eval"])
         snap["buying_power"]["total_eval_kr"] = _kr_total
         _ov_krw, _ov_ts = self._get_overseas_cache()
-        if _ov_krw > 0:
+        # 2026-07-29: `>0` 였던 가드는 **음수 해외분(모의 통합증거금 USD 부채)을 통째로 버렸다** —
+        # 캐시가 -28.99M 인데 안 더해져 사이클/사이징이 보는 총평가가 71M 대신 100M 이 됐다.
+        # 0(=해외 없음)은 더해도 무의미하므로 '0이 아니면' 부호 그대로 반영한다.
+        if _ov_krw:
             snap["buying_power"]["total_eval"] = _kr_total + _ov_krw
             snap["buying_power"]["overseas_krw"] = _ov_krw
         self._acct_snap = snap
@@ -1244,6 +1256,58 @@ class KISBroker:
         self._overseas_krw_cache = (0.0, 0.0)
         return self._overseas_krw_cache
 
+    def _overseas_selfcalc_krw(self, holdings: List[Dict]) -> Dict:
+        """모의서버 기준환율이 garbage 일 때 해외 순평가를 자체 산출한다 (사장 지시 2026-07-22).
+
+        실측(uid2 모의, 2026-07-22):
+          • 보유수량(IEF 97)·현재가($93.31)는 실제와 **일치** → 신뢰 가능.
+          • 오염된 건 기준환율(frst_bltn_exrt 218.31 vs 실제 1480)과 그걸로 환산된
+            총평가(frcr_evlu_tota 357M)뿐. → 환율만 우리 실환율로 갈아끼우면 된다.
+          • 국내 nass_amt = 국내유가증권 + D+2예수금 (차이 0) → 해외분 **미포함**, 더해야 한다.
+
+        ⚠️ 주식분만 더하면 안 된다: 모의는 US 매수 때 KRW 를 전혀 차감하지 않았고(7/21 22:39
+        IEF 97주 매수 전후 D+2 예수금 불변), 그 대가가 **USD 부채**로 남아 있다(원장 cash_usd
+        -9,086). 주식분 13.4M 만 더하면 그만큼 가짜 이득이 된다. 그래서 USD 예수금(음수 포함)을
+        함께 환산해 **순액**으로 더한다 — 매수 시점 총자산이 보존되고(주식 +13.4M, USD현금 -13.4M),
+        이후 IEF 가격 변동만 손익으로 잡힌다.
+
+        USD 예수금 출처: KIS 모의는 frcr_dncl_amt_2 를 0 으로 오보하므로(부채를 안 알려줌)
+        우리 체결 원장의 cash_usd 를 쓴다. 원장이 없으면 산출을 포기한다(0 처리 — 종전 동작).
+
+        ⚠️ 감시 필요(2026-07-22): 모의가 **뒤늦게(US 결제일 T+2~3) KRW 를 차감**하면 부채가
+        이중 계상된다 — KIS 쪽 KRW 예수금이 줄고 우리 원장 cash_usd 도 여전히 음수라 총평가가
+        13.4M 헛빠진다. 아래 INFO 로그가 매 폴마다 (주식 / USD예수금 / 순액)을 찍으니,
+        총평가가 US 매수액만큼 계단식으로 떨어지면 이 경로를 먼저 의심할 것. 그때는 USD 예수금
+        출처를 원장 대신 KIS 실측(또는 KRW 차감 감지 후 원장 cash_usd 상계)으로 바꿔야 한다.
+
+        반환: {ok, krw(순액), stock_krw, usd_cash, fx}. 산출 불가면 ok=False.
+        """
+        fx = _real_usdkrw()
+        usd_stock = sum(self._num(h.get("qty")) * self._num(h.get("cur_price"))
+                        for h in (holdings or []) if h.get("ccy") == "USD")
+        # 2026-07-29: `usd_stock<=0` 조기반환은 **부채를 지웠다**. 모의는 US 매수 때 KRW 를 안
+        # 깎고 USD 부채로 남기므로, 해외 보유목록이 비어도(조회 실패·전량매도 직후) 원장
+        # cash_usd 는 그대로 남는다. 주식분이 0 이어도 부채는 계속 순평가에 반영해야 한다.
+        if fx <= 0:
+            return {"ok": False, "krw": 0.0, "stock_krw": 0.0, "usd_cash": 0.0, "fx": fx}
+        # 브로커는 uid 를 들고 있지 않다. 원장은 data/<uid>/ledger.json 이고 토큰 경로가
+        # data/<uid>/kis_token.json 이므로, 같은 디렉터리에서 직접 읽는다(_settled_cash_path 와 동형).
+        try:
+            _p = self._token_path.parent / "ledger.json"
+            if not _p.exists():
+                return {"ok": False, "krw": 0.0, "stock_krw": 0.0, "usd_cash": 0.0, "fx": fx}
+            led = json.loads(_p.read_text(encoding="utf-8"))
+            if not isinstance(led, dict) or "cash_usd" not in led:
+                return {"ok": False, "krw": 0.0, "stock_krw": 0.0, "usd_cash": 0.0, "fx": fx}
+            usd_cash = float(led.get("cash_usd") or 0.0)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[해외자체산출] 원장 USD 예수금 조회 실패(%s): %s — 자체산출 포기",
+                           self._token_path.parent, e)
+            return {"ok": False, "krw": 0.0, "stock_krw": 0.0, "usd_cash": 0.0, "fx": fx}
+        stock_krw = usd_stock * fx
+        return {"ok": True, "krw": stock_krw + usd_cash * fx, "stock_krw": stock_krw,
+                "usd_cash": usd_cash, "fx": fx}
+
     def _set_overseas_cache(self, krw: float, ts: float, stock: Optional[float] = None,
                             exrt: Optional[float] = None) -> None:
         self._overseas_krw_cache = (float(krw), float(ts))
@@ -1385,6 +1449,25 @@ class KISBroker:
         # 곡선·총평가가 조회 실패로 ~16% 급락하지 않게 한다.
         pk = await self._overseas_present_krw()
         krw = None
+        # 사장 보고 2026-07-29(수익률 ±40% 튐): 모의 자체산출 순평가는 **음수**(USD 부채)일 수
+        # 있고, 그 부채는 US 보유목록이 비어도 남는다. 종전엔 자체산출 진입 조건이
+        # `_us_in_holdings` 라, 해외 보유 조회가 빈 폴마다 -29M 부채가 사라져 총평가가
+        # 71M↔100M 로 튀었다(uid2). 자체산출은 보유목록 유무와 무관하게 시도한다(모의 한정).
+        def _selfcalc_into_bp():
+            """원장 기반 해외 순평가 → (krw, stock_krw) | None. bp 에 투명성 필드도 채운다."""
+            _sc = self._overseas_selfcalc_krw(holdings)
+            if not _sc["ok"] or not (_sc["krw"] or _sc["stock_krw"]):
+                return None
+            bp["overseas_selfcalc"] = True
+            # 표시 투명성: 보유목록엔 US 주식 평가만 보이고 그 대가인 USD 부채는 안 보이므로,
+            # 합이 안 맞아 보인다. 부채분을 별도 필드로 노출한다.
+            bp["overseas_stock_krw"] = _sc["stock_krw"]
+            bp["overseas_usd_cash_krw"] = _sc["usd_cash"] * _sc["fx"]
+            logger.info("[해외자체산출 uid=%s] 주식 %s + USD예수금 %s USD × %s = 순 %s원 "
+                        "(모의 기준환율 %s 무시)", self._token_path.parent.name,
+                        f"{_sc['stock_krw']:,.0f}", f"{_sc['usd_cash']:,.2f}",
+                        f"{_sc['fx']:,.1f}", f"{_sc['krw']:,.0f}", pk.get("exrt"))
+            return _sc["krw"], _sc["stock_krw"]
         if pk["ok"] and pk["krw_value"] > 0:
             krw = pk["krw_value"]                         # 조회 성공 + 평가 있음 = 권위값
             # 사장 지시 2026-06-10: 모의서버 해외 데이터는 평가·기준환율뿐 아니라 보유 가격·수량까지
@@ -1392,6 +1475,12 @@ class KISBroker:
             # 가격×수량×환율 재계산도 입력이 전부 오염돼 무의미하므로, exrt 비정상(<500)이면 해외평가를
             # 신뢰 불가로 0 처리(제외)한다 → 모의 equity = 국내+현금만(안정·정직). 실거래(exrt~1500)는 영향 없음.
             krw, _ov_stock = _sanitize_overseas(krw, pk.get("stock_value"), pk.get("exrt"))
+            # 사장 지시 2026-07-22: 종전엔 여기서 0 처리하고 끝이라 모의계정의 US 평가·손익이
+            # 자산곡선에 영영 안 잡혔다. 수량·현재가는 멀쩡하므로 실환율로 순평가를 자체 산출한다.
+            if krw <= 0:
+                _r = _selfcalc_into_bp()
+                if _r:
+                    krw, _ov_stock = _r
             self._set_overseas_cache(krw, _now, stock=_ov_stock, exrt=pk.get("exrt"))
             # 사장 지시 2026-06-01: 기준환율 sanity 가드 — 모의서버가 비정상 환율(221.9 등)을 주면
             # 전역 FX 캐시(예산·리스크 환산)가 오염돼 실전 계정까지 망가진다. USD/KRW 는 역사적으로 500↑.
@@ -1407,12 +1496,30 @@ class KISBroker:
                 for h in holdings:
                     if h.get("ccy") == "USD":
                         h["krw_value"] = round(self._num(h.get("qty")) * self._num(h.get("cur_price")) * pk["exrt"])
+            else:
+                # 2026-07-22: 기준환율이 비정상(모의)이면 종목별 원화표시가 통째로 빠져
+                # 대시보드 보유목록에서 US 종목만 원화가 비어 보였다 — 실환율로 채운다.
+                _fx = _real_usdkrw()
+                if _fx > 0:
+                    for h in holdings:
+                        if h.get("ccy") == "USD":
+                            h["krw_value"] = round(self._num(h.get("qty")) * self._num(h.get("cur_price")) * _fx)
         elif pk["ok"] and pk["krw_value"] == 0 and not _us_in_holdings:
-            self._set_overseas_cache(0.0, _now)           # 조회 성공 + 평가 0 + 보유목록도 US 없음 = 실제 매도 → 캐시 무효화
+            # 조회 성공 + 평가 0 + 보유목록도 US 없음 = 실제 매도 → 캐시 무효화.
+            # 단 모의는 US 매수분이 KRW 를 안 깎고 USD 부채로 남으므로, 주식이 0 이어도 원장에
+            # 부채가 있으면 그 부채를 유지해야 한다(0 으로 지우면 총평가가 부채만큼 튄다).
+            _r = _selfcalc_into_bp() if self.is_mock else None
+            if _r:
+                krw, _ov_stock = _r
+                self._set_overseas_cache(krw, _now, stock=_ov_stock)
+            else:
+                self._set_overseas_cache(0.0, _now)
         else:
             # 조회 실패(ok=False) 또는 모순(보유목록엔 US인데 평가 0) → 최근 캐시로 보강(곡선 안정)
             _ck, _ct = self._get_overseas_cache()
-            if _ck > 0 and (_now - _ct) < self._OVERSEAS_CACHE_TTL:
+            # 2026-07-29: `_ck > 0` 는 음수 캐시(모의 USD 부채)를 폴백에서 제외해, 조회 실패 폴마다
+            # 부채가 사라지고 총평가가 튀게 만들었다 → 0이 아니면(부호 무관) 폴백한다.
+            if _ck and (_now - _ct) < self._OVERSEAS_CACHE_TTL:
                 # 사장 지시 2026-05-30: stale 캐시값으로 '동결'하면 US 세션 내내 자산곡선이 안 움직인다.
                 # 보유종목 라이브 현재가로 '주식분'을 재계산하고 캐시에 보존된 'USD 예수금분'(총액−주식분)을
                 # 더한다 — 예수금 정확도(2026-05-28 수정)는 지키면서 곡선이 라이브로 움직인다.
@@ -1428,7 +1535,9 @@ class KISBroker:
                                   for h in holdings if h.get("ccy") == "USD") * _exrt
                 _cached_stock = float(getattr(self, "_overseas_stock_krw", 0.0) or 0.0)
                 if _live_stock > 0 and _exrt > 0 and _cached_stock > 0:
-                    krw = _live_stock + max(0.0, _ck - _cached_stock)
+                    # 예수금분 = 캐시총액 − 캐시주식분. `max(0,…)` 로 바닥을 치면 모의 USD
+                    # 부채(음수 예수금)가 지워져 총평가가 부채만큼 튄다 → 부호 보존(2026-07-29).
+                    krw = _live_stock + (_ck - _cached_stock)
                 else:
                     krw = _ck
                 bp["overseas_krw_stale"] = True
@@ -1436,11 +1545,16 @@ class KISBroker:
         # 맞춰 결제 과도기 곡선 출렁임을 줄인다. 결제기준 조회 성공(실전)이면 그 값을, 실패(모의 등)면 위에서
         # 구한 실시간 krw 로 폴백한다. (per-종목 krw_value 표시는 실시간 환율 유지 — '표시=실시간')
         settled = await self._overseas_settled_krw()
-        curve_overseas = settled["krw"] if (settled.get("ok") and self._num(settled.get("krw")) > 0) else krw
-        if curve_overseas and curve_overseas > 0:
+        _use_settled = bool(settled.get("ok") and self._num(settled.get("krw")) > 0)
+        curve_overseas = settled["krw"] if _use_settled else krw
+        # 2026-07-22/29: `> 0` 가드는 '해외분은 항상 양수 자산'을 전제했는데, 자체산출 순액은
+        # USD 부채(통합증거금 매수)가 주식평가를 넘으면 **음수일 수 있다**. 그 경우 가드에 걸려
+        # 통째로 누락되면 US 손익이 안 보이고 총평가가 부채만큼 튄다 → 0이 아니면 부호 그대로
+        # 반영한다(0/None 은 '조회 실패·해외 없음' 이라 더해도 의미 없음 = 종전 동작 유지).
+        if curve_overseas:
             bp["total_eval"] = self._num(bp.get("total_eval")) + curve_overseas
             bp["overseas_krw"] = curve_overseas
-            if settled.get("ok") and self._num(settled.get("krw")) > 0:
+            if _use_settled:
                 bp["overseas_settled"] = True
         # 사장 결정 2026-06-01: 대시보드 '현재 총자산'은 KIS 통합총자산(CTRP6548R tot_asst_amt)으로 — HTS와
         # 일치(실시간). 단 이 값은 예수금이 D0 기반이라 자산곡선(total_eval)엔 절대 반영하지 않는다(5/28 D0 금지).

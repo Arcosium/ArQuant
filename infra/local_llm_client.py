@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -168,7 +169,19 @@ async def chat_completion(
     return await _post_with_retry(url, headers, payload, timeout_sec)
 
 
+_MD_EMPHASIS_RE = re.compile(r"\*\*+")
+
+
+def strip_markdown_emphasis(text: str) -> str:
+    """LLM 응답의 마크다운 굵게 마커(`**`)를 제거한다 (사장 지시 — 재발 2026-07-29).
+
+    채팅 UI는 마크다운을 렌더하지 않아 `**농심**` 이 그대로 노출된다. 전 에이전트 프롬프트에
+    금지를 박아뒀지만 로컬 모델이 계속 무시하므로, 출력 단계에서 결정론적으로 지운다.
+    `**` 런 자체만 지우므로 본문 글자는 하나도 손대지 않는다."""
+    return _MD_EMPHASIS_RE.sub("", text or "")
+
+
 def response_text(data: Dict[str, Any]) -> str:
     choice = (data.get("choices") or [{}])[0] or {}
     message = choice.get("message") or {}
-    return str(message.get("content") or "").strip()
+    return strip_markdown_emphasis(str(message.get("content") or "")).strip()

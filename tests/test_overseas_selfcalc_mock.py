@@ -67,11 +67,18 @@ def test_selfcalc_gives_up_without_fx(tmp_path, monkeypatch):
     assert b._overseas_selfcalc_krw(HOLDINGS)["ok"] is False
 
 
-def test_selfcalc_skipped_without_us_holdings(tmp_path, monkeypatch):
+def test_selfcalc_keeps_debt_without_us_holdings(tmp_path, monkeypatch):
+    """US 보유목록이 비어도 원장 USD 부채는 순평가에 남는다 (사장 보고 2026-07-29).
+
+    종전엔 `usd_stock<=0` 이면 산출을 포기해, 해외 조회가 빈 폴마다 부채가 통째로 사라지고
+    총평가가 71M↔100M(±40%) 로 튀었다. 주식분 0 + 부채만 = 음수 순평가가 정답이다."""
     monkeypatch.setattr("infra.kis_broker._real_usdkrw", lambda: 1475.6)
     b = _broker(tmp_path, {"cash_usd": -9086.0, "positions": {}})
     kr_only = [h for h in HOLDINGS if h["ccy"] == "KRW"]
-    assert b._overseas_selfcalc_krw(kr_only)["ok"] is False
+    out = b._overseas_selfcalc_krw(kr_only)
+    assert out["ok"] is True
+    assert out["stock_krw"] == 0.0
+    assert round(out["krw"]) == round(-9086.0 * 1475.6)
 
 
 def test_sanitize_still_zeroes_garbage_first(tmp_path):

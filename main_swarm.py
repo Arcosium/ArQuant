@@ -1176,6 +1176,18 @@ async def _broadcast(msg, uid=None):
     Phase 2 멀티테넌트: uid 가 주어지면(오케스트레이터 사이클 이벤트) 해당 유저 연결에만,
     uid 가 None 이면(시스템 알림 등) 전체 연결에 송신한다. 라우팅은 app.py 가 등록한
     콜백(_route)이 결정한다."""
+    # 사장 지시(재발 2026-07-29): 대시보드는 마크다운을 렌더하지 않아 `**` 가 그대로 보인다.
+    # LLM 응답은 base_agent/response_text 에서 이미 지우지만, 코드가 직접 만든 문구에도
+    # `**` 가 남아 있었다(예: '굵직한 **40건** 선별'). 브로드캐스트 단일 관문에서 최종 제거.
+    try:
+        if isinstance(msg, dict):
+            _fix = {k: msg[k] for k in ("message", "report")
+                    if isinstance(msg.get(k), str) and "**" in msg[k]}
+            if _fix:
+                from infra.local_llm_client import strip_markdown_emphasis
+                msg = {**msg, **{k: strip_markdown_emphasis(v) for k, v in _fix.items()}}
+    except Exception:
+        pass
     try:
         if isinstance(msg, dict): log_response_event({"source":"system_event", **msg}, uid=uid)
     except Exception: pass
@@ -2004,6 +2016,39 @@ def _build_sleeve_sell_orders(decisions, sleeve_holdings, price_lookup, pool=Non
     for _key, (spec, dirs) in by_key.items():
         orders.extend(assemble_sleeve_orders(spec, "sell", 0, dirs, sleeve_holdings, price_lookup))
     return orders
+
+
+def dedupe_sell_orders(orders):
+    """같은 종목 매도 주문 중복 제거 — (ticker) 당 1건만 남긴다(순수 함수).
+
+    사장 보고 2026-07-29: 주식 매도 트랙(_assemble_sell_orders)과 슬리브 매도 트랙
+    (_build_sleeve_sell_orders)이 같은 사후관리실장 지시로 **같은 종목에 각각 매도 주문**을
+    만들어 보유의 2배를 팔았다(261220: 보유 45 → 22+22 → 1주 잔여, 이후 매 사이클
+    '잔고내역이 없습니다' 실패 + 사이클 화면에 결정 중복 표시). 두 생산자가 합류하는
+    지점에서 '한 사이클 · 한 종목 · 매도 1건' 불변식을 강제한다.
+    수량이 다르면 **큰 쪽**을 남긴다(전량 지시가 부분 지시에 잘리지 않게). 매수는 무관.
+    반환: (정리된 orders, 제거된 [(ticker, dropped_qty)])"""
+    seen: Dict[str, int] = {}      # ticker → orders 내 인덱스
+    dropped: List[tuple] = []
+    out: List[Dict] = []
+    for o in (orders or []):
+        if str(o.get("side") or "buy").lower() != "sell":
+            out.append(o)
+            continue
+        tk = str(o.get("ticker") or "").strip().upper()
+        if not tk:
+            out.append(o)
+            continue
+        idx = seen.get(tk)
+        if idx is None:
+            seen[tk] = len(out)
+            out.append(o)
+            continue
+        keep, drop = out[idx], o
+        if int(float(drop.get("qty") or 0)) > int(float(keep.get("qty") or 0)):
+            out[idx], drop = drop, keep
+        dropped.append((tk, int(float(drop.get("qty") or 0))))
+    return out, dropped
 
 
 # 사장 피드백 2026-05-15 (#4): 계량분석팀장의 `진입가: code=값` 한 줄을 파싱.
@@ -2886,7 +2931,13 @@ class _ExecutionMixin:
         MAX_CYCLE_BUDGET_RATIO = float(runtime.get("MAX_CYCLE_BUDGET_RATIO", uid=self.uid) or 0.4) * float(getattr(self, "_regime_budget_mult", 1.0))  # 리스크검증과 동일한 사이클 예산 한도 + 레짐 틸트(사장 지시 2026-07-21)
         report = (quant_report or "") + "\n" + (news_report or "")
         snap = await self.broker.kr_account_snapshot()
-        bp = snap["buying_power"]; holdings = holdings or snap.get("holdings") or []
+        bp = snap["buying_power"]
+        # 사장 보고 2026-07-29(261220 중복매도): `holdings or snap[...]` 는 **빈 리스트를 falsy 로**
+        # 보고 KIS 전체 보유로 갈아끼웠다. 보유가 전부 슬리브 ETF(채권·원자재)인 계정(uid2)은
+        # 주식 매도 트랙 입력(stock_holdings)이 정확히 `[]` 라, 이 폴백이 슬리브 ETF를 되살려
+        # 슬리브 트랙과 **같은 종목에 매도 주문을 2건** 만들었다(45주 → 22+22 → 1주 잔여 → 이후
+        # 매 사이클 '모의투자 잔고내역이 없습니다' 실패). None(미주입)일 때만 폴백한다.
+        holdings = (snap.get("holdings") or []) if holdings is None else holdings
         # 사장 지시 2026-05-21: 자산곡선은 KR+US 통합 총평가로 기록한다(주문 사이징은 KR 기준 bp 유지).
         # 사장 지시 2026-05-24: 실제 정규장 세션(요일·휴장 반영)에만 평가금액 추이를 기록한다(장외/주말/휴장 제외).
         if is_market_session_now():
@@ -5864,7 +5915,10 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                             else getattr(cyc, "holdings", None)) or []
                 sell_directives = getattr(cyc, "sell_directives", {}) or {}
                 # 슬리브 매수가 있으면 주식 target/보유가 없어도 위원회를 연다(슬리브 찬반토론 위해).
-                if not targets and not holdings and not (getattr(cyc, "sleeve_buy_orders", None) or []):
+                # 2026-07-29: 개회 판정도 *전체* 보유 기준 — 보유가 전부 슬리브 ETF 인 계정(모의)은
+                # stock_holdings 가 [] 라 여기서 통째로 return 돼 '보유 심의' 카드가 안 떴다.
+                if (not targets and not (getattr(cyc, "holdings", None) or [])
+                        and not (getattr(cyc, "sleeve_buy_orders", None) or [])):
                     return
                 name_map = getattr(cyc, "name_map", {}) or {}
                 per_dart = getattr(cyc, "per_dart", {}) or {}
@@ -5915,6 +5969,9 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
 
                 candidates, dropped = [], []   # dropped: (code, 사유)
                 _DEBATE_CAP = 3   # LLM 토론은 상위 N종목까지 — 그 이하는 결정론 심의(게이트는 전 종목)
+                # 보유 매도 심의도 같은 이유로 상한을 둔다(종목당 LLM 5턴). 초과분은 사후관리실장
+                # 1차 판단을 그대로 쓴다 — 매도 자체가 누락되지는 않는다.
+                _SELL_DEBATE_CAP = 4
                 for i, code in enumerate(targets):
                     name = name_map.get(code, code)
                     _ins_ex = _insight_map.get(code, "")
@@ -6048,35 +6105,76 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                                 f"{n}({c}) — {st}" for c, n, st in sleeve_dropped)})
                     candidates.extend(sleeve_cands)
 
-                # ── 보유 심의 기록 (사후관리실장 매도결정 재구성 — 추가 LLM 없음) ──
+                # ── 보유 심의 (사장 지시 2026-07-29: 유지 심사역 ↔ 매도 심사역 찬반토론) ──
+                # 종전엔 사후관리실장 단독 판단을 240자로 잘라 '재구성'만 했다. 이제 매수 심의와
+                # 동일하게 토론을 돌리고, 그 최종 스탠스(유지|절반|전량)를 **실제 매도지시로
+                # 되돌려 반영**한다. 심의 대상은 슬리브 ETF 포함 *전체* 보유 — 종전엔 주식만
+                # (stock_holdings) 봐서 보유가 전부 채권·원자재 ETF인 계정(모의)에선 '보유 심의'
+                # 카드가 통째로 비어 있었다.
                 pm_view = getattr(cyc, "_pm_view", "") or ""
+                _all_h = getattr(cyc, "holdings", None) or holdings
+                # 토론 예산(_SELL_DEBATE_CAP)은 '결정이 갈릴 여지가 큰' 포지션부터 쓴다 —
+                # ① 1차 판단이 '보유'가 아닌 것(실제 매도 후보) ② 평가손익이 나쁜 것 순.
+                # 예산 밖 포지션은 사후관리실장 1차 판단을 그대로 쓴다(매도 누락 없음).
+                _all_h = sorted(
+                    _all_h,
+                    key=lambda x: (str(sell_directives.get(str(x.get("code", "")).strip(), "보유")).strip()
+                                   in _SELL_HOLD_WORDS,
+                                   float(x.get("pnl_pct") or 0.0)))
                 reviews = []
-                for h in holdings:
+                _reviewed = 0
+                for h in _all_h:
                     hc = str(h.get("code", "")).strip()
                     if not hc or hc not in sell_directives:
                         continue
                     directive = str(sell_directives.get(hc, "보유")).strip()
-                    if directive == "보유":
-                        decision = "유지"
-                    elif directive == "전량":
-                        decision = "매도"
-                    else:
-                        decision = f"매도({directive})"
-                    reason = _quant_ctx_for(pm_view, hc, width=240) or ""
-                    if not reason:
-                        # pm_view 에서 종목명/코드가 든 문장 발췌 (없으면 지시값 자체가 사유)
-                        _nm_h = str(h.get("name", "") or "")
+                    _nm_h = str(h.get("name", "") or hc)
+                    _spec_h = sleeve_for_code(hc)
+                    _chief = _spec_h.manager_name if _spec_h else "사후관리실장"
+                    # 1차 판단 근거 — 사후관리실장 원문에서 이 종목 문단(절단 없이 넉넉히).
+                    _view = _quant_ctx_for(pm_view, hc, width=1200) or ""
+                    if not _view:
                         for _sent in re.split(r"(?<=[.다요])\s+", pm_view):
                             if hc in _sent or (_nm_h and _nm_h in _sent):
-                                reason = _sent.strip()[:240]; break
+                                _view = _sent.strip(); break
+                    _dialogue, _dec, _llm = [], None, False
+                    if _reviewed < _SELL_DEBATE_CAP:
+                        try:
+                            from infra import position_thesis as _pth
+                            _th = (_pth.get(self.uid, hc) or {}) if _spec_h is None else {}
+                            _hp = cycle_store.get_holding_period(hc, uid=self.uid) or {}
+                            _dialogue, _dec, _llm = await cmt.deliberate_position_sell(
+                                hc, _nm_h, qty=int(h.get("qty") or 0),
+                                pnl_pct=float(h.get("pnl_pct") or 0.0),
+                                hold_days=_hp.get("days_held"),
+                                manager_view=(_view or f"1차 매도지시: {directive}"),
+                                thesis=str(_th.get("entry_reason") or ""),
+                                quant_excerpt=_quant_ctx_for(getattr(cyc, "quant_report", ""), hc, width=300),
+                                news_excerpt=_extract_code_news(cyc.news_report, hc, _nm_h)[:300],
+                                macro_view=macro_view, chief_label=_chief,
+                                fallback_directive=directive, progress=_prog)
+                            _reviewed += 1
+                        except Exception as _se:  # noqa: BLE001
+                            logger.warning(f"[매도심의] {hc} 생략(fail-open): {_se}")
+                            _dialogue, _dec = [], None
+                    if _dec:
+                        directive = _dec["stance"]
+                        sell_directives[hc] = directive       # 토론 결과를 실제 매도지시로 반영
+                        _reason = _dec["text"]
+                    else:
+                        _reason = _view or f"{_chief} 매도결정: {directive}"
+                        _dialogue = [{"speaker": _chief, "role": "chief", "text": _reason,
+                                      "stance": directive}]
+                    decision = ("유지" if directive in _SELL_HOLD_WORDS
+                                else ("매도" if directive in _SELL_ALL_WORDS else f"매도({directive})"))
                     reviews.append({
-                        "code": hc, "name": h.get("name", hc), "sector": "",
+                        "code": hc, "name": _nm_h, "sector": "",
                         "pnl_pct": round(float(h.get("pnl_pct") or 0.0), 2),
-                        "decision": decision, "reason": reason or f"사후관리실장 매도결정: {directive}",
-                        "dialogue": ([{"speaker": "사후관리실장", "role": "chief",
-                                       "text": (reason or f"매도결정: {directive}"),
-                                       "stance": decision}]),
+                        "decision": decision, "reason": _reason,
+                        "engine": ("llm" if _llm else "결정론"),
+                        "dialogue": _dialogue,
                     })
+                cyc.sell_directives = sell_directives
 
                 if candidates or reviews:
                     cyc.committee = {
@@ -6130,6 +6228,15 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 sell_directives, getattr(cyc, "holdings", None) or [], _sleeve_price_lookup,
                 pool=self._enabled_sleeve_codes())  # 코드리뷰 #5: 활성 슬리브만(OFF 슬리브는 주식 트랙)
             order_obj["orders"].extend(_sleeve_sells)
+            # 두 매도 생산자(주식 트랙·슬리브 트랙)가 합류하는 유일한 지점 — 여기서 종목당 1건으로
+            # 강제한다(2026-07-29 261220 이중매도). 위 stock_holdings 폴백 수정이 근본원인이지만,
+            # 불변식은 합류점에서 지키는 게 맞다(새 매도 생산자가 늘어도 안전).
+            order_obj["orders"], _dup_sells = dedupe_sell_orders(order_obj["orders"])
+            if _dup_sells:
+                _dup_msg = ", ".join(f"{t} x{q}" for t, q in _dup_sells)
+                logger.warning(f"[매도중복 uid={self.uid}] 같은 종목 매도 주문 중복 제거: {_dup_msg}")
+                await self._emit({"type": "agent_msg", "agent": "시스템",
+                                  "message": f"🧹 매도 주문 중복 제거 — {_dup_msg} (보유 초과 매도 방지)"})
             # C1: 슬리브 가격을 price_map 에 합쳐야 validate_order_draft 가 슬리브 매수를 통과시킨다
             # (매수는 가격 미주입 시 price<=0 → 무조건 반려). 매도가 폴백 가격도 price_map 에 반영.
             # US 가격은 주식 price_map 과 동일 USD 단위(원시 us_last_price) — 환산은 guardrails 가 수행.

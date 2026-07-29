@@ -276,9 +276,15 @@ class TimefolioBroker:
                 except Exception:
                     pass
             state = "체결" if res.get("filled") else "접수/대기"
-            return {"ok": bool(res.get("filled")), "accepted": True, "filled": bool(res.get("filled")),
+            # 사장 보고 2026-07-29: 종전 `ok=filled` 라, 상대호가 미체결로 '접수(대기)'된 주문이
+            # 전부 **실패로 표시**됐다(사이트에선 나중에 체결돼 잔고만 계속 변함). 접수는 실패가
+            # 아니다 — KIS US 경로와 동일하게 accepted=ok 로 두고 filled 로 체결 여부를 구분한다.
+            return {"ok": True, "accepted": True, "filled": bool(res.get("filled")),
+                    "pending": bool(res.get("pending") or (not res.get("filled"))),
                     "qty": qty, "price": price,
-                    "result": f"Timefolio 주문 {state}: {ticker} {side} {qty}주"}
+                    "sector_clamped": res.get("sector_clamped"),
+                    "result": f"Timefolio 주문 {state}: {ticker} {side} {qty}주"
+                              + (f" — {res.get('result')}" if res.get("sector_clamped") else "")}
         return {"ok": False, "accepted": False, "filled": False, "qty": qty, "price": price,
                 "result": f"Timefolio 주문 실패: {_clean_site_msg(res.get('result'))}"}
 

@@ -440,6 +440,8 @@ details.rep pre{white-space:pre-wrap;word-break:break-word;font-family:var(--f);
       <div class="sec-h l3">③ 신뢰·사후 계층 <em>In-Sight</em></div>
       <div class="ai" onclick="mention('리스크관리실장')"><span class="ad det" id="d-gate"></span><span class="an">리스크관리실장</span><span class="ast">#결정론게이트</span></div>
       <div class="ai" onclick="mention('사후관리실장')"><span class="ad" id="d-post"></span><span class="an">사후관리실장</span><span class="ast">#매도판단</span></div>
+      <div class="ai sub" onclick="mention('유지 심사역')"><span class="ad" id="d-post-keep"></span><span class="an">유지 심사역</span><span class="ast">#보유논거</span></div>
+      <div class="ai sub" onclick="mention('매도 심사역')"><span class="ad" id="d-post-sell"></span><span class="an">매도 심사역</span><span class="ast">#매도논거</span></div>
       <div class="ai" onclick="mention('프롭트레이딩팀장')"><span class="ad" id="d-trader"></span><span class="an">프롭트레이딩팀장</span><span class="ast">#주문체결</span></div>
       <div class="ai" onclick="mention('운용지원실장')"><span class="ad" id="d-ops"></span><span class="an">운용지원실장</span><span class="ast">#자동튜닝</span></div>
     </div>
@@ -986,6 +988,8 @@ const agents=[
   {name:"원자재운용실장",color:"#d97706"},
   {name:"리스크관리실장",color:"#8b5cf6"},
   {name:"사후관리실장",color:"#f43f5e"},
+  {name:"유지 심사역",color:"#34d399"},
+  {name:"매도 심사역",color:"#f87171"},
   {name:"운용지원실장",color:"#14b8a6"},
   {name:"프롭트레이딩팀장",color:"#ef4444"},
   {name:"포트폴리오기획팀장",color:"#ec4899"},
@@ -1522,7 +1526,7 @@ async function loadOpsHistory(){
 }
 // ── 사이클 히스토리 + 심의 근거 트리 (QIS 이식 — 데이터원 = /api/cycles) ─────────
 let _histRows=[], _cands=[], _reviews=[];
-const ROLE_CLS={quant:'',news:'',insight:'',bull:'bull',bear:'bear',chief:'chief'};
+const ROLE_CLS={quant:'',news:'',insight:'',bull:'bull',bear:'bear',chief:'chief',keep:'bull',sell:'bear'};
 // 사장 지시 2026-07-21: 사이클 히스토리는 실제 매수·매도가 있었던 사이클만 UI에 표시(나머지는 데이터로만 보존).
 const _cycHasFill=r=>((r.orders||0)+(r.sells||0))>0;
 async function loadHist(){
@@ -1599,7 +1603,8 @@ function opHtml(o){return `<div class="op"><span class="who">${_escHtml(o.agent)
   <span><span class="dec ${_decCls(o.stance)}" style="margin-right:6px">${_escHtml(o.stance)}</span>${_escHtml(o.rationale)}</span>
   <span class="conf">확신 ${((o.confidence||0)*100).toFixed(0)}%</span></div>`;}
 function uttHtml(u){
-  const tag=u.role==='bull'?'찬성 측':(u.role==='bear'?'반대 측':(u.role==='chief'?'최종 결정':''));
+  const tag=u.role==='bull'?'찬성 측':(u.role==='bear'?'반대 측':(u.role==='chief'?'최종 결정':
+             (u.role==='keep'?'유지 측':(u.role==='sell'?'매도 측':''))));
   return `<div class="utt ${ROLE_CLS[u.role]||''}"><span class="who">${_escHtml(u.speaker)}${u.round?` R${u.round}`:''}${tag?`<em>${tag}</em>`:''}</span>
     <span>${u.stance?`<span class="dec ${_decCls(u.stance)}" style="margin-right:6px">${_escHtml(u.stance)}</span>`:''}${_escHtml(u.text)}</span></div>`;}
 function chkHtml(c){return `<div class="chk ${c.passed?'ok':'no'}"><span class="ic">${c.passed?'✓':'✗'}</span>
@@ -1648,9 +1653,9 @@ function reviewHtml(r,i){
 function reviewDetailHtml(r){
   const t=r.thesis||{};
   return `${t.text?`<div class="thesis"><b>매수 thesis</b> — ${_escHtml(t.text)}<br>목표 ${fmt(t.target||0)} · 손절 ${fmt(t.stop||0)}${t.horizon_days?` · 계획 ${t.horizon_days}일`:''}</div>`:''}
-    <div class="sec-t">🗣️ 매도 심의</div>
+    <div class="sec-t">🗣️ 매도 심의 (유지 심사역 ↔ 매도 심사역)</div>
     ${(r.dialogue||[]).map(uttHtml).join('')||'<div class="note">회의록 없음</div>'}
-    <div class="note">결정: <b>${_escHtml(r.decision)}</b> — ${_escHtml(r.reason||'')}</div>`;
+    <div class="note">최종 결정: <b>${_escHtml(r.decision)}</b>${r.engine?` · ${_escHtml(r.engine==='llm'?'LLM 토론':'결정론')}`:''}</div>`;
 }
 function openReview(i){
   const r=_reviews[i]; if(!r)return;
@@ -1673,7 +1678,8 @@ function updateSidebarActivation(){
   const bondOn=!tf&&(p?(p.ENABLE_BOND_ETF!==false):true);
   const commOn=!tf&&(p?!!p.ENABLE_COMMODITY_ETF:false);
   const set=(id,on)=>{const el=document.getElementById(id);if(el)el.classList.toggle('on',!!on);};
-  ['d-macro','d-news','d-quant','d-insight','d-chief','d-stock-bull','d-stock-bear','d-fund','d-post','d-trader'].forEach(id=>set(id,true));
+  ['d-macro','d-news','d-quant','d-insight','d-chief','d-stock-bull','d-stock-bear','d-fund','d-post',
+   'd-post-keep','d-post-sell','d-trader'].forEach(id=>set(id,true));
   ['d-bond','d-bond-bull','d-bond-bear'].forEach(id=>set(id,bondOn));
   ['d-commodity','d-comm-bull','d-comm-bear'].forEach(id=>set(id,commOn));
   set('d-ops',!!_opsEnabled);   // 운용지원(자동 튜닝)이 켜져 있으면 초록

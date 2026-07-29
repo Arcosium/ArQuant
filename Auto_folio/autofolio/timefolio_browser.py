@@ -407,6 +407,7 @@ class TimefolioBrowser:
         sector_rooms = self._scrape_sector_rooms(page) if side == "buy" else {}
         self._open_order_ticket(page)
         selected = self._select_ticker(page, ticker)
+        sector_clamped = None
         if side == "buy":
             sector = (selected or {}).get("sector")
             room = sector_rooms.get(sector) if sector else None
@@ -419,6 +420,12 @@ class TimefolioBrowser:
                     "rejected_reason": "sector_full", "sector": sector, "sector_room_pct": room,
                     "result": msg, "summary": before_summary,
                 }
+            # 사장 지시 2026-07-29: 여유가 남아 있어도 **주문 비중이 그 여유보다 크면 한도를 넘는다**.
+            # 종전엔 여유>1% 이면 전량 통과라 (여유 3% · 주문 5%) 가 그대로 나가 섹터 한도를 깼다.
+            # 사이트 권위값(추가 편입 가능 비중)까지로 이번 주문 비중을 깎는다 — 남는 몫은 다음 사이클.
+            if room is not None and weight_pct > room:
+                sector_clamped = {"from": weight_pct, "to": round(room, 2), "sector": sector}
+                weight_pct = max(0.01, round(room, 2))
         self._choose_side(page, side)
         self._fill_weight(page, weight_pct)
         self._choose_default_price_type(page, opp_tick=opp_tick)
@@ -489,6 +496,9 @@ class TimefolioBrowser:
             _msg = f"{ticker} {side} 접수(미체결) — 상대호가 대기"
         else:
             _msg = f"{ticker} {side} 미접수 — 사이트가 주문을 받지 않음(다음 사이클 재시도)"
+        if sector_clamped:
+            _msg += (f" · 섹터 한도 클램프 {sector_clamped['from']:.2f}%→{sector_clamped['to']:.2f}% "
+                     f"({sector_clamped['sector']} 추가편입가능)")
         return {
             "ticker": ticker,
             "side": side,
@@ -499,6 +509,7 @@ class TimefolioBrowser:
             "working_order": working,
             "filled": bool(filled),
             "pending": bool(working and not filled),
+            "sector_clamped": sector_clamped,
             "result": _msg,
             "summary": summary,
         }
