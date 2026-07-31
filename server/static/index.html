@@ -262,7 +262,7 @@ details.rep pre{white-space:pre-wrap;word-break:break-word;font-family:var(--f);
 <div id="loginOv" style="position:fixed;inset:0;z-index:9999;display:none;align-items:center;justify-content:center;background:#0b0f1af5">
   <div style="width:380px;max-width:92vw;max-height:92vh;overflow-y:auto;-webkit-overflow-scrolling:touch;background:#141a26;border:1px solid #2a3344;border-radius:14px;padding:24px 22px;box-shadow:0 20px 60px #000a">
     <div style="display:flex;align-items:center;gap:9px;margin-bottom:4px">
-      <div style="width:30px;height:30px;background:linear-gradient(135deg,#FFBC00,#06b6d4);border-radius:9px;box-shadow:0 2px 10px #ffbc0033;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:11px;color:#0a0e1a">QI</div>
+      <div style="width:30px;height:30px;background:linear-gradient(135deg,#FFBC00,#06b6d4);border-radius:9px;box-shadow:0 2px 10px #ffbc0033;display:flex;align-items:center;justify-content:center"><svg viewBox="0 0 20 20" width="17" height="17" fill="none" aria-hidden="true"><path d="M4 8.2v8.6M10 5v9.8M16 1.8v9.7" stroke="#0a0e1a" stroke-width="1.5" stroke-linecap="round"/><rect x="2.55" y="10.6" width="2.9" height="4.4" rx="1" fill="#0a0e1a"/><rect x="8.55" y="7.4" width="2.9" height="5" rx="1" fill="#0a0e1a"/><rect x="14.55" y="3.9" width="2.9" height="4.7" rx="1" fill="#0a0e1a"/></svg></div>
       <div><div style="font-weight:700;font-size:16px;color:#e8edf6">QuantInSight</div><div style="font-size:10px;color:#7a869c">Multi-Asset AI Trading</div></div>
     </div>
     <div style="display:flex;gap:6px;margin:14px 0 12px">
@@ -400,7 +400,7 @@ details.rep pre{white-space:pre-wrap;word-break:break-word;font-family:var(--f);
 
 <div class="app">
   <header class="header">
-    <div class="logo">QI</div>
+    <div class="logo" aria-label="QuantInSight"><svg viewBox="0 0 20 20" width="19" height="19" fill="none" aria-hidden="true"><path d="M4 8.2v8.6M10 5v9.8M16 1.8v9.7" stroke="#0a0e1a" stroke-width="1.5" stroke-linecap="round"/><rect x="2.55" y="10.6" width="2.9" height="4.4" rx="1" fill="#0a0e1a"/><rect x="8.55" y="7.4" width="2.9" height="5" rx="1" fill="#0a0e1a"/><rect x="14.55" y="3.9" width="2.9" height="4.7" rx="1" fill="#0a0e1a"/></svg></div>
     <h1>QuantInSight<span>Multi-Asset AI Trading</span></h1>
     <span id="badge" class="badge badge-idle">-</span>
     <div class="hdr-right">
@@ -427,14 +427,14 @@ details.rep pre{white-space:pre-wrap;word-break:break-word;font-family:var(--f);
       <div class="sec-h l2">② 운용 계층 <em>Strategy</em></div>
       <div class="ai" onclick="mention('주식운용실장')"><span class="ad" id="d-chief"></span><span class="an">주식운용실장</span><span class="ast">#종목선정</span></div>
       <div class="ai sub" onclick="mention('매수 심사역')"><span class="ad" id="d-stock-bull"></span><span class="an">매수 심사역</span><span class="ast">#매수논거</span></div>
-      <div class="ai sub" onclick="mention('리스크 심사역')"><span class="ad" id="d-stock-bear"></span><span class="an">리스크 심사역</span><span class="ast">#리스크검증</span></div>
+      <div class="ai sub" onclick="mention('보유 심사역')"><span class="ad" id="d-stock-bear"></span><span class="an">보유 심사역</span><span class="ast">#리스크검증</span></div>
       <div class="ai" onclick="mention('포트폴리오기획팀장')"><span class="ad" id="d-fund"></span><span class="an">포트폴리오기획팀장</span><span class="ast">#진입계획</span></div>
       <div class="ai" onclick="mention('채권운용실장')"><span class="ad" id="d-bond"></span><span class="an">채권운용실장</span><span class="ast">#채권배분</span></div>
       <div class="ai sub" onclick="mention('매수 심사역')"><span class="ad" id="d-bond-bull"></span><span class="an">매수 심사역</span><span class="ast">#매수논거</span></div>
-      <div class="ai sub" onclick="mention('리스크 심사역')"><span class="ad" id="d-bond-bear"></span><span class="an">리스크 심사역</span><span class="ast">#리스크검증</span></div>
+      <div class="ai sub" onclick="mention('보유 심사역')"><span class="ad" id="d-bond-bear"></span><span class="an">보유 심사역</span><span class="ast">#리스크검증</span></div>
       <div class="ai" onclick="mention('원자재운용실장')"><span class="ad" id="d-commodity"></span><span class="an">원자재운용실장</span><span class="ast">#원자재배분</span></div>
       <div class="ai sub" onclick="mention('매수 심사역')"><span class="ad" id="d-comm-bull"></span><span class="an">매수 심사역</span><span class="ast">#매수논거</span></div>
-      <div class="ai sub" onclick="mention('리스크 심사역')"><span class="ad" id="d-comm-bear"></span><span class="an">리스크 심사역</span><span class="ast">#리스크검증</span></div>
+      <div class="ai sub" onclick="mention('보유 심사역')"><span class="ad" id="d-comm-bear"></span><span class="an">보유 심사역</span><span class="ast">#리스크검증</span></div>
     </div>
     <div class="sb-sec">
       <div class="sec-h l3">③ 신뢰·사후 계층 <em>In-Sight</em></div>
@@ -689,7 +689,7 @@ function renderModeToggle(m){
 }
 let _appStarted=false;
 function startApp(){ if(_appStarted)return; _appStarted=true; replayLog(); connectWS();
-  fetch(API+'/api/me').then(r=>r.json()).then(m=>{IS_ADMIN=!!(m&&m.is_admin);IS_VIEWER=!!(m&&m.is_viewer);IS_TIMEFOLIO=!!(m&&m.is_timefolio);applyViewerMode();renderModeToggle(m);pfRefreshFeedbackBadge();}).catch(()=>{});
+  fetch(API+'/api/me').then(r=>r.json()).then(m=>{IS_ADMIN=!!(m&&m.is_admin);IS_VIEWER=!!(m&&m.is_viewer);IS_TIMEFOLIO=!!(m&&m.is_timefolio);applyViewerMode();renderModeToggle(m);pfRefreshFeedbackBadge();updateSidebarActivation();}).catch(()=>{});
   loadLatestCycle();
 }
 document.addEventListener('DOMContentLoaded',()=>{
@@ -983,7 +983,8 @@ const agents=[
   {name:"마켓센티먼트팀장",color:"#f59e0b"},
   {name:"기업리서치팀장",color:"#22d3ee"},
   {name:"매수 심사역",color:"#34d399"},
-  {name:"리스크 심사역",color:"#f87171"},
+  {name:"보유 심사역",color:"#f87171"},
+  {name:"리스크 심사역",color:"#f87171"}, // 구 명칭 — 과거 사이클 로그 리플레이 색상 호환(2026-07-31 개명)
   {name:"채권운용실장",color:"#3b82f6"},
   {name:"원자재운용실장",color:"#d97706"},
   {name:"리스크관리실장",color:"#8b5cf6"},
@@ -1673,16 +1674,21 @@ function renderCycleDetail(d){
 // 채권·원자재운용실장은 타임폴리오(대회: 주식만) 또는 전략 토글 OFF면 회색. 나머지는 매 사이클 가동.
 let _opsEnabled=true;
 function updateSidebarActivation(){
+  // 사장 지시: 초록 점 = 이 계정 사이클이 "실제로 호출하는" 직원만. 비활성은 회색(기본).
+  // 타임폴리오 전용 사이클(timefolio_swarm)은 뉴스 + 주식운용실장(결정·심의 종합) +
+  // 매수/보유 심사역(위원회) + 프롭트레이딩(집행)만 쓴다 — 매크로·계량(LLM)·기업리서치·
+  // 펀드기획·사후관리(유지/매도 심사역)·운용지원은 호출 자체가 없으므로 회색.
   const p=(_stratData&&_stratData.active&&_stratData.active.params)||null;
   const tf=IS_TIMEFOLIO;
   const bondOn=!tf&&(p?(p.ENABLE_BOND_ETF!==false):true);
   const commOn=!tf&&(p?!!p.ENABLE_COMMODITY_ETF:false);
   const set=(id,on)=>{const el=document.getElementById(id);if(el)el.classList.toggle('on',!!on);};
-  ['d-macro','d-news','d-quant','d-insight','d-chief','d-stock-bull','d-stock-bear','d-fund','d-post',
-   'd-post-keep','d-post-sell','d-trader'].forEach(id=>set(id,true));
+  ['d-news','d-chief','d-stock-bull','d-stock-bear','d-trader'].forEach(id=>set(id,true));
+  ['d-macro','d-quant','d-insight','d-fund','d-post','d-post-keep','d-post-sell']
+    .forEach(id=>set(id,!tf));
   ['d-bond','d-bond-bull','d-bond-bear'].forEach(id=>set(id,bondOn));
   ['d-commodity','d-comm-bull','d-comm-bear'].forEach(id=>set(id,commOn));
-  set('d-ops',!!_opsEnabled);   // 운용지원(자동 튜닝)이 켜져 있으면 초록
+  set('d-ops',!tf&&!!_opsEnabled);   // 운용지원(자동 튜닝) — 타임폴리오 사이클엔 워커 자체가 없음
 }
 // 하위호환: 위원회 사이클 콜백은 이제 활성 동그라미만 갱신한다(사이드바에 심의 집계 표기 폐지).
 function updateSidebar(d){ updateSidebarActivation(); }

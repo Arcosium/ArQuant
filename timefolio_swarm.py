@@ -12,7 +12,7 @@ uid7 주문 6건 전량 거부, 체결 0, 100% 현금 방치). 이 사이클은:
     사전 스크리닝해 애초에 적격 종목만 LLM 에 올린다
   - 주문은 TimefolioBroker(check_order 하드게이트 + 1주문 비중캡 + 사이트 섹터게이트)로 집행
 
-LLM 은 2회: 마켓센티먼트(뉴스) + 타임폴리오운용실장(매도/매수/현금 결정).
+LLM 은 2회: 마켓센티먼트(뉴스) + 주식운용실장(매도/매수/현금 결정 — 대회 계정 전담 페르소나).
 점수는 기존 결정론 엔진(tools/quant_score) 재사용 — 데이터는 전부 네이버(KIS 토큰 불필요).
 """
 from __future__ import annotations
@@ -36,7 +36,9 @@ KST = timezone(timedelta(hours=9))
 from Auto_folio.autofolio import contest_rules, order_limits          # noqa: E402
 from Auto_folio.autofolio.naver_data import fetch_security_meta      # noqa: E402
 
-STRATEGIST_NAME = "타임폴리오운용실장"
+# 사장 지시 2026-07-31: 사이드바 조직도에 없는 '타임폴리오운용실장' 임의 직책 폐지 —
+# 대회 계정의 결정자도 사이드바의 '주식운용실장' 명의로 발화한다(멘션 라우팅도 동일 명의로 부착).
+STRATEGIST_NAME = "주식운용실장"
 
 
 # ─── 유니버스/후보 수집 (결정론) ─────────────────────────────────────────────
@@ -245,7 +247,7 @@ def assemble_orders(*, sells: Dict[str, str], buys: Dict[str, float],
             continue
         price = float(prices.get(code) or h.get("cur_price") or 0.0)
         sell_orders.append({"code": code, "side": "sell", "qty": qty, "price": price,
-                            "reason": f"타임폴리오운용실장 매도 판단 — {directive}"})
+                            "reason": f"주식운용실장 매도 판단 — {directive}"})
 
     # 매수 — 예산: 현금(현금바닥 유보) 안에서만. 매도 대금은 체결 확인 전이라 계상하지 않는다(보수).
     budget = max(0.0, cash - total_eval * cash_floor_pct / 100.0)
@@ -290,7 +292,7 @@ def assemble_orders(*, sells: Dict[str, str], buys: Dict[str, float],
             smallcap_now += qty * price
         budget -= qty * price
         buy_orders.append({"code": code, "side": "buy", "qty": qty, "price": price,
-                           "reason": f"타임폴리오운용실장 매수 — 목표비중 {w:.1f}%"
+                           "reason": f"주식운용실장 매수 — 목표비중 {w:.1f}%"
                                      + (f", 퀀트 {score}점" if score is not None else "")})
     return sell_orders, buy_orders, notes
 
@@ -298,7 +300,7 @@ def assemble_orders(*, sells: Dict[str, str], buys: Dict[str, float],
 # ─── 전략가 에이전트 ─────────────────────────────────────────────────────────
 
 def create_timefolio_strategist(injection=None):
-    """타임폴리오운용실장 — 대회 계정의 매도/매수/현금 배분 단일 결정자.
+    """대회 계정 전담 주식운용실장 페르소나 — 매도/매수/현금 배분 단일 결정자.
     결정 에이전트이므로 pro(reasoning) 티어인 post_manager 모델 슬롯을 공유한다."""
     from agents.base_agent import BaseAgent
     return BaseAgent(
@@ -306,7 +308,7 @@ def create_timefolio_strategist(injection=None):
         role="timefolio_strategist",
         model_key="post_manager",
         injection=injection,
-        system_prompt="""당신은 ArQuant의 '타임폴리오운용실장'입니다. 타임폴리오 RFM 실전투자대회
+        system_prompt="""당신은 ArQuant의 '주식운용실장'입니다. 지금은 타임폴리오 RFM 실전투자대회
 계정 하나를 단독 운용합니다. 대회 순위는 NAV 수익률로 결정됩니다.
 
 ## 대회 룰 (절대 제약 — 시스템이 주문 직전에도 강제함)
@@ -639,7 +641,7 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
                                      + " | " + "; ".join(f"{c}={w}%" for c, w in list(buys.items())[:4]))
 
     # [5.5] 운용위원회 심의 (사장 지시 2026-07-21) — 대회 계정도 QIS 위원회 로직을 살린다.
-    #   전략가가 고른 매수 후보를 매수 심사역↔리스크 심사역 찬반토론 + 주식운용실장 종합에 올려
+    #   전략가가 고른 매수 후보를 매수 심사역↔보유 심사역 찬반토론 + 주식운용실장 종합에 올려
     #   회의록을 기록(사이클 탭 '심의·근거 트리'에 표시)한다. 주식운용실장이 '회피'로 종합하면
     #   그 매수만 취소한다. 대회 규정 리스크는 집행 직전 check_order 하드 게이트가 최종 담당하므로,
     #   심의 실패는 절대 사이클을 막지 않는다(fail-open).
@@ -712,7 +714,7 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
         if (str(code).zfill(6), side) in _still_working:
             _skip = f"{code} {side} — 직전 사이클 주문이 사이트에서 아직 작동 중(미체결) → 재제출 생략"
             orch.cycle_log.log("EXECUTION", "시스템", _skip)
-            await orch._emit({"type": "agent_msg", "agent": STRATEGIST_NAME, "message": f"⏳ {_skip}"})
+            await orch._emit({"type": "agent_msg", "agent": "프롭트레이딩팀장", "message": f"⏳ {_skip}"})
             continue
         try:
             draft = OrderDraft(ticker=code, side=side, qty=qty,
@@ -736,7 +738,8 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
         exec_results.append(rec)
         orch.cycle_log.log("EXECUTION", "시스템", f"{code} {side} x{qty} → {rec['result']}")
         if rec["accepted"]:
-            await orch._emit({"type": "order_submitted", "agent": STRATEGIST_NAME,
+            # 주문 접수·집행 알림은 main_swarm 관례와 동일하게 프롭트레이딩팀장 명의(집행 소관).
+            await orch._emit({"type": "order_submitted", "agent": "프롭트레이딩팀장",
                               "message": f"📨 {code} {'매수' if side == 'buy' else '매도'} {rec['qty']}주 주문 접수 (타임폴리오)",
                               "ticker": code, "side": side, "qty": rec["qty"]})
         if rec["filled"]:

@@ -5436,10 +5436,18 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     _pass2_emit_msg = "[최종 매수 종목 결정] 신규 매수 보류 (신규 뉴스 없는 사이클) — 보유 종목 매도 평가로 진행."
                 picked = []
             else:
+                # 과거 매매 복기 교훈(사장 지시 2026-07-31) — 최근 청산 결과를 최종 선정 판단에 재주입.
+                _lessons = ""
+                try:
+                    from infra import trade_reflections
+                    _lessons = trade_reflections.past_context(self.uid, None, n_same=0, n_cross=3)
+                except Exception:
+                    pass
                 final_view = await self.orchestrator.think(
                     f"[최종 매수 종목 결정]\n1차 후보: {_cand_line}\n최대 매수 개수 N = {_N} (전략 설정)\n현재 세션: {session}\n"
                     f"{_budget_hint}\n\n"
                     + (f"{_standing_directive_block}\n\n" if _standing_directive_block else "")
+                    + (f"[과거 매매 복기 교훈 — 최근 청산 결과, 같은 실수 반복 금지]\n{_lessons}\n\n" if _lessons else "")
                     + f"검증된 글로벌 지수(수치는 이 스냅샷에서만 그대로 인용):\n{index_facts}\n\n"
                     + f"글로벌리서치팀장 자산 배분 권고(글로벌리서치팀장의 매크로 판단 — 참고하여 반영):\n{macro_report[:600]}\n\n"
                     f"계량분석팀장 평가:\n{quant_report}\n\n마켓센티먼트팀장 평가:\n{news_report}\n\n"
@@ -5903,7 +5911,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
     async def _cyc_stage_committee(self, cyc):
             """QuantInSight 위원회 심의 이식 (사장 지시 2026-07-18) — fail-open.
 
-            PASS 2 매수 대상별로: 출처검증 리포트 → 찬반토론(매수 심사역↔리스크 심사역, 라운드
+            PASS 2 매수 대상별로: 출처검증 리포트 → 찬반토론(매수 심사역↔보유 심사역, 라운드
             고정) → 주식운용실장 최종 결정(+claims 자진신고) → 결정론 게이트(체크리스트).
             차단/회피/보류 판정 종목은 target_codes 에서 투명하게 제외한다. 보유 종목은
             사후관리실장의 매도결정을 '보유 심의' 기록으로 재구성한다(추가 LLM 없음).
@@ -5933,6 +5941,14 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
 
                 async def _prog(agent, msg):
                     await self._emit({"type": "agent_msg", "agent": agent, "message": msg})
+
+                # 과거 매매 복기 주입(사장 지시 2026-07-31) — 같은 종목 청산 결과·교훈을 심의 브리핑에.
+                def _tr_past(_code):
+                    try:
+                        from infra import trade_reflections
+                        return trade_reflections.past_context(self.uid, _code)
+                    except Exception:
+                        return ""
 
                 # 기업리서치팀장 (사장 지시 2026-07-21) — 마켓센티먼트팀장 다음·계량분석팀장 이후,
                 # 개별 '기업' 매수 대상만(ETF·슬리브 제외) 최신 기업 분석자료를 종합해 위원회 평가에 추가한다.
@@ -6022,12 +6038,13 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                             code, name, rep, quant_score=q_scores.get(code),
                             quant_excerpt=q_ex,
                             news_excerpt=_extract_code_news(cyc.news_report, code, name)[:300],
-                            macro_view=macro_view, insight_excerpt=_ins_ex, progress=_prog)
+                            macro_view=macro_view, insight_excerpt=_ins_ex,
+                            past_context=_tr_past(code), progress=_prog)
                     else:
                         opinions, dialogue, chief, llm_used = await cmt.deliberate_target(
                             code, name, rep, quant_score=q_scores.get(code),
                             quant_excerpt=q_ex, news_excerpt="", macro_view=macro_view,
-                            insight_excerpt=_ins_ex, progress=None)
+                            insight_excerpt=_ins_ex, past_context=_tr_past(code), progress=None)
                     gate = cmt.run_gate(rep, q_scores.get(code), chief["confidence"],
                                         min_quant_score=_min_qs, base_weight=_base_w)
                     if gate.verdict == cmt.BLOCK:
@@ -6057,7 +6074,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
 
                 # ── 슬리브(채권·원자재) 매수 위원회 심의 (사장 지시 2026-07-20) ──
                 # 종전엔 채권·원자재 ETF 매수가 매니저 단독 판단으로 나갔다 — 주식과 동일하게
-                # 매수 심사역↔리스크 심사역 찬반토론 후 슬리브운용실장이 최종 확정한다.
+                # 매수 심사역↔보유 심사역 찬반토론 후 슬리브운용실장이 최종 확정한다.
                 # 보류/회피 판정 ETF는 cyc.sleeve_buy_orders 에서 투명하게 제외한다.
                 sleeve_orders = list(getattr(cyc, "sleeve_buy_orders", None) or [])
                 sleeve_meta = getattr(cyc, "sleeve_buy_meta", {}) or {}
@@ -6152,7 +6169,8 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                                 quant_excerpt=_quant_ctx_for(getattr(cyc, "quant_report", ""), hc, width=300),
                                 news_excerpt=_extract_code_news(cyc.news_report, hc, _nm_h)[:300],
                                 macro_view=macro_view, chief_label=_chief,
-                                fallback_directive=directive, progress=_prog)
+                                fallback_directive=directive,
+                                past_context=_tr_past(hc), progress=_prog)
                             _reviewed += 1
                         except Exception as _se:  # noqa: BLE001
                             logger.warning(f"[매도심의] {hc} 생략(fail-open): {_se}")
@@ -6910,6 +6928,31 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                             f"목표가 {parsed.get('target_price') or '?'} | 손절가 {parsed.get('stop_price') or '?'} | "
                             f"계획 보유 {parsed.get('planned_hold_hours') or '?'}h\n"
                             f"진입 사유: {parsed.get('entry_reason') or buy_reason[:150]}")})
+            # Phase A 복기 기록(사장 지시 2026-07-31): 진입 스냅샷 + 벤치마크 진입 레벨을 pending 으로.
+            # 전량 청산이 원장에서 확인되면 Phase B 가 수익률·알파·LLM 복기로 확정한다. fail-open.
+            try:
+                from infra import trade_reflections
+                _cands = ((getattr(cyc, "committee", None) or {}).get("candidates") or [])
+                _cmt_row = next((c for c in _cands if c.get("code") == code), {})
+                _chief_op = next((o for o in (_cmt_row.get("opinions") or [])
+                                  if o.get("role") == "chief"), {})
+                _bench = await asyncio.to_thread(trade_reflections.bench_snapshot, code)
+                trade_reflections.record_pending(self.uid, code, {
+                    "name": disp_name, "entry_ts": thesis["entry_ts"],
+                    "entry_price": fill_price, "ccy": ccy,
+                    "qty": int(rec.get("qty") or 0),
+                    "quant_score": (getattr(cyc, "_quant_scores", {}) or {}).get(code),
+                    "committee_stance": _chief_op.get("stance") or _cmt_row.get("decision"),
+                    "committee_confidence": _chief_op.get("confidence"),
+                    "entry_reason": thesis.get("entry_reason") or "",
+                    "target_price": thesis.get("target_price"),
+                    "stop_price": thesis.get("stop_price"),
+                    "planned_hold_hours": thesis.get("planned_hold_hours"),
+                    "bench_name": _bench.get("bench_name"),
+                    "bench_entry": _bench.get("level"),
+                })
+            except Exception as _tre:
+                logger.warning(f"[복기] pending 기록 실패 {code}: {_tre}")
         except Exception as e:
             logger.warning(f"[펀드기획] thesis 기록 실패 {code}: {e}")
 
@@ -7040,6 +7083,21 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 except Exception:
                     _us = []
                 self._sync_thesis_with_current_holdings(_all_holdings, drop_foreign=bool(_us))
+                # Phase B 복기 확정(사장 지시 2026-07-31): pending 종목이 보유에서 사라졌으면 청산으로 보고
+                # 복기 확정을 백그라운드로 시도한다. US 조회가 비신뢰(_us 빈값)면 US 코드는 건너뛰고
+                # (thesis 오삭제 방지와 동일 가드), 원장에 매도 체결이 없으면 resolve_position 이
+                # pending 을 유지한다(KIS 결제 과도기 잔고 글리치 오발동 방지 — 이중 가드).
+                try:
+                    from infra import trade_reflections
+                    _codes_now = {str(h.get("code", "")).strip() for h in (_all_holdings or [])
+                                  if int(h.get("qty") or 0) > 0}
+                    for _rc in trade_reflections.pending_codes(self.uid):
+                        if _rc in _codes_now or (not _is_kr_code(_rc) and not _us):
+                            continue
+                        asyncio.create_task(
+                            trade_reflections.resolve_position(self.uid, _rc, emit=self._emit))
+                except Exception as _tre:
+                    logger.warning(f"[복기] 청산 감지 스킵(fail-open): {_tre}")
             except Exception as _se:
                 logger.warning(f"[펀드기획] 사이클 종료 thesis 동기화 스킵: {_se}")
             await self._emit({"type":"cycle_complete","report":report,"trades_total":self._trades_executed})
