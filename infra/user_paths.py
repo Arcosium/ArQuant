@@ -23,10 +23,6 @@ def token_path(uid: int) -> Path:
     return user_dir(uid) / "kis_token.json"
 
 
-def cost_rollup_path(uid: int) -> Path:
-    return user_dir(uid) / "cost_rollup.json"
-
-
 def running_marker(uid: int) -> Path:
     return user_dir(uid) / ".running"
 

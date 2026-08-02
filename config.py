@@ -24,7 +24,6 @@ OPENDART_API_KEY = os.getenv("OPENDART_API_KEY", "")
 # ─── Coresight RAG Paths ────────────────────────────────────────────────────
 _ARCAIVE = BASE_DIR.parent / "ArcAI.ve"
 CORESIGHT_PATH = os.getenv("CORESIGHT_PATH", str(_ARCAIVE / "coresight_logs"))
-CORESIGHT_CHROMA_PATH = os.getenv("CORESIGHT_CHROMA_PATH", str(_ARCAIVE / "chroma_db"))
 
 # ─── Local LLM model assignments (by agent role) ────────────────────────────
 # URL은 설치 시에만 지정한다. 예: http://127.0.0.1:8080/v1
@@ -82,10 +81,9 @@ MODEL_ASSIGNMENTS = {
 }
 
 # ─── Risk Management Constants ──────────────────────────────────────────────
-MAX_SINGLE_STOCK_RATIO = 0.20       # 단일 종목 최대 20%
-MAX_DRAWDOWN_LIMIT = 0.10           # 최대 손실 제한 10%
-MAX_ORDER_RETRY = 3                 # 주문 재시도 최대 3회
-MAX_VALIDATION_LOOP = 3             # 리스크 검증 재시도 최대 3회
+# ⚠️ 2026-08-02 삭제: MAX_SINGLE_STOCK_RATIO(단일종목 20%)·MAX_DRAWDOWN_LIMIT(손실 10%)·
+# MAX_ORDER_RETRY·MAX_VALIDATION_LOOP 는 **어디서도 읽지 않는 장식**이었다(선언만 존재).
+# 실제로 동작하는 한도는 STRATEGY_DEFAULTS 의 튜닝 파라미터와 아래 CONSERVATIVE_MDD 다.
 # 회로차단기(사장 지시 2026-06-17): 연속 US 매수실패(주문가능금액 초과)가 이 횟수 이상이면
 # 해당 세션 US 매수를 보류한다(매도로 USD 확보·세션 전환 시 자동 해제). 안전망이라 ops 튜닝 비대상.
 US_BUY_FAIL_STREAK_LIMIT = 2
@@ -126,7 +124,6 @@ AGENT_MAX_TOKENS = {
     "bond_manager":       40000,   # 채권운용실장. 2026-06-10 pro 전환 후 2000→5000: pro=reasoning은 max_tokens에 CoT 포함이라 2000이면 본문이 잘림(391자 관측). CoT+결정문 여유 확보.
     "commodity_manager":  40000,   # 원자재운용실장. 동일 사유(pro reasoning CoT 토큰 소모) → 5000.
 }
-ENABLE_PROMPT_CACHE = False
 AGENT_HISTORY_TURNS = 3               # trailing history messages to resend (was 10)
 
 # Macro/DART recompute throttling (slow-moving inputs — don't regenerate every cycle)

@@ -90,40 +90,6 @@ def load_universe():
     return rows[:config.UNIVERSE_SIZE]
 
 
-def load_markets():
-    """data/universe.csv → {code: 'KOSPI'|'KOSDAQ'} (2팩터 시장중립화용).
-
-    market 컬럼이 있으면 그걸 쓰고, 없으면 파일 순서(앞 UNIVERSE_KOSPI 개 = KOSPI)로 가른다
-    — build_universe 가 KOSPI 블록을 먼저, KOSDAQ 블록을 뒤에 기록하기 때문(구 CSV 하위호환).
-    """
-    if not config.UNIVERSE_CSV.exists():
-        return {}
-    with open(config.UNIVERSE_CSV, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    out = {}
-    for i, r in enumerate(rows[:config.UNIVERSE_SIZE]):
-        mk = (r.get("market") or "").strip().upper()
-        if mk not in ("KOSPI", "KOSDAQ"):
-            mk = "KOSPI" if i < config.UNIVERSE_KOSPI else "KOSDAQ"
-        out[r["code"]] = mk
-    return out
-
-
-def load_sectors():
-    """data/universe.csv → {code: 업종명} (섹터 동시점 컨트롤용).
-    sector 컬럼이 없으면 빈 dict → analytics 가 섹터 팩터를 건너뛴다. (tools/build_sectors.py 로 채움)"""
-    if not config.UNIVERSE_CSV.exists():
-        return {}
-    with open(config.UNIVERSE_CSV, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    out = {}
-    for r in rows[:config.UNIVERSE_SIZE]:
-        s = (r.get("sector") or "").strip()
-        if s:
-            out[r["code"]] = s
-    return out
-
-
 # ── 수집 ─────────────────────────────────────────────────────────
 def parse_sise(text):
     """siseJson 응답 → [(ts, close, vol_cum)] 시간 오름차순.

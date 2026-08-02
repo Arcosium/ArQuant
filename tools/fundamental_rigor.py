@@ -8,7 +8,6 @@ execution semantics.
 """
 from __future__ import annotations
 
-import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional
 

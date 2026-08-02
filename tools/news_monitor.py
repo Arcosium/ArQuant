@@ -8,7 +8,6 @@ Articles are classified at crawl time into 'KR' (국내 시장), 'US' (미국 �
 or 'BOTH' (양쪽 모두 영향) so the orchestrator can route them to the right
 analysis cycle (KR 장 시간엔 KR+BOTH만 분석/매매, US 장 시간엔 US+BOTH만).
 """
-import asyncio
 import difflib
 import json as _json
 import logging
@@ -19,7 +18,6 @@ from pathlib import Path
 from typing import List, Dict, Optional
 from urllib.parse import urljoin
 
-import aiohttp
 import requests
 from bs4 import BeautifulSoup
 

@@ -289,7 +289,8 @@ def fetch_cycle_context(cycle_id: Optional[int], uid: Optional[int] = None) -> D
         logger.warning(f"realized_stats 로드 실패(uid={uid}): {e}")
     return {"target_cycle": target, "recent_cycles": cycles,
             "recent_errors_skips": recent_events,
-            "recent_outcomes": recent_outcomes, "realized": realized}
+            "recent_outcomes": recent_outcomes, "realized": realized,
+            "tuning_trail": tuning_trail(uid)}   # P4 — 중복·왕복 제안 억제
 
 
 def detect_recurring_order_failure(cycles, *, min_cycles: int = 3) -> Optional[str]:
@@ -388,6 +389,42 @@ def _save_param_log(uid, log: Dict[str, Any]) -> None:
             json.dumps(log or {}, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def tuning_trail(uid, limit: int = 40) -> Dict[str, List]:
+    """최근 '적용된' 파라미터 조정을 키별 시계열로 압축 (P4, 2026-08-02).
+
+    왜: filter_oscillating_overrides 는 **적용 단계**에서 되감기를 막지만, LLM 은 자기가 지난주
+    무엇을 어디로 옮겼는지 모른 채 매 사이클 같은 제안을 다시 만든다(무한 재제안 → 토큰 낭비 +
+    드롭 로그 오염). 이력을 프롬프트에 보여 **애초에 제안하지 않게** 한다.
+
+    per-uid (profile_overrides 이력 = 계정별). 반환 {key: [(ts, value), ...]} 시간 오름차순."""
+    from infra import profile_overrides
+    trail: Dict[str, List] = {}
+    for rec in (profile_overrides.load_proposals(uid) or [])[-limit:]:
+        ts = str(rec.get("ts") or "")[5:16]          # 'MM-DD HH:MM'
+        for k, v in (rec.get("overrides_applied") or {}).items():
+            trail.setdefault(str(k), []).append((ts, v))
+    return trail
+
+
+def _tuning_trail_block(trail: Dict[str, List], max_keys: int = 12) -> str:
+    """tuning_trail → 프롬프트 블록. 값이 과거 값으로 되돌아온 키는 '왕복'으로 표시한다."""
+    if not trail:
+        return ""
+    lines = []
+    for k, hist in sorted(trail.items(), key=lambda kv: -len(kv[1]))[:max_keys]:
+        recent = hist[-5:]
+        vals = [v for _, v in hist]
+        # 되돌아옴 = 마지막 값이 '직전 값을 제외한' 과거에 이미 있었다 → 왕복 신호
+        flip = " ⚠️왕복(과거 값으로 되돌아옴)" if len(vals) >= 3 and vals[-1] in vals[:-2] else ""
+        trace = " → ".join(f"{v}({t})" for t, v in recent)
+        lines.append(f"- {k}: {trace}  [누적 {len(hist)}회 변경]{flip}")
+    return ("\n[최근 파라미터 조정 이력 — 이 계정에 **이미 적용된** 변경들]\n"
+            + "\n".join(lines)
+            + "\n  ⚠️ 위 키를 '되감는' 방향(직전 조정의 반대)으로 다시 제안하지 말 것 — 시스템이 진동으로 "
+              "판단해 자동 드롭한다. 누적 변경 횟수가 많은데도 성과가 개선되지 않았다면, 그 키는 "
+              "**원인이 아니다** — 같은 키를 계속 흔들지 말고 다른 원인을 찾거나 '변경 없음'으로 답하라.")
 
 
 def _osc_num(v):
@@ -655,6 +692,10 @@ def build_prompt(ctx: Dict[str, Any], manual_directive: Optional[str] = None,
             f"  🎯 목표: 현재 회전율에서 '거래당 기대값'을 +로 끌어올려라. 기대값이 −면 비용 대비 엣지가 부족하다 — "
             f"MIN_NET_EDGE_PCT↑(비용 못 버는 매매 차단)·MIN_QUANT_SCORE↑(진입 엄선)·STOP_LOSS_PCT↓(손실 빨리 차단)·"
             f"TRAILING_TAKE_PROFIT_PCT(승자 길게)로 조절하라. 비용드래그가 크면 US 진입엣지를 더 높여라.")
+
+    _trail = _tuning_trail_block(ctx.get("tuning_trail") or {})
+    if _trail:
+        parts.append(_trail)
 
     parts.append(_task_block_for_trigger(trigger))
     parts.append(ANTI_CONFAB_GUARD)

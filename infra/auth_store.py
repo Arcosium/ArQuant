@@ -28,7 +28,7 @@ import threading
 import time
 from datetime import datetime as _dt, timezone as _tz
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHash, VerificationError
@@ -666,24 +666,6 @@ def set_account_mode(user_id: int, mode: str) -> None:
         conn.execute("UPDATE users SET account_mode=? WHERE id=?", (mode, int(user_id)))
 
 
-def list_users() -> list:
-    """회원 목록(민감정보 제외) — ADMIN 회원관리용 (사장 지시 2026-05-22)."""
-    init()
-    with _DB_LOCK, _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, username, label, is_admin, created_at, last_login_at "
-            "FROM users ORDER BY id").fetchall()
-    out = []
-    for r in rows:
-        k = r.keys()
-        out.append({"id": int(r["id"]), "username": r["username"],
-                    "label": (r["label"] if "label" in k else "") or "",
-                    "is_admin": bool(r["is_admin"]) if "is_admin" in k else False,
-                    "created_at": (r["created_at"] if "created_at" in k else "") or "",
-                    "last_login_at": (r["last_login_at"] if "last_login_at" in k else "") or ""})
-    return out
-
-
 def set_admin(user_id: int, is_admin_flag: bool) -> bool:
     """ADMIN 권한 부여/회수. 사장 지시 2026-06-08: ADMIN 은 hh09080 영구·단독.
     - hh09080 외 계정 승격 거부, hh09080 강등 거부 (모두 return False + 경고, 예외 없음).
@@ -1014,13 +996,6 @@ def delete_session(token: str) -> None:
     init()
     with _DB_LOCK, _connect() as conn:
         conn.execute("DELETE FROM sessions WHERE token=?", (token,))
-
-
-def purge_expired_sessions() -> int:
-    init()
-    with _DB_LOCK, _connect() as conn:
-        cur = conn.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
-        return cur.rowcount or 0
 
 
 # ─── Bootstrap from .env (사장 피드백 2026-05-16) ───────────────────────────────

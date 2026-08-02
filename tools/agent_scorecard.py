@@ -36,6 +36,11 @@ def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
     return cov / (vx ** 0.5 * vy ** 0.5)
 
 
+def pearson(xs: List[float], ys: List[float]) -> Optional[float]:
+    """피어슨 상관 (3쌍 미만·무분산이면 None). 프로필 수익률 상관 등 외부 호출용 공개 래퍼."""
+    return _pearson(xs, ys)
+
+
 def information_coefficient(pairs: List[Tuple[float, float]]) -> Optional[float]:
     """[(signal, forward_return)] → 스피어만 순위상관. 3쌍 미만이면 None."""
     pairs = [(float(s), float(r)) for s, r in pairs if s is not None and r is not None]

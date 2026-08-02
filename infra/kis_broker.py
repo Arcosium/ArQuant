@@ -4,7 +4,7 @@ Arquant v1.0 - KIS Broker (확장판)
   국내주식 시세/주문/잔고, 해외주식, 장내채권, 해외선물옵션, 국내선물옵션
   일봉/분봉 실시간 데이터 CSV 누적 수집
 """
-import asyncio, aiohttp, time, logging, os, csv, json, math
+import asyncio, aiohttp, time, logging, csv, json, math
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from enum import Enum

@@ -2,12 +2,9 @@
 NPS Swarm v1.0 - Base Agent
 Local-LLM-powered agent base class with dynamic model allocation.
 """
-import json
 import logging
-import time
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional
 
 from infra.error_log import record_error  # 사장 지시 2026-05-19 — 상세 에러를 운용지원실장이 열람 가능하게
 
@@ -30,7 +27,6 @@ class BaseAgent:
         role: str,
         system_prompt: str,
         model_key: str = "quant_analyst",
-        tools: Optional[List[Dict[str, Any]]] = None,
         injection: Optional[Dict[str, Any]] = None,
     ):
         from config import MODEL_ASSIGNMENTS, AGENT_MAX_TOKENS, AGENT_HISTORY_TURNS
@@ -50,9 +46,7 @@ class BaseAgent:
         self.model = _ov or MODEL_ASSIGNMENTS.get(model_key, "")
         # Local server is unauthenticated. Keep the attribute for call-site compatibility.
         self.api_key = ""
-        self.tools = tools or []
         self.conversation_history: List[Dict[str, str]] = []
-        self._tool_functions: Dict[str, Callable] = {}
         # ── Cost-reduction knobs ──────────────────────────────────────────
         self.max_tokens = AGENT_MAX_TOKENS.get(model_key, AGENT_MAX_TOKENS.get(role, 2048))
         self.history_turns = AGENT_HISTORY_TURNS
@@ -60,10 +54,6 @@ class BaseAgent:
         # (= admin 게이트를 이미 통과한 macro/news/post-manager). query_coresight 가
         # 내부에서 admin 재검증하므로 이중 방어. 비대상이면 None → 주입 안 함.
         self.coresight_uid = self.uid if "query_coresight" in (system_prompt or "") else None
-
-    def register_tool_function(self, name: str, func: Callable):
-        """Register a callable function that can be invoked as a tool."""
-        self._tool_functions[name] = func
 
     async def _coresight_context(self, message: str) -> str:
         """이 메시지에 관련된 Coresight 과거 지식을 검색해 주입용 블록으로 반환.

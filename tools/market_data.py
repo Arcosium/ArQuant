@@ -5,7 +5,7 @@ Adapted from KRX Quant Simulator CrawlerUtil:
   - 종목 3년치 일봉 + 수급 크롤링 (네이버 금융 HTML)
   - 분봉 데이터는 KIS API 사용 (kis_broker.kr_minute_chart)
 """
-import os, csv, re, json, logging, time
+import csv, re, json, logging, time
 from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))

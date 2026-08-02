@@ -225,11 +225,55 @@ async def resolve_position(uid: int, code: str, emit=None) -> bool:
         return False
 
 
+def tag_stats(uid: int, min_n: int = 2) -> Dict[str, Dict[str, Any]]:
+    """확정 복기를 알파 계열(alpha_tag)별로 집계 — P2, 2026-08-02.
+
+    "상관 낮은 알파를 섞는다"의 전제는 계열별 실적 데이터다. 표본이 min_n 미만인 계열은
+    반환에서 뺀다(1건 승률 100% 같은 잡음이 위원회 프롬프트에 들어가지 않게).
+    반환 {tag: {n, wins, win_rate, avg_ret_pct, avg_alpha_pct}} — 평균알파 내림차순."""
+    try:
+        rows: Dict[str, list] = {}
+        for e in _load(int(uid)):
+            if e.get("status") != "resolved" or e.get("raw_ret_pct") is None:
+                continue
+            rows.setdefault(str(e.get("alpha_tag") or "미태깅"), []).append(e)
+        out = {}
+        for tag, es in rows.items():
+            if len(es) < max(1, min_n):
+                continue
+            rets = [float(e["raw_ret_pct"]) for e in es]
+            alphas = [float(e["alpha_pct"]) for e in es if e.get("alpha_pct") is not None]
+            wins = sum(1 for r in rets if r > 0)
+            out[tag] = {"n": len(es), "wins": wins,
+                        "win_rate": round(wins / len(es) * 100, 1),
+                        "avg_ret_pct": round(sum(rets) / len(rets), 2),
+                        "avg_alpha_pct": (round(sum(alphas) / len(alphas), 2) if alphas else None)}
+        return dict(sorted(out.items(),
+                           key=lambda kv: -(kv[1]["avg_alpha_pct"] if kv[1]["avg_alpha_pct"] is not None
+                                            else kv[1]["avg_ret_pct"])))
+    except Exception as e:
+        logger.warning(f"[복기] tag_stats 실패(생략): {e}")
+        return {}
+
+
+def tag_stats_block(uid: int, min_n: int = 2) -> str:
+    """tag_stats → 프롬프트/보고 한 블록. 표본 부족이면 빈 문자열(호출부가 블록 생략)."""
+    st = tag_stats(uid, min_n=min_n)
+    if not st:
+        return ""
+    lines = ["알파 계열별 실적 (청산 확정분):"]
+    for tag, s in st.items():
+        a = f" · 평균알파 {s['avg_alpha_pct']:+.2f}%p" if s["avg_alpha_pct"] is not None else ""
+        lines.append(f"- {tag}: {s['n']}건 · 승률 {s['win_rate']:.0f}% · 평균 {s['avg_ret_pct']:+.2f}%{a}")
+    return "\n".join(lines)
+
+
 def _fmt_entry(e: Dict[str, Any], full: bool) -> str:
     a = f" | 알파 {e['alpha_pct']:+.2f}%p" if e.get("alpha_pct") is not None else ""
+    tag = f" · 계열 {e['alpha_tag']}" if e.get("alpha_tag") else ""
     head = (f"[{str(e.get('entry_ts', ''))[:10]} 매수 → {str(e.get('exit_ts', ''))[:10]} 청산 | "
             f"수익률 {e.get('raw_ret_pct', 0):+.2f}%{a} | 보유 {e.get('holding_days', '?')}일 | "
-            f"퀀트 {e.get('quant_score', '?')}/10 · 위원회 {e.get('committee_stance') or '?'}]")
+            f"퀀트 {e.get('quant_score', '?')}/10 · 위원회 {e.get('committee_stance') or '?'}{tag}]")
     lines = [f"- {e.get('name') or e.get('code')}({e.get('code')}) {head}"]
     if full and e.get("entry_reason"):
         lines.append(f"    진입 사유: {str(e['entry_reason'])[:150]}")
@@ -256,6 +300,10 @@ def past_context(uid: int, code: Optional[str] = None,
         if cross:
             parts.append("최근 청산 매매 교훈 (타 종목):")
             parts.extend(_fmt_entry(e, full=False) for e in cross)
+        # P2: 계열별 실적 — 개별 복기가 못 보여주는 '어떤 알파가 이 계정에서 밥값을 하는가'.
+        tags = tag_stats_block(int(uid))
+        if tags:
+            parts.append(tags)
         return "\n".join(parts)
     except Exception as e:
         logger.warning(f"[복기] past_context 실패(생략): {e}")

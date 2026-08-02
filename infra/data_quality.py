@@ -70,5 +70,3 @@ def persistent_drift_issues(diffs: List[str], streak_map: dict, *, threshold: in
     return out
 
 
-def summarize(issues: List[str]) -> dict:
-    return {"n_issues": len(issues), "issues": issues[:20], "ok": not issues}

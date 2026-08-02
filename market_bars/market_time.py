@@ -23,29 +23,12 @@ def is_weekday(d):
     return d.weekday() < 5
 
 
-def is_regular_minute(ts):
-    """ts(datetime, KST) 분봉이 연산 대상 정규 분봉인가 (동시호가 제외)."""
-    t = ts.time()
-    return REGULAR_FIRST <= t <= REGULAR_LAST
-
-
 def in_crawl_session(ts=None):
     """수집을 돌릴 시간대인가 — 평일 09:00~15:35 (마감 프린트 여유 포함)."""
     ts = ts or now_kst()
     if not is_weekday(ts):
         return False
     return dtime(9, 0) <= ts.time() <= dtime(15, 35)
-
-
-def session_minutes(day):
-    """해당 일자의 정규 연산 분봉 시각 리스트 (YYYYMMDDHHMM 문자열)."""
-    base = datetime(day.year, day.month, day.day, 9, 1, tzinfo=KST)
-    out = []
-    cur = base
-    while cur.time() <= REGULAR_LAST:
-        out.append(cur.strftime("%Y%m%d%H%M"))
-        cur += timedelta(minutes=1)
-    return out
 
 
 def recent_trading_days(n, today=None):
@@ -59,6 +42,3 @@ def recent_trading_days(n, today=None):
     return list(reversed(days))
 
 
-def ts_str_to_dt(ts_str):
-    """'YYYYMMDDHHMM' → aware datetime(KST)."""
-    return datetime.strptime(ts_str, "%Y%m%d%H%M").replace(tzinfo=KST)

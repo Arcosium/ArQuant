@@ -9,7 +9,7 @@ A "strategy" = the set of tunable trading parameters (sizing, TP/SL, risk gates,
   runtime.set_strategy(custom={...})       # apply ad-hoc params, persist, append to history
   runtime.history()
 """
-import json, os, time
+import json, os
 from datetime import datetime
 from pathlib import Path
 import config
@@ -237,6 +237,24 @@ def get(key, default=None, uid=None):
     if key in p:
         return p[key]
     return getattr(config, key, default)
+
+
+# 지표 신호명 → QIW_* 튜닝키. main_swarm 2곳(루브릭·점수산정) + backtest/quant_ic 이 같은 표를
+# 각자 들고 있어 축을 추가할 때마다 갱신을 빠뜨렸다(2026-08-02 통합).
+QIW_KEYS = (("rsi", "QIW_RSI"), ("macd", "QIW_MACD"), ("adx", "QIW_ADX"), ("vwap", "QIW_VWAP"),
+            ("vol", "QIW_VOL"), ("mom", "QIW_MOM"), ("cmf", "QIW_CMF"), ("flow", "QIW_FLOW"),
+            ("high52", "QIW_HIGH52"), ("leadlag", "QIW_LEADLAG"), ("vol_surge", "QIW_VOLUME_SURGE"))
+
+
+def quant_weights(uid=None) -> dict:
+    """지표 가중치 {신호명: QIW 값} — tools.quant_score.compute_indicator_score 입력."""
+    return {sig: get(key, uid=uid) for sig, key in QIW_KEYS}
+
+
+def dim_weights(uid=None) -> dict:
+    """차원 가중치 {QUANT/NEWS/MACRO} — tools.quant_score.combine_dimensions 입력."""
+    return {"QUANT": get("DW_QUANT", uid=uid), "NEWS": get("DW_NEWS", uid=uid),
+            "MACRO": get("DW_MACRO", uid=uid)}
 
 
 def active(uid=None) -> dict:

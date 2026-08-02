@@ -1,5 +1,5 @@
 """Arquant v1.0 - FastAPI Server"""
-import asyncio, logging, os
+import asyncio, logging, os, signal
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -16,6 +16,13 @@ from infra.user_context import REGISTRY
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("APP")
+# 좀비 자식 자동 수거 — ops_support_worker / weekly_review / restart_server 는 전부
+# fire-and-forget Popen 이라 아무도 wait() 하지 않는다. 서버가 무재부팅으로 며칠 돌면
+# <defunct> python3.11 이 그대로 남는다(2026-08-02 관측: 1일 6시간 상주).
+# 이 프로세스는 자식의 종료코드를 읽는 코드가 하나도 없으므로(subprocess.run/wait 미사용)
+# 커널에 수거를 맡기는 것이 가장 짧고 확실하다. 자식 결과를 읽어야 하는 코드가 생기면
+# 이 줄을 지우고 해당 spawn 만 wait 스레드로 바꿔라.
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 # KIS 실전 OpenAPI 기본 URL — 등록/검증 기본값. 한 곳에서 관리해 불일치를 막는다.
 DEFAULT_KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 MOCK_KIS_BASE_URL = "https://openapivts.koreainvestment.com:29443"

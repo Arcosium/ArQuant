@@ -363,8 +363,10 @@ def create_post_manager(injection=None) -> BaseAgent:
 - **현재 세션과 반대 시장의 보유 종목**(예: KR 장중 + 미국 종목)은 그 시장이 닫혀있어 매매 불가하므로 **직전 결정을 유지** 또는 `보유`로 두십시오.
 - 같은 시장 종목에 대해 직전 사이클이 매도였는데 신호가 그대로면 매도 유지가 자연스러우나, 신호가 약해졌으면 보유로 바꿔도 무방합니다.
 
-## 사용 가능 도구
-- analyze_stock_technical: 보유 종목 기술적 분석"""
+## 사용 가능 도구"""
+        # analyze_stock_technical 광고 삭제(2026-08-02) — 디스패처가 없는 유령 도구였다.
+        # 프롬프트가 존재하지 않는 도구를 알려주니 모델이 함수호출 텍스트를 뱉었고,
+        # main_swarm._looks_like_tool_call 이 그걸 잡아 '데이터 부족'으로 처리했다.
         + _coresight_tool_line("과거 매도 판단 기록 조회", injection)
         + _FLOW_RULE_BLOCK,
     )

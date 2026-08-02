@@ -89,11 +89,6 @@ def _is_kr_code(code: Any) -> bool:
     return s.isdigit() and len(s) == 6
 
 
-def _is_us_code(code: Any) -> bool:
-    """해외(US) 종목 판정 = KR 코드가 아닌 것(티커)."""
-    return not _is_kr_code(code)
-
-
 # 기업리서치팀장은 '개별 기업'에만 붙는다(사장 지시 2026-07-21) — ETF/ETN/레버리지·인버스·
 # 채권/원자재 상품은 기업 분석 대상이 아니므로 이름 힌트로 제외한다.
 _ETF_NAME_HINTS = ("ETF", "ETN", "레버리지", "인버스", "KODEX", "TIGER", "ARIRANG", "KBSTAR",
@@ -690,20 +685,28 @@ def get_equity_series(equity_path, limit: int = 500, view: str = "realtime") -> 
     return out[-max(1, int(limit)):]
 
 
+def _sell_pnl(e: dict):
+    """매도 거래 하나에서 (detail, 실현손익) 추출. 매도가 아니거나 손익 미상이면 None.
+    realized_pnl 우선, 없으면 total_pnl 폴백 — _trade_realized_stats/_realized_perf_buckets 공유."""
+    if str((e or {}).get("side") or "").lower() != "sell":
+        return None
+    det = e.get("detail") or {}
+    pnl = det.get("realized_pnl")
+    if pnl is None:
+        pnl = det.get("total_pnl")
+    return None if pnl is None else (det, pnl)
+
+
 def _trade_realized_stats(trades: Optional[list]) -> dict:
     """매도 거래의 FIFO/KIS 실현손익으로 승률·매도수·보유일 합계를 집계한다.
     performance_kpis(표시) 와 clear_trade_log(비우기 시 베이스라인 적립) 가 공유한다."""
     wins = total = 0
     hold_sum = 0.0; hold_n = 0
     for e in (trades or []):
-        if str(e.get("side") or "").lower() != "sell":
+        sp = _sell_pnl(e)
+        if sp is None:
             continue
-        det = e.get("detail") or {}
-        pnl = det.get("realized_pnl")
-        if pnl is None:
-            pnl = det.get("total_pnl")
-        if pnl is None:
-            continue
+        det, pnl = sp
         total += 1
         if pnl > 0:
             wins += 1
@@ -753,14 +756,10 @@ def _realized_perf_buckets(trades: Optional[list], now: datetime, fx: Optional[f
     acc = {"cum": [0.0, 0.0], "today": [0.0, 0.0], "week": [0.0, 0.0], "month": [0.0, 0.0]}
     has = False
     for e in (trades or []):
-        if str(e.get("side") or "").lower() != "sell":
+        sp = _sell_pnl(e)
+        if sp is None:
             continue
-        det = e.get("detail") or {}
-        pnl = det.get("realized_pnl")
-        if pnl is None:
-            pnl = det.get("total_pnl")
-        if pnl is None:
-            continue
+        det, pnl = sp
         try:
             qty = float(det.get("qty") or 0)
         except (TypeError, ValueError):
@@ -1477,7 +1476,8 @@ def format_scoring_rubric_block(qiw: Dict[str, float], dw: Dict[str, float], min
     후보를 제안하게 한다. 점수는 시스템(파이썬)이 확정하므로 LLM은 '선정 기준'으로만 참고."""
     _names = {"rsi": "RSI(과매도 가점)", "macd": "MACD 모멘텀", "adx": "ADX 추세강도",
               "vwap": "VWAP 이격(추격 감점)", "vol": "저변동", "mom": "모멘텀(1·3M)",
-              "cmf": "CMF 매집", "flow": "외인·기관 수급", "high52": "52주 신고가 근접"}
+              "cmf": "CMF 매집", "flow": "외인·기관 수급", "high52": "52주 신고가 근접",
+              "leadlag": "선행-후행(그랜저)", "vol_surge": "거래량 급증"}
     pos = sorted(((k, float(v)) for k, v in (qiw or {}).items() if float(v) > 0), key=lambda kv: -kv[1])[:3]
     drivers = ", ".join(_names.get(k, k) for k, _ in pos) or "(가중치 미설정)"
     lines = ["[채점 루브릭 — 주식운용실장 선정 참고]",
@@ -4867,14 +4867,9 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             else:
                 # 사장 지시 2026-06-04 ①: 채점 루브릭(가중 상위 지표·최소 퀀트점수)을 선정 프롬프트에 주입 —
                 # LLM이 시스템 점수 기준에 부합할 후보를 고르게 한다(점수는 시스템 확정, 선정 가이드용).
-                _rubric_qiw = {sig: runtime.get(key, uid=self.uid) for sig, key in (
-                    ("rsi", "QIW_RSI"), ("macd", "QIW_MACD"), ("adx", "QIW_ADX"), ("vwap", "QIW_VWAP"),
-                    ("vol", "QIW_VOL"), ("mom", "QIW_MOM"), ("cmf", "QIW_CMF"), ("flow", "QIW_FLOW"),
-                    ("high52", "QIW_HIGH52"))}
-                _rubric_dw = {"QUANT": runtime.get("DW_QUANT", uid=self.uid), "NEWS": runtime.get("DW_NEWS", uid=self.uid),
-                              "MACRO": runtime.get("DW_MACRO", uid=self.uid)}
                 _rubric_block = format_scoring_rubric_block(
-                    _rubric_qiw, _rubric_dw, int(runtime.get("MIN_QUANT_SCORE", uid=self.uid) or 0))
+                    runtime.quant_weights(self.uid), runtime.dim_weights(self.uid),
+                    int(runtime.get("MIN_QUANT_SCORE", uid=self.uid) or 0))
                 allocation = await self.orchestrator.think(
                     f"[후보 종목 선정]\n전략리서치팀 매크로 보고:\n{macro_report}\n\n"
                     f"마켓센티먼트팀장 뉴스 분석 (증권 속보 기반):\n{news_report}\n\n"
@@ -5147,6 +5142,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             elif is_kr_tradable(session):
                 _quant_codes = [c for c in _quant_codes if _is_kr_code(c)]
             _quant_scores: Dict[str, int] = {}
+            _quant_tags: Dict[str, str] = {}       # P2 2026-08-02: 코드→알파 계열(복기 귀인용)
             _quant_sigmas: Dict[str, float] = {}   # 사장 지시 2026-06-04 ②: 리스크기반 사이징용 변동성(σ20)
             cyc.fundamental_research = getattr(cyc, "fundamental_research", {}) or {}
             _quant_sections: List[str] = []
@@ -5170,13 +5166,8 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             # 사장 지시 2026-06-04: 결정론 점수 엔진 — DETERMINISTIC_SCORING이면 퀀트점수를 파이썬이 확정,
             # 계량분석팀장은 해설만(점수 파싱 안 함). 지표별 QIW·차원 DW·매크로%·뉴스감성으로 산정.
             _det_scoring = bool(runtime.get("DETERMINISTIC_SCORING", uid=self.uid)) and not _user_strategy_block
-            _qiw = {sig: runtime.get(key, uid=self.uid) for sig, key in (
-                ("rsi", "QIW_RSI"), ("macd", "QIW_MACD"), ("adx", "QIW_ADX"), ("vwap", "QIW_VWAP"),
-                ("vol", "QIW_VOL"), ("mom", "QIW_MOM"), ("cmf", "QIW_CMF"), ("flow", "QIW_FLOW"),
-                ("high52", "QIW_HIGH52"), ("leadlag", "QIW_LEADLAG"),
-                ("vol_surge", "QIW_VOLUME_SURGE"))}   # 선행-후행·거래량급증 계량 팩터(사장 지시 2026-07-21)
-            _dw = {"QUANT": runtime.get("DW_QUANT", uid=self.uid), "NEWS": runtime.get("DW_NEWS", uid=self.uid),
-                   "MACRO": runtime.get("DW_MACRO", uid=self.uid)}
+            _qiw = runtime.quant_weights(self.uid)   # runtime.QIW_KEYS 단일 정본(선행-후행·거래량급증 포함)
+            _dw = runtime.dim_weights(self.uid)
             _leadlag_on = bool(runtime.get("ENABLE_LEADLAG_SIGNAL", uid=self.uid))
             _max_gap_up = float(runtime.get("MAX_GAP_UP_PCT", uid=self.uid) or 0.0)   # 갭업 추격 회피(사장 지시 2026-07-21)
             _macro_pct = _parse_macro_stock_pct(macro_report)
@@ -5311,6 +5302,9 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 # 점수 확정 — 결정론 모드면 파이썬 값 사용(LLM 파싱 무시), 아니면 LLM 응답 파싱.
                 if _det_score is not None:
                     _quant_scores[_qcode] = _det_score
+                    # P2: 이 점수를 끌어올린 알파 계열을 태깅 — 청산 후 계열별 성과 귀인의 유일한 근거.
+                    from tools.quant_score import alpha_tag as _alpha_tag
+                    _quant_tags[_qcode] = _alpha_tag(_det_bd)
                 else:
                     _ms = re.search(rf"퀀트점수\s*[:：][^\n]*\b{re.escape(_qcode)}\s*=\s*(\d+)", _quant_resp or "")
                     if _ms:
@@ -5388,6 +5382,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             cyc._sell_prices = _sell_prices
             cyc._cand_line = _cand_line
             cyc._quant_scores = _quant_scores   # 사장 지시 2026-06-04: MIN_QUANT_SCORE 결정론 게이트용
+            cyc._quant_tags = _quant_tags       # P2: 진입 복기에 알파 계열을 실어보내기 위한 스냅샷
             cyc._quant_sigmas = _quant_sigmas   # 사장 지시 2026-06-04 ②: 리스크기반 사이징용 변동성
 
     async def _cyc_stage_finalize_sell(self, cyc):
@@ -6942,6 +6937,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     "entry_price": fill_price, "ccy": ccy,
                     "qty": int(rec.get("qty") or 0),
                     "quant_score": (getattr(cyc, "_quant_scores", {}) or {}).get(code),
+                    "alpha_tag": (getattr(cyc, "_quant_tags", {}) or {}).get(code),   # P2 알파 귀인
                     "committee_stance": _chief_op.get("stance") or _cmt_row.get("decision"),
                     "committee_confidence": _chief_op.get("confidence"),
                     "entry_reason": thesis.get("entry_reason") or "",
