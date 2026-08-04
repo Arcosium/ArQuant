@@ -181,11 +181,17 @@ def kr_price_naver(code: str) -> float:
 
 
 _NAME_CACHE: Dict[str, str] = {}
+_NAME_MISS: set = set()          # 조회 실패 심볼(프로세스 수명) — 반복 404 억제, 재시작 시 재검증
 def get_stock_name(code: str) -> str:
-    """Resolve a 6-digit KR stock code to its Korean name (cached). '' on failure."""
+    """종목코드 → 종목명(캐시). KR=6자리 코드(네이버), US=영문 티커(yfinance). '' on failure.
+
+    US 분기 추가 2026-08-04: 후보 검증이 KR 만 있고 US 는 무검증이라 'Rocket Lab(RVLV)'
+    (실제 RVLV=Revolve Group) 같은 티커 오배정이 그대로 통과하던 문제."""
     code = str(code).strip()
     if code in _NAME_CACHE:
         return _NAME_CACHE[code]
+    if not re.fullmatch(r"\d{6}", code):
+        return _us_stock_name(code)
     name = ""
     try:
         r = requests.get(f"https://polling.finance.naver.com/api/realtime/domestic/stock/{code}",
@@ -202,6 +208,26 @@ def get_stock_name(code: str) -> str:
             name = ""
     if name:
         _NAME_CACHE[code] = name
+    return name
+
+
+def _us_stock_name(ticker: str) -> str:
+    """US 티커 → 회사명(yfinance, 캐시). 실패 시 '' — **호출부는 fail-open** 이어야 한다
+    (네트워크 장애로 US 후보가 통째로 사라지면 안 됨; 없는 티커는 하류 일봉 게이트가 거른다)."""
+    t = str(ticker).strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z.\-]{0,5}", t) or t in _NAME_MISS:
+        return ""
+    name = ""
+    try:
+        import yfinance as yf
+        info = yf.Ticker(t).info or {}
+        name = (info.get("longName") or info.get("shortName") or "").strip()
+    except Exception:
+        name = ""
+    if name:
+        _NAME_CACHE[t] = name
+    else:
+        _NAME_MISS.add(t)
     return name
 
 

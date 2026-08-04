@@ -1646,6 +1646,14 @@ def _resolve_candidate_codes(allocation: str, *, session: Optional[str] = None,
         # 영문 토큰 → US 티커 (단, KR 세션이면 영문 종목명일 수 있으니 코드 해석으로 넘김)
         if not code and re.fullmatch(r"[A-Za-z]{1,5}", inner) and not is_kr:
             t = inner.upper()
+            # KR 과 대칭으로 이름↔티커 검증 (2026-08-04). 'Rocket Lab(RVLV)' 처럼 **실존하는**
+            # 티커로 오배정되면 하류 일봉 게이트에 안 걸려 엉뚱한 회사를 매수한다.
+            # 한글 이름은 영문 회사명과 대조 불가라 건너뛰고, 조회 실패('')도 통과 — fail-open.
+            if name and name_check and not re.search(r"[가-힣]", name):
+                actual = name_check(t)
+                if actual and not _names_match(name, actual):
+                    logger.warning(f"[후보검증] '{name}' ↔ 티커 {t}(실제 {actual}) 불일치 — 후보 제외")
+                    continue
             if t not in out:
                 out.append(t)
             if len(out) >= limit:

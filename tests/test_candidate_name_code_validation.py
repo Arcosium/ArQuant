@@ -48,3 +48,30 @@ def test_code_only_still_trusted():
 def test_offline_no_namecheck_trusts_code():
     out = _resolve_candidate_codes(_alloc("벡트(290650)"), resolver=None, name_check=None)
     assert out == ["290650"]
+
+
+# ── US 티커 대칭 검증 (2026-08-04) ────────────────────────────────────────
+# 실사고: 뉴스의 'Rocket Lab(RVLV)'·'SpaceX(SPACE)' 를 그대로 후보로 채택. RVLV 는 실존
+# 티커(Revolve Group)라 하류 일봉 게이트에도 안 걸려 엉뚱한 회사를 매수할 수 있었다.
+_US = {"RVLV": "Revolve Group, Inc.", "AAPL": "Apple Inc."}
+def _us_check(sym): return _US.get(sym.upper(), "")
+
+
+def test_us_ticker_name_mismatch_dropped():
+    out = _resolve_candidate_codes(_alloc("Rocket Lab(RVLV), Apple(AAPL)"),
+                                   session="US_TRADING", name_check=_us_check)
+    assert out == ["AAPL"]
+
+
+def test_us_ticker_unknown_passes_fail_open():
+    # 조회 실패(없는 티커/네트워크 장애)는 통과 — 하류 일봉 게이트가 거른다
+    out = _resolve_candidate_codes(_alloc("SpaceX(SPACE)"),
+                                   session="US_TRADING", name_check=_us_check)
+    assert out == ["SPACE"]
+
+
+def test_us_korean_name_skips_check():
+    # 한글 이름은 영문 회사명과 대조 불가 → 검증 생략(오탐 방지)
+    out = _resolve_candidate_codes(_alloc("애플(AAPL)"),
+                                   session="US_TRADING", name_check=_us_check)
+    assert out == ["AAPL"]
