@@ -524,7 +524,10 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
     universe = load_universe()
     movers = await asyncio.to_thread(movers_from_bars, universe, config.TIMEFOLIO_MOVERS_TOP)
     news_codes = codes_in_news(news_articles, universe)
-    held_codes = [str(h.get("code") or "").zfill(6) for h in holdings]
+    # code 가 빈 보유행(스크랩 합계행 등)을 zfill 하면 존재하지 않는 '000000' 이 되어, 아래
+    # 퀀트 루프가 유령 종목으로 시세를 긁는다 — pykrx 빈 응답 → yfinance 000000.KS/.KQ 404 반복
+    # (2026-08-04 로그 8건). 빈 코드는 애초에 보유로 세지 않는다.
+    held_codes = [c.zfill(6) for c in (str(h.get("code") or "").strip() for h in holdings) if c]
     raw_candidates: List[str] = []
     for c in news_codes + [m["code"] for m in movers]:
         if c not in raw_candidates and c not in held_codes:
