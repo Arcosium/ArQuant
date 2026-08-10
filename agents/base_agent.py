@@ -69,13 +69,23 @@ class BaseAgent:
             logger.debug(f"[{self.name}] Coresight 주입 실패(무시): {e}")
         return ""
 
-    async def think(self, message: str, context: Optional[str] = None) -> str:
+    async def think(
+        self,
+        message: str,
+        context: Optional[str] = None,
+        *,
+        max_tokens: Optional[int] = None,
+        timeout_sec: int = 300,
+        thinking: Optional[bool] = None,
+    ) -> str:
         """
         Process a message and return the agent's response.
 
         Args:
             message: Input message from another agent or orchestrator
             context: Optional additional context (e.g., market data)
+            max_tokens/thinking/timeout_sec: 정형·경량 단계의 호출별 제한. 생략하면
+                기존 에이전트 기본값과 모델의 thinking 설정을 그대로 사용한다.
 
         Returns:
             Agent's response text
@@ -97,11 +107,13 @@ class BaseAgent:
 
         messages.append({"role": "user", "content": user_content})
 
+        _max_tokens = int(max_tokens if max_tokens is not None else self.max_tokens)
         try:
             from infra.local_llm_client import chat_completion
             data = await chat_completion(
                 api_key=self.api_key, model=self.model, messages=messages,
-                max_tokens=self.max_tokens, temperature=0.3, timeout_sec=300,
+                max_tokens=_max_tokens, temperature=0.3, timeout_sec=timeout_sec,
+                thinking=thinking,
             )
 
             # 공급자가 빈 JSON/None을 반환해도 명시적 오류로 변환한다.
@@ -125,16 +137,17 @@ class BaseAgent:
                 logger.warning(
                     f"[{self.name}] 빈 응답 (status=200, finish_reason={_fr}, "
                     f"prompt_tok={_u0.get('prompt_tokens')}, completion_tok={_u0.get('completion_tokens')}, "
-                    f"max_tokens={self.max_tokens}) → max_tokens 상향 후 1회 재시도")
+                    f"max_tokens={_max_tokens}) → max_tokens 상향 후 1회 재시도")
                 # ceiling 2026-07-21 16000→64000(사장 지시): 추론 ON 에이전트 base 가
                 # 64000 이라 16000 실링은 '상향'이 아니라 오히려 삭감이었다. 로컬 모델 추론이
                 # 1.1k~10.7k 로 길어 빈 응답의 주원인이 예산 부족인 만큼, 재시도는 확실히
                 # 더 큰 예산으로 간다(슬롯 131072 이내).
-                _retry_max = min(max(self.max_tokens * 2, 4000), 64000)
+                _retry_max = min(max(_max_tokens * 2, 4000), 64000)
                 try:
                     _d2 = await chat_completion(
                         api_key=self.api_key, model=self.model, messages=messages,
-                        max_tokens=_retry_max, temperature=0.3, timeout_sec=300,
+                        max_tokens=_retry_max, temperature=0.3, timeout_sec=timeout_sec,
+                        thinking=thinking,
                     )
                     _c2 = _d2.get("choices") or []
                     if _c2:

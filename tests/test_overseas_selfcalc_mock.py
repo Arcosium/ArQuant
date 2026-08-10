@@ -81,6 +81,41 @@ def test_selfcalc_keeps_debt_without_us_holdings(tmp_path, monkeypatch):
     assert round(out["krw"]) == round(-9086.0 * 1475.6)
 
 
+def test_selfcalc_carries_ledger_stock_with_debt_on_empty_live_holdings(tmp_path, monkeypatch):
+    """일시 빈 잔고에서는 원장 주식과 USD 부채를 함께 이월해 매수원금 급락을 막는다."""
+    monkeypatch.setattr("infra.kis_broker._real_usdkrw", lambda: 1000.0)
+    b = _broker(tmp_path, {
+        "cash_usd": -100.0,
+        "positions": {
+            "IEF": {"qty": 5, "last_price": 19.0, "avg_cost": 20.0, "ccy": "USD"},
+            "005930": {"qty": 1, "last_price": 80000, "ccy": "KRW"},
+        },
+    })
+    out = b._overseas_selfcalc_krw([])
+    assert out["stock_krw"] == 95_000.0
+    assert out["krw"] == -5_000.0                  # 부채만 잡으면 -100,000원으로 급락
+
+
+def test_mock_flat_reconcile_requires_three_authoritative_empty_reads(tmp_path):
+    """단발 빈 응답은 보존하고, 세 거래소 정상 빈 잔고 3회에만 허수 US 포지션을 청산한다."""
+    b = _broker(tmp_path, {
+        "cash_usd": -100.0,
+        "positions": {"IEF": {"qty": 5, "last_price": 19.0, "ccy": "USD"}},
+    })
+    b.is_mock = True
+
+    assert b._reconcile_mock_us_flat(True) is False
+    assert b._reconcile_mock_us_flat(False) is False       # 조회 실패가 끼면 연속성 리셋
+    assert b._reconcile_mock_us_flat(True) is False
+    assert b._reconcile_mock_us_flat(True) is False
+    assert b._reconcile_mock_us_flat(True) is True
+
+    led = json.loads((tmp_path / "ledger.json").read_text(encoding="utf-8"))
+    assert "IEF" not in led["positions"]
+    assert abs(led["cash_usd"] - (-100.0 + 5 * 19.0 * 0.997)) < 1e-9
+    assert led["reconciliations"][-1]["kind"] == "mock_us_authoritative_flat"
+
+
 def test_sanitize_still_zeroes_garbage_first(tmp_path):
     """자체산출은 _sanitize_overseas 가 0 으로 만든 뒤에만 개입한다(실계좌 경로 불변)."""
     assert _sanitize_overseas(357_415_556, 13_355_758, 218.31) == (0.0, 0.0)

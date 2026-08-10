@@ -30,6 +30,21 @@ def test_parse_uses_last_match():
     assert tfs.parse_buy_line(text) == {"035420": 7.0}
 
 
+def test_cross_side_sell_and_rebuy_is_normalized_to_hold():
+    sells = {"003230": "절반", "196170": "전량", "008930": "보유"}
+    buys = {"003230": 2.0, "008930": 3.0, "051600": 5.0}
+    overlap = tfs.normalize_cross_side_decisions(sells, buys)
+    assert overlap == ["003230", "008930"]
+    assert sells == {"003230": "보유", "196170": "전량", "008930": "보유"}
+    assert buys == {"051600": 5.0}
+
+
+def test_committee_buy_gate_matches_kis_policy():
+    assert tfs.committee_buy_allowed("매수") is True
+    assert tfs.committee_buy_allowed("보류") is False
+    assert tfs.committee_buy_allowed("회피") is False
+
+
 def test_sell_qty_from_directive():
     assert tfs.sell_qty_from_directive("전량", 10) == 10
     assert tfs.sell_qty_from_directive("절반", 10) == 5
@@ -127,6 +142,28 @@ def test_assemble_sells_from_holdings_only():
     sells, buys, notes = _assemble(sells={"005930": "전량", "000660": "전량"},
                                    holdings=holdings, prices={"005930": 80_000})
     assert len(sells) == 1 and sells[0]["qty"] == 100 and sells[0]["side"] == "sell"
+
+
+def test_timefolio_uses_common_hard_take_profit_even_when_llm_says_hold():
+    holdings = [{"code": "214450", "name": "파마리서치", "qty": 2,
+                 "cur_price": 408_500, "pnl_pct": 20.4, "eval_amt": 817_000}]
+    sells, _, _ = _assemble(
+        sells={"214450": "보유"}, holdings=holdings, prices={"214450": 408_500},
+        enable_rebalance=True, take_profit_pct=12.0, stop_loss_pct=5.0)
+    assert len(sells) == 1 and sells[0]["qty"] == 2
+    assert "자동 익절" in sells[0]["reason"]
+
+
+def test_pending_buy_skips_ledger_when_site_reconciliation_already_adopted_it():
+    pending = {"ticker": "003230", "side": "buy", "qty": 57, "before_qty": 0}
+    assert tfs.pending_ledger_apply_qty(pending, 56, site_qty=56, ledger_qty=56) == 0
+
+
+def test_pending_fill_applies_only_unreconciled_quantity():
+    buy = {"ticker": "003230", "side": "buy"}
+    sell = {"ticker": "214450", "side": "sell"}
+    assert tfs.pending_ledger_apply_qty(buy, 56, site_qty=56, ledger_qty=20) == 36
+    assert tfs.pending_ledger_apply_qty(sell, 2, site_qty=0, ledger_qty=1) == 1
 
 
 def test_assemble_skips_already_held():

@@ -15,7 +15,10 @@ def _broker():
 
     async def fake_token(force=False):
         return "tok"
+    async def fake_pace():
+        return None
     b.token = fake_token
+    b._pace = fake_pace
     return b
 
 

@@ -208,6 +208,26 @@ def parse_buy_line(text: str) -> Dict[str, float]:
     return out
 
 
+def normalize_cross_side_decisions(sells: Dict[str, str], buys: Dict[str, float]) -> List[str]:
+    """같은 사이클에 매도와 매수를 동시에 지시한 보유종목을 무거래로 정규화한다.
+
+    타임폴리오는 매도 접수분을 즉시 매수예산으로 잡지 않고, 현재 보유종목 재매수도 중복
+    방지 게이트가 거부한다. 따라서 `절반 매도 + 2% 재매수`를 그대로 두면 매도만 실행되어
+    전략가가 의도한 목표비중과 정반대가 된다. 양쪽에 나온 코드는 보유로 바꾸고 매수에서
+    제거한다. 실제 손익 기반 익절·손절은 공통 하드 안전망이 이후 별도로 우선 적용한다.
+    """
+    overlap = sorted(set(sells or {}) & set(buys or {}))
+    for code in overlap:
+        sells[code] = "보유"
+        buys.pop(code, None)
+    return overlap
+
+
+def committee_buy_allowed(stance: str) -> bool:
+    """KIS 공통 위원회와 같은 정책: 최종 결정이 '매수'일 때만 주문한다."""
+    return str(stance or "").strip() == "매수"
+
+
 def sell_qty_from_directive(directive: str, held_qty: int) -> int:
     """전량/절반/보유/N주 → 매도 수량. '보유'(또는 미인식)=0."""
     t = str(directive or "").strip()
@@ -231,23 +251,34 @@ def assemble_orders(*, sells: Dict[str, str], buys: Dict[str, float],
                     mcap_map: Dict[str, float], quant_scores: Dict[str, int],
                     min_score: int, max_buys: int,
                     smallcap_budget_pct: float, cash_floor_pct: float,
+                    enable_rebalance: bool = True,
+                    take_profit_pct: float = 12.0,
+                    stop_loss_pct: float = 5.0,
+                    trailing_pct: float = 0.0,
+                    peaks: Optional[Dict[str, Any]] = None,
                     ) -> Tuple[List[Dict], List[Dict], List[str]]:
     """전략가 결정 → 대회 한도를 선반영한 주문 리스트. (집행 직전 check_order 가 최종 게이트.)
     Returns (sell_orders, buy_orders, notes) — 주문: {code, side, qty, price, reason}."""
     notes: List[str] = []
     held = {str(h.get("code") or "").zfill(6): h for h in holdings or []}
 
+    # KIS 실전·모의와 동일한 결정론 매도 조립기를 사용한다. 타임폴리오 전용 차이는 주문
+    # 집행기와 대회 매수 한도뿐이며, 익절·손절·트레일링·LLM 지시 우선순위는 계정 공통이다.
+    from main_swarm import _assemble_sell_orders
+    common_sells, _ = _assemble_sell_orders(
+        holdings, sells or {}, enable_rebalance=bool(enable_rebalance),
+        take_profit_pct=float(take_profit_pct or 0.0),
+        stop_loss_pct=float(stop_loss_pct or 0.0),
+        trim_over_ratio=False, conservative_ratio=0.0, per_stock_cap=0.0,
+        total=float(total_eval or 0.0), sell_prices=None,
+        trailing_pct=float(trailing_pct or 0.0), peaks=peaks)
     sell_orders: List[Dict] = []
-    for code, directive in (sells or {}).items():
-        h = held.get(code)
-        if not h:
-            continue
-        qty = sell_qty_from_directive(directive, int(h.get("qty") or 0))
-        if qty <= 0:
-            continue
+    for od in common_sells:
+        code = str(od.get("ticker") or "").zfill(6)
+        h = held.get(code) or {}
         price = float(prices.get(code) or h.get("cur_price") or 0.0)
-        sell_orders.append({"code": code, "side": "sell", "qty": qty, "price": price,
-                            "reason": f"주식운용실장 매도 판단 — {directive}"})
+        sell_orders.append({"code": code, "side": "sell", "qty": int(od.get("qty") or 0),
+                            "price": price, "reason": str(od.get("reason") or "")})
 
     # 매수 — 예산: 현금(현금바닥 유보) 안에서만. 매도 대금은 체결 확인 전이라 계상하지 않는다(보수).
     budget = max(0.0, cash - total_eval * cash_floor_pct / 100.0)
@@ -409,6 +440,24 @@ def resolve_pending(pending: List[Dict], holdings: List[Dict]) -> Tuple[List[Dic
     return done, still
 
 
+def pending_ledger_apply_qty(pending: Dict, fill_qty: int, *, site_qty: int,
+                             ledger_qty: int) -> int:
+    """지연 체결 중 원장에 아직 반영되지 않은 수량만 반환한다.
+
+    사이트-원장 정기 대조가 다음 사이클보다 먼저 누락/허수를 정정할 수 있다. 그 뒤 지연
+    체결을 주문수량 그대로 다시 적용하면 매수는 두 번 더해지고 매도는 현금이 중복 반영된다.
+    사이트 현재수량을 종착점으로 삼아 남은 차이만 원장에 적용한다.
+    """
+    fill_qty = max(0, int(fill_qty or 0))
+    site_qty = max(0, int(site_qty or 0))
+    ledger_qty = max(0, int(ledger_qty or 0))
+    if str((pending or {}).get("side") or "").lower() == "buy":
+        remaining = site_qty - ledger_qty
+    else:
+        remaining = ledger_qty - site_qty
+    return min(fill_qty, max(0, remaining))
+
+
 async def _confirm_pending_fills(orch, ms, uid: int, holdings: List[Dict]) -> None:
     pending = _load_pending(uid)
     if not pending:
@@ -428,8 +477,20 @@ async def _confirm_pending_fills(orch, ms, uid: int, holdings: List[Dict]) -> No
                "avg_cost": price}
         orch._trade_log.append({"ts": ms._now_kst_iso(), **rec})
         try:
-            ms.trade_ledger.apply_fill(uid, ticker=code, side=side, qty=qty, price=price,
-                                       ccy="KRW", avg_cost=price, note="timefolio_pending_confirm")
+            # 정기 원장대조가 지연 체결보다 먼저 사이트 수량으로 정정했을 수 있다. 현재 사이트
+            # 수량과 원장 수량의 남은 차이만 반영해 다음 사이클 이중계상을 막는다.
+            _held_now = {str(h.get("code") or "").zfill(6): int(float(h.get("qty") or 0))
+                         for h in (holdings or [])}
+            _led = ms.trade_ledger.load(uid) or {}
+            _led_qty = int((((_led.get("positions") or {}).get(code) or {}).get("qty")) or 0)
+            _apply_qty = pending_ledger_apply_qty(
+                p, qty, site_qty=_held_now.get(code, 0), ledger_qty=_led_qty)
+            if _apply_qty > 0:
+                ms.trade_ledger.apply_fill(uid, ticker=code, side=side, qty=_apply_qty, price=price,
+                                           ccy="KRW", avg_cost=price, note="timefolio_pending_confirm")
+            elif qty > 0:
+                logger.info("[타임폴리오 원장 uid=%s] %s 지연체결 %s주 — 사이트 대조로 이미 반영, 원장 skip",
+                            uid, code, qty)
         except Exception as le:  # noqa: BLE001
             logger.warning("[타임폴리오 원장 uid=%s] 지연체결 반영 실패 %s: %s", uid, code, le)
         await orch._emit({"type": "trade_executed",
@@ -633,20 +694,28 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
         # 2026-07-22: 대회 사이클은 상시지시를 전혀 읽지 않아, 대시보드에 등록한 지시가
         # 타임폴리오 계정에만 조용히 무시됐다(KIS 경로는 _run_analysis_cycle 이 주입).
         + _standing_block(orch)
-        + "\n위 정보로 매도/매수를 결정하고, 마지막 두 줄에 `매도결정:`/`매수결정:` 을 형식대로 출력하십시오.")
+        + "\n같은 보유 종목을 한 사이클의 매도결정과 매수결정에 동시에 넣지 마십시오. "
+          "비중 유지면 매도결정에 보유만, 축소면 매도만, 확대면 매수만 쓰십시오. "
+          "위 정보로 매도/매수를 결정하고, 마지막 두 줄에 `매도결정:`/`매수결정:` 을 형식대로 출력하십시오.")
     await orch._emit({"type": "agent_msg", "agent": STRATEGIST_NAME, "message": decision})
     orch.cycle_log.log("ORDER_DRAFTING", STRATEGIST_NAME, decision)
 
     sells = parse_sell_line(decision)
     buys = {c: w for c, w in parse_buy_line(decision).items() if c in eligible}  # 후보 밖 코드 무시(환각 차단)
+    _cross_side = normalize_cross_side_decisions(sells, buys)
+    if _cross_side:
+        _msg = ("동일 사이클 매도·매수 중복 → 보유 정규화: " + ", ".join(_cross_side))
+        logger.warning("[타임폴리오 uid=%s] %s", uid, _msg)
+        orch.cycle_log.log("ORDER_DRAFTING", "시스템", _msg)
+        await orch._emit({"type": "agent_msg", "agent": "시스템", "message": "🛡️ " + _msg})
     orch._timefolio_last_decision = (f"{started_at} 매도 {len(sells)}건/매수 {len(buys)}건 — "
                                      + "; ".join(f"{c}={d}" for c, d in list(sells.items())[:4])
                                      + " | " + "; ".join(f"{c}={w}%" for c, w in list(buys.items())[:4]))
 
     # [5.5] 운용위원회 심의 (사장 지시 2026-07-21) — 대회 계정도 QIS 위원회 로직을 살린다.
     #   전략가가 고른 매수 후보를 매수 심사역↔보유 심사역 찬반토론 + 주식운용실장 종합에 올려
-    #   회의록을 기록(사이클 탭 '심의·근거 트리'에 표시)한다. 주식운용실장이 '회피'로 종합하면
-    #   그 매수만 취소한다. 대회 규정 리스크는 집행 직전 check_order 하드 게이트가 최종 담당하므로,
+    #   회의록을 기록(사이클 탭 '심의·근거 트리'에 표시)한다. 주식운용실장이 최종 '매수'로
+    #   종합한 후보만 집행한다. 대회 규정 리스크는 집행 직전 check_order 하드 게이트가 최종 담당하므로,
     #   심의 실패는 절대 사이클을 막지 않는다(fail-open).
     committee_record: Dict[str, Any] = {"candidates": [], "position_reviews": []}
     if buys:
@@ -675,12 +744,14 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
                     "code": code, "name": nm, "sector": sector, "quant_score": qs,
                     "decision": decision, "engine": ("llm" if llm_used else "결정론"),
                     "opinions": opinions, "dialogue": dialogue, "report": rep.to_dict()})
-                if _stance == cmt.AVOID:
+                # KIS 실전/모의의 공통 위원회 게이트와 동일하게 최종 '매수'만 통과시킨다.
+                # 과거에는 '회피'만 제외해 '보류' 종목도 주문되는 모순이 있었다.
+                if not committee_buy_allowed(_stance):
                     _dropped.append(code)
             for code in _dropped:
                 buys.pop(code, None)
                 orch.cycle_log.log("ORDER_DRAFTING", "주식운용실장",
-                                   f"{code} — 운용위원회 종합 '회피'로 매수 취소")
+                                   f"{code} — 운용위원회 최종 '매수' 아님 → 매수 취소")
         except Exception as e:  # noqa: BLE001
             logger.warning("[타임폴리오] 위원회 심의 생략(fail-open): %s", e)
 
@@ -691,13 +762,21 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
             prices[code] = await broker.kr_last_price(code)
         except Exception:  # noqa: BLE001
             prices[code] = 0.0
+    _trailing_pct = float(runtime.get("TRAILING_TAKE_PROFIT_PCT", uid=uid) or 0.0)
+    _peaks = ms._load_trailing_peaks(uid) if _trailing_pct > 0 else None
     sell_orders, buy_orders, notes = assemble_orders(
         sells=sells, buys=buys, holdings=holdings, prices=prices,
         total_eval=total_eval, cash=cash, mcap_map=mcap_map, quant_scores=quant_scores,
         min_score=int(runtime.get("MIN_QUANT_SCORE", uid=uid) or 0),
         max_buys=config.TIMEFOLIO_MAX_BUYS_PER_CYCLE,
         smallcap_budget_pct=config.TIMEFOLIO_SMALLCAP_BUDGET_PCT,
-        cash_floor_pct=config.TIMEFOLIO_CASH_FLOOR_PCT)
+        cash_floor_pct=config.TIMEFOLIO_CASH_FLOOR_PCT,
+        enable_rebalance=bool(runtime.get("ENABLE_SELL_REBALANCE", uid=uid)),
+        take_profit_pct=float(runtime.get("TAKE_PROFIT_PCT", uid=uid) or 0.0),
+        stop_loss_pct=float(runtime.get("STOP_LOSS_PCT", uid=uid) or 0.0),
+        trailing_pct=_trailing_pct, peaks=_peaks)
+    if _peaks is not None:
+        ms._save_trailing_peaks(uid, _peaks, holdings)
     for n in notes:
         orch.cycle_log.log("ORDER_DRAFTING", "시스템", n)
 

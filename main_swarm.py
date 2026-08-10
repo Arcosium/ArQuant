@@ -5,7 +5,7 @@ When strategist returns target stocks → 3yr daily + supply crawl + minute char
 """
 import json, re, asyncio, logging, time, difflib, subprocess, types
 from enum import Enum
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from datetime import datetime, timezone, timedelta
 
 from agents.base_agent import BaseAgent
@@ -1837,7 +1837,9 @@ def _assemble_sell_orders(holdings, sell_directives, *, enable_rebalance, take_p
                           stop_loss_pct, trim_over_ratio, conservative_ratio, per_stock_cap, total,
                           sell_prices=None, trailing_pct=0.0, peaks=None):
     """보유종목 → 매도 주문 리스트 + price_map. KR(6자리)·US(티커) 모두 처리.
-    사후관리실장 매도결정(sell_directives)이 우선, 미언급 종목은 자동 익절/손절(안전망).
+    자동 익절·손절·트레일링은 계정 공통 하드 안전망이며 사후관리실장의 '보유/절반'보다 우선한다.
+    안전망 미발동 종목만 sell_directives 판단을 따른다. 자동매도를 원치 않는 프로필은
+    ENABLE_SELL_REBALANCE=False 로 명시적으로 끌 수 있다.
     편중축소(TRIM)는 KRW per_stock_cap 기준이라 KR에만 적용 — US(USD 평가액)와 통화를
     섞으면 안 됨(버그 2026-05-22). 반환 order dict 의 market 으로 실행부가 us_sell/kr_sell 라우팅."""
     sell_directives = sell_directives or {}
@@ -1861,8 +1863,25 @@ def _assemble_sell_orders(holdings, sell_directives, *, enable_rebalance, take_p
                            "peak_pnl": max(float(_pk.get("peak_pnl") or 0.0), pnl)}
         reason = None
         sell_qty = 0
+        automatic_safety = False
         directive = sell_directives.get(code) or sell_directives.get(code.upper())
-        if directive is not None:
+        # 계정 공통 결정론 안전망. LLM이 '보유'를 반환해도 설정된 손익 규율은 무력화되지 않는다.
+        if enable_rebalance and float(take_profit_pct or 0.0) > 0 and pnl >= float(take_profit_pct):
+            reason = f"자동 익절 — 평가손익 {pnl:+.1f}% ≥ +{take_profit_pct:.0f}%"; sell_qty = qty
+            automatic_safety = True
+        elif enable_rebalance and float(stop_loss_pct or 0.0) > 0 and pnl <= -float(stop_loss_pct):
+            reason = f"자동 손절 — 평가손익 {pnl:+.1f}% ≤ -{stop_loss_pct:.0f}%"; sell_qty = qty
+            automatic_safety = True
+        elif enable_rebalance and _tt > 0 and peaks is not None and cur > 0:
+            _pp = float((peaks.get(pkey) or {}).get("peak_price") or 0.0)
+            _ppnl = float((peaks.get(pkey) or {}).get("peak_pnl") or 0.0)
+            _retr = ((_pp - cur) / _pp * 100.0) if _pp > 0 else 0.0
+            if _ppnl >= _tt and _retr >= _tt:
+                reason = (f"트레일링 익절 — 고점 +{_ppnl:.1f}% → 현재 {pnl:+.1f}% "
+                          f"(고점가 대비 -{_retr:.1f}% 되밀림 ≥ {_tt:.1f}%)"); sell_qty = qty
+                automatic_safety = True
+
+        if reason is None and directive is not None:
             dl = str(directive).strip().lower()
             if dl in _SELL_HOLD_WORDS:
                 continue
@@ -1876,28 +1895,20 @@ def _assemble_sell_orders(holdings, sell_directives, *, enable_rebalance, take_p
                     sell_qty = max(1, min(int(mnum.group(1)), qty)); reason = f"사후관리실장 매도 판단 — {sell_qty}주"
                 else:
                     continue  # 알 수 없는 지시 → 보유로 간주
-        elif enable_rebalance:
-            # 사후관리실장이 언급 안 한 종목 → 자동 익절/손절/편중축소 (안전망)
-            if pnl >= take_profit_pct:
-                reason = f"자동 익절 — 평가손익 {pnl:+.1f}% ≥ +{take_profit_pct:.0f}%"; sell_qty = qty
-            elif pnl <= -stop_loss_pct:
-                reason = f"자동 손절 — 평가손익 {pnl:+.1f}% ≤ -{stop_loss_pct:.0f}%"; sell_qty = qty
-            elif _tt > 0 and peaks is not None and cur > 0:
-                # 트레일링 익절 — 승자(고점 평가손익 ≥ trailing)가 고점가 대비 trailing% 되밀리면 매도.
-                _pp = float((peaks.get(pkey) or {}).get("peak_price") or 0.0)
-                _ppnl = float((peaks.get(pkey) or {}).get("peak_pnl") or 0.0)
-                _retr = ((_pp - cur) / _pp * 100.0) if _pp > 0 else 0.0
-                if _ppnl >= _tt and _retr >= _tt:
-                    reason = (f"트레일링 익절 — 고점 +{_ppnl:.1f}% → 현재 {pnl:+.1f}% "
-                              f"(고점가 대비 -{_retr:.1f}% 되밀림 ≥ {_tt:.1f}%)"); sell_qty = qty
-            elif is_kr and trim_over_ratio and per_stock_cap > 0 and cur > 0 and (cur * qty) > per_stock_cap:
+        if reason is None and directive is None and enable_rebalance:
+            # 하드 안전망·LLM 지시가 모두 없는 종목의 편중만 축소한다.
+            if is_kr and trim_over_ratio and per_stock_cap > 0 and cur > 0 and (cur * qty) > per_stock_cap:
                 over = int(((cur * qty) - per_stock_cap) // cur) + 1
                 sell_qty = max(1, min(over, qty))
                 reason = f"편중 축소 — 비중 {cur*qty/total*100:.1f}% > {conservative_ratio*100:.0f}% 한도"
         if reason and sell_qty > 0:
             # 사장 지시 2026-05-22: 계량분석팀장이 '매도가'를 숫자로 제시하면 그 지정가로 매도.
             # (시장가/미지정·안전망 자동 익절손절은 시장가 유지 — 즉시 청산.)
-            _sp = (sell_prices or {}).get(code) or (sell_prices or {}).get(pkey) or (sell_prices or {}).get(code.upper())
+            # 실제 손익으로 발동한 하드 안전망은 LLM의 매도가를 사용하지 않는다. 오래되거나
+            # 잘못 생성된 지정가 때문에 익절·손절 주문이 미체결로 남는 것을 막는다.
+            _sp = None if automatic_safety else (
+                (sell_prices or {}).get(code) or (sell_prices or {}).get(pkey)
+                or (sell_prices or {}).get(code.upper()))
             _lim = _sp.get("limit_price") if (_sp and _sp.get("mode") == "limit") else None
             _od = {"ticker": pkey, "side": "sell", "qty": sell_qty,
                    "price_type": "limit" if _lim else "market",
@@ -1980,6 +1991,60 @@ def _parse_sell_decisions(text: str) -> Dict[str, str]:
             # 종전엔 isdigit() 판정에 걸려 매도가 조용히 누락됐다(#481 261220=1매).
             out[mm.group(1).upper()] = normalize_sell_directive(mm.group(2).strip())
     return out
+
+
+_CLAIMED_CURRENT_PRICE_RE = re.compile(
+    r"현재가\s*(?:\(\s*|[:：]?\s*(?:약\s*)?)([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:원|달러|USD|\$)?",
+    re.IGNORECASE,
+)
+
+
+def sanitize_sell_directives_by_authoritative_prices(
+        text: str, directives: Dict[str, str], holdings: List[Dict],
+        *, max_deviation_pct: float = 3.0) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    """LLM이 보유 현재가를 크게 틀린 채 만든 매도지시를 보유로 격리한다.
+
+    자동 익절·손절은 이후 _assemble_sell_orders 가 권위 pnl_pct로 별도 집행하므로 여기서는
+    자유서술 기반 지시만 보수적으로 차단한다. 가격 언급이 없거나 오차 허용범위 안이면 그대로 둔다.
+    """
+    cleaned = dict(directives or {})
+    conflicts: List[Dict[str, Any]] = []
+    if not text or not cleaned:
+        return cleaned, conflicts
+    facts = {}
+    for h in holdings or []:
+        code = str(h.get("code") or "").strip().upper()
+        cur = float(h.get("cur_price") or 0.0)
+        if code and cur > 0:
+            facts[code] = {"cur": cur, "name": str(h.get("name") or "")}
+    code_starts = {}
+    upper_text = text.upper()
+    for code, fact in facts.items():
+        starts = [p for p in (upper_text.find(code), upper_text.find(fact["name"].upper())) if p >= 0]
+        if starts:
+            code_starts[code] = min(starts)
+    ordered = sorted((p, c) for c, p in code_starts.items())
+    for code, directive in list(cleaned.items()):
+        key = str(code).strip().upper()
+        if str(directive or "").strip().lower() in _SELL_HOLD_WORDS or key not in code_starts:
+            continue
+        start = code_starts[key]
+        later = [p for p, other in ordered if p > start and other != key]
+        section = text[start:(min(later) if later else len(text))]
+        m = _CLAIMED_CURRENT_PRICE_RE.search(section)
+        if not m:
+            continue
+        try:
+            claimed = float(m.group(1).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        actual = facts[key]["cur"]
+        deviation = abs(claimed - actual) / actual * 100.0 if actual > 0 else 0.0
+        if claimed > 0 and deviation > float(max_deviation_pct):
+            cleaned[code] = "보유"
+            conflicts.append({"code": key, "claimed": claimed, "actual": actual,
+                              "deviation_pct": deviation, "directive": directive})
+    return cleaned, conflicts
 
 
 def _build_sleeve_prompt(spec, macro, news, pool_txt, weight_ctx, thesis_reminder="", holdings_txt=""):
@@ -4545,7 +4610,11 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 # 클린코드 2026-05-19: 침묵 삼킴 제거 — 빈 holdings로 진행하면 보유 종목
                 # 회피·체결확인이 불가하므로 최소한 원인을 남긴다.
                 record_error("_collect_company_data", _he, context="세션 보유종목 조회 실패 → 빈 목록 진행", uid=self.uid)
-            holdings_str = ("; ".join(f"{h['name']}({h['code']}) {h['qty']}주 손익 {h['pnl_pct']:+.1f}%" for h in holdings) or "없음")
+            holdings_str = ("; ".join(
+                f"{h['name']}({h['code']}) {h['qty']}주 "
+                f"평단 {float(h.get('avg_price') or 0):,.2f} 현재가 {float(h.get('cur_price') or 0):,.2f} "
+                f"손익 {float(h.get('pnl_pct') or 0):+.1f}%"
+                for h in holdings) or "없음")
 
             # [2] DART — 사장 피드백 2026-05-15 (#20): DART는 국내 종목만 있으니 KR 장 시간에만 30분 간격으로 가동.
             # US_TRADING/OFF_HOURS 사이클은 DART 호출 자체를 생략.
@@ -4895,7 +4964,11 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     f"코드를 임의로 지어내지 마십시오(가짜 코드는 종목 자체가 누락됩니다). 미국 종목은 티커(예: AAPL).\n"
                     f"그 외에는 대형주에 치우치지 말고 시가총액·업종을 분산하고, 위 1주 예산 안에서 매수 가능한(또는 근접한) 종목을 우선하며, 이미 보유한 종목은 가급적 제외하십시오.\n"
                     f"[대화 흐름] 이건 이어지는 팀 회의입니다 — 첫 문장은 글로벌리서치팀장·마켓센티먼트팀장 발언을 받아 잇는 인계 코멘트로 시작하고, 지수·환율 등 이미 나온 수치는 다시 나열하지 말고 짧게 참조만 하십시오.\n"
-                    f"⚠️ 응답 마지막 줄은 반드시 `후보종목: 종목명(코드), ...` (5개, 다른 텍스트 없이).")
+                    f"⚠️ 응답 마지막 줄은 반드시 `후보종목: 종목명(코드), ...` (5개, 다른 텍스트 없이).",
+                    # 후보 5개를 뽑는 정형 단계에 pro 기본 40k thinking 예산을 쓰면 모델이
+                    # 30k+ 토큰을 생성하며 사이클이 장 마감까지 정체될 수 있다. 심층 심의는
+                    # 뒤 위원회에서 수행하므로 이 단계만 짧고 결정론적인 출력으로 제한한다.
+                    max_tokens=2500, timeout_sec=120, thinking=False)
                 allocation = _strip_leading_section_marker(allocation, "[후보 종목 선정]", "[최종 매수 종목 결정]")
                 self.cycle_log.log("MACRO", "주식운용실장", allocation)
                 await self._emit({"type":"agent_msg","agent":"주식운용실장","message":f"[후보 종목 선정]\n{allocation}"})
@@ -5421,6 +5494,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 # 프롬프트 보유 문자열도 슬리브 제외 — 슬리브 매도는 매니저 제안+사후관리 종합으로 처리.
                 holdings_str = ("; ".join(
                     f"{h.get('name', h.get('code'))}({h.get('code')}) {h.get('qty')}주 "
+                    f"평단 {float(h.get('avg_price') or 0):,.2f} 현재가 {float(h.get('cur_price') or 0):,.2f} "
                     f"손익 {float(h.get('pnl_pct') or 0.0):+.1f}%" for h in holdings) or "없음")
             # ── PASS 2: 주식운용실장 → 최종 매수 종목 (전략 설정에 따라 1~N개) ──────
             _N = int(runtime.get("MAX_TRADES_PER_CYCLE", uid=self.uid) or 2)
@@ -5598,6 +5672,8 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     + f"보유기간 (Arquant 자체 관찰):\n{holding_period_str}\n\n"
                     f"계량분석팀장 평가:\n{quant_report}\n\n마켓센티먼트팀장 평가:\n{news_report}\n\n"
                     + _sleeve_prop_block
+                    + "⚠️ 현재 보유 종목 줄의 평단·현재가·손익이 이 사이클의 권위 사실입니다. 다른 가격을 추정하거나 "
+                      "과거 가격을 현재가로 쓰지 마십시오. 권위 현재가와 모순되는 가격을 근거로 만든 매도결정은 시스템이 폐기합니다.\n"
                     + f"위 매크로 → 퀀트 → 뉴스 → 평가손익 순으로 가중해 보유 종목별로 매도/보유를 결정하십시오. "
                     f"{_hold_guide} 종목별 사유에 '시장이 닫혀 매매 불가' 같은 세션 추측을 쓰지 마십시오 (위 세션 안내가 사실). "
                     + ("⚠️ 위 [장기 펀더멘털 리서치 참고]에서 QUALITY_VETO 또는 thesis invalidator가 있으면, "
@@ -5628,6 +5704,16 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 self.cycle_log.log("RISK", "사후관리실장", pm_view)
                 await self._emit({"type":"agent_msg","agent":"사후관리실장","message":pm_view})
                 sell_directives = _parse_sell_decisions(pm_view)
+                sell_directives, _price_conflicts = sanitize_sell_directives_by_authoritative_prices(
+                    pm_view, sell_directives, holdings)
+                if _price_conflicts:
+                    _facts = "; ".join(
+                        f"{x['code']} LLM {x['claimed']:,.2f} vs 실제 {x['actual']:,.2f}"
+                        for x in _price_conflicts)
+                    logger.warning("[매도사실충돌 uid=%s] %s — LLM 매도지시 보유로 격리", self.uid, _facts)
+                    await self._emit({"type": "agent_msg", "agent": "시스템",
+                                      "message": f"🛡️ 매도 근거 가격 불일치 차단 — {_facts}. "
+                                                 "자동 익절·손절은 실제 손익 기준으로 별도 적용합니다."})
                 cyc._pm_view = pm_view  # QuantInSight 이식(2026-07-18): 위원회 '보유 심의' 기록용 원문
                 # 사장 지시 2026-06-09 #1: 사후관리실장이 슬리브(채권·원자재) 코드를 매도결정에 포함하면
                 # 그대로 *종합*한다(구 strip 폐지). 슬리브 코드는 주식 매도 트랙(stock_holdings 기반)엔 안 걸리고,
