@@ -32,6 +32,7 @@ def run_cycle(uid: int, *, targets: list[str] | None = None, sell_targets: list[
 
     # 미체결 매도가 사이트 보유목록에서 빠지기 전 다음 사이클이 같은 종목을 또 파는 것을 막는다.
     recently_sold = contest_store.recently_sold(uid, within_min=2)
+    rejected_sells = contest_store.recently_rejected(uid, "sell")
     # 사이트에 아직 살아 있는(분할 체결 중인) 매도 주문 — 같은 종목에 또 내면 사이트가
     # "전량 청산 주문 작동 시 추가 청산 불가"(TMS 오류)로 거부한다. 진행 중이니 그냥 기다린다.
     working_sells = {str(x).zfill(6) for x in (working_sells or set())}
@@ -42,6 +43,11 @@ def run_cycle(uid: int, *, targets: list[str] | None = None, sell_targets: list[
         if not code.strip("0"):
             continue
         if code in recently_sold:
+            continue
+        if code in rejected_sells:
+            events.append({"ok": False, "accepted": False, "filled": False, "pending": False,
+                           "ticker": code, "side": "sell", "reason": "reject_cooldown",
+                           "message": "최근 사이트 거절 후 쿨다운 중 — 재주문 생략"})
             continue
         if code in working_sells:   # 사이트에서 분할 체결 진행 중 — 재주문하면 TMS 거부만 난다
             events.append({"ok": False, "accepted": False, "filled": False, "pending": True,
@@ -73,6 +79,7 @@ def run_cycle(uid: int, *, targets: list[str] | None = None, sell_targets: list[
                 res = _place_or_submit(uid, "sell", code, int(pos.get("qty") or 0), price, meta, executor)
             except Exception as exc:  # noqa: BLE001
                 log.exception("[%s] 매도 주문 예외 uid=%s reason=%s", code, uid, reason)
+                contest_store.mark_recent_reject(uid, code, "sell", cooldown_min=2, reason=str(exc))
                 events.append({"ok": False, "accepted": False, "filled": False, "ticker": code,
                                "side": "sell", "qty": int(pos.get("qty") or 0), "price": price,
                                "reason": reason, "message": f"주문 예외: {exc}"})
@@ -83,6 +90,13 @@ def run_cycle(uid: int, *, targets: list[str] | None = None, sell_targets: list[
                 sold += 1
                 just_sold.add(code)
                 contest_store.mark_recent_sell(uid, code)   # 중복 청산 방지 마킹
+            else:
+                site = res.get("site_execution") or {}
+                reject_text = str(site.get("result") or res.get("message") or res.get("reason") or "")
+                # 전일 주문/사이트 규정 거절은 같은 입력을 1분 뒤 다시 내도 결과가 같다.
+                cooldown = 15 if site.get("rejected_reason") == "tms_error" else 5
+                contest_store.mark_recent_reject(uid, code, "sell", cooldown_min=cooldown,
+                                                 reason=reject_text)
             log.info("[%s] 매도 %s → accepted=%s filled=%s", code, reason,
                      res.get("accepted"), res.get("filled"))
 
@@ -95,12 +109,18 @@ def run_cycle(uid: int, *, targets: list[str] | None = None, sell_targets: list[
     # 미체결(site_pending) 매수는 사이트 보유목록에 아직 안 떠 held 에 안 잡힌다 → 매 사이클
     # 같은 종목을 반복 매수(처닝)하는 것을 막기 위해 최근 매수분도 스킵 대상에 포함한다.
     recently = contest_store.recently_bought(uid, within_min=15)
+    rejected_buys = contest_store.recently_rejected(uid, "buy")
 
     # 2) Buy up to max_buys names that pass contest rules.
     for code in target_list:
         if bought >= max(0, int(max_buys or 0)):
             break
         if code in held or code in just_sold or code in recently:  # 보유·방금청산·최근매수(미체결) 스킵
+            continue
+        if code in rejected_buys:
+            events.append({"ok": False, "accepted": False, "filled": False, "ticker": code,
+                           "side": "buy", "reason": "reject_cooldown",
+                           "message": "최근 사이트 거절 후 쿨다운 중 — 재주문 생략"})
             continue
         meta = _fetch_and_store(code)
         price = float(meta.get("last_price") or 0.0)
@@ -128,6 +148,7 @@ def run_cycle(uid: int, *, targets: list[str] | None = None, sell_targets: list[
             res = _place_or_submit(uid, "buy", code, qty, price, meta, executor)
         except Exception as exc:  # noqa: BLE001 — 종목 단위 격리(사이클 전체를 죽이지 않는다)
             log.exception("[%s] 매수 주문 예외 uid=%s", code, uid)
+            contest_store.mark_recent_reject(uid, code, "buy", cooldown_min=2, reason=str(exc))
             events.append({"ok": False, "accepted": False, "filled": False, "ticker": code,
                            "side": "buy", "qty": qty, "price": price, "message": f"주문 예외: {exc}"})
             continue
@@ -136,6 +157,11 @@ def run_cycle(uid: int, *, targets: list[str] | None = None, sell_targets: list[
             bought += 1
             held.add(code)
             contest_store.mark_recent_buy(uid, code)   # 미체결 재매수(처닝) 방지 마킹
+        else:
+            site = res.get("site_execution") or {}
+            reject_text = str(site.get("result") or res.get("message") or res.get("reason") or "")
+            contest_store.mark_recent_reject(uid, code, "buy", cooldown_min=15,
+                                             reason=reject_text)
         log.info("[%s] 매수 → accepted=%s filled=%s", code, res.get("accepted"), res.get("filled"))
 
     refreshed = refresh_holdings(uid) if (contest_store.get_account(uid) or {}).get("positions") else {"refreshed": []}

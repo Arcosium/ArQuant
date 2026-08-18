@@ -56,6 +56,27 @@ def test_naver_cycle_executor_reject_does_not_paper_fill(tmp_path, monkeypatch):
     assert raw["trades"] == []
 
 
+def test_rejected_buy_is_not_resubmitted_every_cycle(tmp_path, monkeypatch):
+    """동일한 사이트 규정 거절을 신호가 살아 있는 동안 매분 반복하지 않는다."""
+    monkeypatch.setattr(contest_store, "_STORE_PATH", tmp_path / "contest_state.json")
+    monkeypatch.setattr(contest_store, "_DATA_DIR", tmp_path)
+    monkeypatch.setattr(naver_cycle, "fetch_security_meta", lambda code, stored=None: {**_meta(code), **(stored or {})})
+    contest_store.register(771, "demo", "pass123456!")
+    contest_store.upsert_security_meta("005930", _meta())
+    calls = []
+
+    def reject_executor(order):
+        calls.append(order["ticker"])
+        return {"accepted": False, "filled": False, "rejected_reason": "sector_full",
+                "result": "섹터 편입 여유 부족"}
+
+    first = naver_cycle.run_cycle(771, targets=["005930"], max_buys=1, executor=reject_executor)
+    second = naver_cycle.run_cycle(771, targets=["005930"], max_buys=1, executor=reject_executor)
+    assert first["bought"] == second["bought"] == 0
+    assert calls == ["005930"]
+    assert any(e.get("reason") == "reject_cooldown" for e in second["events"])
+
+
 def test_naver_cycle_executor_filled_syncs_site_positions_without_paper_trade(tmp_path, monkeypatch):
     monkeypatch.setattr(contest_store, "_STORE_PATH", tmp_path / "contest_state.json")
     monkeypatch.setattr(contest_store, "_DATA_DIR", tmp_path)

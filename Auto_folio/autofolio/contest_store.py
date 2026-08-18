@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,7 +16,9 @@ from .contest_rules import normalize_meta, validate_order
 
 _ROOT = Path(__file__).resolve().parents[1]
 # AUTOFOLIO_STATE_PATH 로 상태 파일을 분리할 수 있다(호스트 프로세스별 독립 장부).
-_STORE_PATH = Path(os.environ.get("AUTOFOLIO_STATE_PATH") or (_ROOT / "data" / "contest_state.json"))
+_PRIVATE_ROOT = Path(os.environ.get("AUTOFOLIO_PRIVATE_DATA_DIR") or
+                     (Path.home() / "vault" / "QuantInSight" / "Auto_folio"))
+_STORE_PATH = Path(os.environ.get("AUTOFOLIO_STATE_PATH") or (_PRIVATE_ROOT / "contest_state.json"))
 _DATA_DIR = _STORE_PATH.parent
 _LOCK = threading.RLock()
 DEFAULT_INITIAL_CASH = 1_000_000_000.0
@@ -220,11 +222,15 @@ def _infer_fills(old_positions: dict[str, Any], new_positions: dict[str, Any],
     타임폴리오는 체결가를 '주문 내역' 탭 원장에만 두는데, 그 탭을 열면 이어지는 주문이 깨진다
     (timefolio_browser.ledger_orders 주석). 그래서 LIVE 모드에선 체결이 로컬 장부에 한 줄도
     쌓이지 않았고 실현손익·승률·거래내역이 영구히 0 이었다.
-    매수가는 사이트 평단 변화로 정확히 역산되고, 매도가는 현금 증가분에서 매수대금을 뺀 값으로
-    역산한다(매도 1건이면 수수료·세 차감 후 실수령가와 정확히 일치).
+    매수가는 사이트 평단 변화로 역산한다. 매도가는 사이트가 노출하는 당시 현재가를 쓴다.
+
+    예전에는 ``새 현금 - 이전 현금 + 매수대금``을 매도대금으로 간주했다. 하지만 NAV와 보유
+    현재가는 서로 다른 순간에 렌더되므로 그 차이에는 다른 보유종목의 시가 변동과 반올림이
+    섞인다. 이를 소량 분할 체결 수량으로 나누면 실제 하루 고가·저가를 벗어난 가짜 체결가가
+    만들어진다. 타임폴리오 주문 원장에는 체결가가 없으므로 정확한 값인 척하지 않고, 사이트
+    시장가 스냅샷을 ``estimated`` 체결가로 기록한다.
     """
     fills: list[dict[str, Any]] = []
-    buy_amount = 0.0
     for ticker, new in new_positions.items():
         old = old_positions.get(ticker) or {}
         old_qty, new_qty = int(old.get("qty") or 0), int(new.get("qty") or 0)
@@ -238,36 +244,116 @@ def _infer_fills(old_positions: dict[str, Any], new_positions: dict[str, Any],
             price = float(new.get("last_price") or new_avg or 0.0)
         if price <= 0:
             continue
-        buy_amount += delta * price
         fills.append({"ts": ts, "side": "buy", "ticker": ticker, "qty": delta, "price": price,
-                      "accepted": True, "filled": True, "inferred": True})
+                      "amount": delta * price, "accepted": True, "filled": True, "inferred": True,
+                      "estimated": True, "price_source": "position_average_delta"})
 
     sells: list[tuple[str, int, float, float]] = []
     for ticker, old in old_positions.items():
         old_qty = int(old.get("qty") or 0)
-        new_qty = int((new_positions.get(ticker) or {}).get("qty") or 0)
+        new = new_positions.get(ticker) or {}
+        new_qty = int(new.get("qty") or 0)
         if new_qty >= old_qty:
             continue
-        ref = float(old.get("last_price") or old.get("avg_price") or 0.0)
+        # 부분 체결이면 이번 동기화의 현재가가 가장 가깝고, 전량 청산으로 보유행이 사라졌으면
+        # 직전 동기화의 현재가가 최선이다. 둘 다 체결가 자체는 아니므로 estimated 로 표시한다.
+        ref = float(new.get("last_price") or old.get("last_price") or old.get("avg_price") or 0.0)
         sells.append((ticker, old_qty - new_qty, ref, float(old.get("avg_price") or 0.0)))
-    if sells:
-        proceeds = (new_cash - old_cash) + buy_amount      # 순현금증가 + 매수지출 = 매도 실수령액
-        ref_total = sum(qty * ref for _, qty, ref, _avg in sells)
-        for ticker, qty, ref, avg in sells:
-            price = ref
-            if len(sells) == 1 and proceeds > 0:
-                price = proceeds / qty                     # 매도 1건 → 정확
-            elif proceeds > 0 and ref_total > 0:
-                price = ref * (proceeds / ref_total)       # 여러 건 → 참조가에 비례 배분(근사)
-            if price <= 0:
-                continue
-            # 실현손익은 사이트 평단(avg)으로 그 자리에서 확정한다 — 나중에 장부를 되짚는 것보다 정확하다.
-            pnl = (price - avg) * qty if avg > 0 else 0.0
-            fills.append({"ts": ts, "side": "sell", "ticker": ticker, "qty": qty, "price": price,
-                          "accepted": True, "filled": True, "inferred": True,
-                          "avg_price": avg, "pnl": pnl,
-                          "pnl_pct": ((price / avg - 1.0) * 100.0) if avg > 0 else 0.0})
+    for ticker, qty, price, avg in sells:
+        if price <= 0:
+            continue
+        pnl = (price - avg) * qty if avg > 0 else 0.0
+        fills.append({"ts": ts, "side": "sell", "ticker": ticker, "qty": qty, "price": price,
+                      "amount": qty * price, "accepted": True, "filled": True, "inferred": True,
+                      "estimated": True, "price_source": "market_snapshot",
+                      "avg_price": avg, "pnl": pnl,
+                      "pnl_pct": ((price / avg - 1.0) * 100.0) if avg > 0 else 0.0})
     return fills
+
+
+_INFERRED_FILL_GROUP_SEC = 10 * 60
+
+
+def _in_site_fill_session(ts: Any) -> bool:
+    """사이트 보유 변화로 체결을 복원해도 되는 한국 장중/마감 반영 시간."""
+    dt = _to_kst(_parse_dt(ts))
+    return dt.weekday() < 5 and dtime(8, 55) <= dt.time() <= dtime(15, 40)
+
+
+def consolidate_inferred_trades(trades: list[dict[str, Any]], *,
+                                window_sec: float = _INFERRED_FILL_GROUP_SEC) -> list[dict[str, Any]]:
+    """같은 주문에서 쪼개진 추정 체결을 종목·방향별 한 줄로 합친다.
+
+    동일 종목의 반대 방향 체결이 나오면 새 매매 에피소드로 보며, 다른 종목 체결이 사이에
+    끼는 것은 허용한다. PAPER의 실제 로컬 체결과 거절 기록은 손대지 않는다.
+    """
+    out: list[dict[str, Any]] = []
+    last_by_ticker: dict[str, int] = {}
+    for original in trades or []:
+        row = dict(original)
+        ticker = str(row.get("ticker") or "").zfill(6)
+        side = str(row.get("side") or "").lower()
+        eligible = bool(row.get("inferred") and row.get("accepted") and row.get("filled")
+                        and side in {"buy", "sell"} and int(row.get("qty") or 0) > 0)
+        previous_idx = last_by_ticker.get(ticker)
+        previous = out[previous_idx] if previous_idx is not None else None
+        merge = False
+        if eligible and previous and previous.get("inferred") and previous.get("side") == side:
+            gap = (_parse_dt(row.get("ts")) - _parse_dt(previous.get("ts"))).total_seconds()
+            merge = 0 <= gap <= float(window_sec)
+        if not merge:
+            if eligible:
+                row.setdefault("estimated", True)
+                row.setdefault("price_source", "cash_nav_episode_estimate")
+                row.setdefault("first_ts", row.get("ts"))
+                row.setdefault("fill_count", 1)
+            out.append(row)
+            if ticker.strip("0"):
+                last_by_ticker[ticker] = len(out) - 1
+            continue
+
+        old_qty = int(previous.get("qty") or 0)
+        add_qty = int(row.get("qty") or 0)
+        total_qty = old_qty + add_qty
+        if total_qty <= 0:
+            continue
+        old_price = float(previous.get("price") or 0.0)
+        add_price = float(row.get("price") or 0.0)
+        previous["qty"] = total_qty
+        previous["price"] = ((old_price * old_qty) + (add_price * add_qty)) / total_qty
+        previous["amount"] = previous["price"] * total_qty
+        previous["ts"] = row.get("ts") or previous.get("ts")
+        previous["fill_count"] = int(previous.get("fill_count") or 1) + int(row.get("fill_count") or 1)
+        previous["estimated"] = True
+        sources = {str(previous.get("price_source") or ""), str(row.get("price_source") or "")}
+        previous["price_source"] = (sources.pop() if len(sources) == 1
+                                    else "mixed_episode_estimate")
+        if side == "sell":
+            old_avg = float(previous.get("avg_price") or 0.0)
+            add_avg = float(row.get("avg_price") or 0.0)
+            if old_avg > 0 or add_avg > 0:
+                previous["avg_price"] = ((old_avg * old_qty) + (add_avg * add_qty)) / total_qty
+            if previous.get("pnl") is not None or row.get("pnl") is not None:
+                previous["pnl"] = float(previous.get("pnl") or 0.0) + float(row.get("pnl") or 0.0)
+            avg = float(previous.get("avg_price") or 0.0)
+            previous["pnl_pct"] = ((previous["price"] / avg - 1.0) * 100.0) if avg > 0 else 0.0
+    return out
+
+
+def repair_inferred_trade_history(uid: int) -> dict[str, Any]:
+    """기존 분할 추정 체결을 합쳐 장부와 승률의 조각 체결 중복을 제거한다."""
+    with _LOCK:
+        data = _load()
+        account = _account_raw(data, uid)
+        old = list(account.get("trades") or [])
+        eligible = [row for row in old if not row.get("inferred") or _in_site_fill_session(row.get("ts"))]
+        repaired = consolidate_inferred_trades(eligible)
+        account["trades"] = repaired[-2000:]
+        account["trade_history_repaired_at"] = _now()
+        account["updated_at"] = _now()
+        _save(data)
+    return {"before": len(old), "after": len(repaired), "merged": len(eligible) - len(repaired),
+            "removed_outside_session": len(old) - len(eligible)}
 
 
 def set_site_orders(uid: int, rows: list[dict[str, Any]]) -> None:
@@ -347,11 +433,14 @@ def sync_site_portfolio(uid: int, *, positions: list[dict[str, Any]], total_eval
         last_sync = account.get("site_synced_at")
         gap_sec = ((datetime.now(timezone.utc) - _parse_dt(last_sync)).total_seconds()
                    if last_sync else None)
-        if gap_sec is not None and gap_sec <= _FILL_INFER_MAX_GAP_SEC:
+        fill_ts = _now()
+        if (gap_sec is not None and gap_sec <= _FILL_INFER_MAX_GAP_SEC
+                and _in_site_fill_session(fill_ts)):
             fills = _infer_fills(old_positions, new_positions,
-                                 float(account.get("cash") or 0.0), new_cash, ts=_now())
+                                 float(account.get("cash") or 0.0), new_cash, ts=fill_ts)
             if fills:
-                account["trades"] = [*(account.get("trades") or []), *fills][-2000:]
+                account["trades"] = consolidate_inferred_trades(
+                    [*(account.get("trades") or []), *fills])[-2000:]
 
         account["cash"] = new_cash
         account["positions"] = new_positions
@@ -374,6 +463,49 @@ def recently_bought(uid: int, *, within_min: int = 15) -> set[str]:
     """최근 within_min 분 내 매수 제출한 종목 집합 — 미체결분이 사이트 보유목록에 뜨기 전
     매 사이클 같은 종목을 반복 매수하는 처닝을 막는다."""
     return _recent(uid, "recent_buys", within_min)
+
+
+def mark_recent_reject(uid: int, ticker: str, side: str, *, cooldown_min: int,
+                       reason: str | None = None) -> None:
+    """사이트 거절 종목을 잠시 쉬게 해 같은 실패를 매분 재제출하지 않는다."""
+    ticker = str(ticker or "").zfill(6)
+    if not ticker.strip("0"):
+        return
+    with _LOCK:
+        data = _load()
+        account = _account_raw(data, uid)
+        rejects = account.setdefault("recent_rejects", {})
+        rejects[f"{str(side).lower()}:{ticker}"] = {
+            "ts": _now(), "cooldown_min": max(1, int(cooldown_min or 1)), "reason": str(reason or "")[:300]
+        }
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
+        for key, value in list(rejects.items()):
+            try:
+                if _parse_dt((value or {}).get("ts")) < cutoff:
+                    rejects.pop(key, None)
+            except Exception:
+                rejects.pop(key, None)
+        account["updated_at"] = _now()
+        _save(data)
+
+
+def recently_rejected(uid: int, side: str) -> set[str]:
+    """아직 종목별 거절 쿨다운이 끝나지 않은 종목 집합."""
+    now = datetime.now(timezone.utc)
+    prefix = f"{str(side).lower()}:"
+    with _LOCK:
+        account = _load().get("accounts", {}).get(str(int(uid))) or {}
+    out: set[str] = set()
+    for key, value in (account.get("recent_rejects") or {}).items():
+        if not str(key).startswith(prefix) or not isinstance(value, dict):
+            continue
+        try:
+            until = _parse_dt(value.get("ts")) + timedelta(minutes=max(1, int(value.get("cooldown_min") or 1)))
+            if until > now:
+                out.add(str(key).split(":", 1)[1].zfill(6))
+        except Exception:
+            continue
+    return out
 
 
 def mark_recent_sell(uid: int, ticker: str) -> None:
@@ -765,7 +897,8 @@ def _replay_points(account: dict[str, Any]) -> list[dict[str, Any]]:
     def mark_total() -> float:
         return cash + sum(float(p.get("qty") or 0) * float(p.get("last_price") or p.get("avg_price") or 0) for p in positions.values())
 
-    for trade in sorted((account.get("trades") or []), key=lambda x: str(x.get("ts") or "")):
+    rows = consolidate_inferred_trades(list(account.get("trades") or []))
+    for trade in sorted(rows, key=lambda x: str(x.get("ts") or "")):
         if not trade.get("accepted") or not trade.get("filled"):
             continue
         ticker = str(trade.get("ticker") or "").zfill(6)
@@ -859,7 +992,8 @@ def _realized_stats(account: dict[str, Any]) -> dict[str, Any]:
     win_count = 0
     realized = 0.0
     basis = 0.0
-    for trade in sorted((account.get("trades") or []), key=lambda x: str(x.get("ts") or "")):
+    rows = consolidate_inferred_trades(list(account.get("trades") or []))
+    for trade in sorted(rows, key=lambda x: str(x.get("ts") or "")):
         if not trade.get("accepted") or not trade.get("filled"):
             continue
         ticker = str(trade.get("ticker") or "").zfill(6)

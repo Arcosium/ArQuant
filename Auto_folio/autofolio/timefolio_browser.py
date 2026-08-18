@@ -43,11 +43,18 @@ class TimefolioBrowser:
         self.page: Page | None = None
 
     def __enter__(self) -> "TimefolioBrowser":
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(headless=self.headless, args=["--no-sandbox"])
-        self._context = self._browser.new_context(locale="ko-KR", timezone_id="Asia/Seoul")
-        self.page = self._context.new_page()
-        return self
+        try:
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(headless=self.headless, args=["--no-sandbox"])
+            self._context = self._browser.new_context(locale="ko-KR", timezone_id="Asia/Seoul")
+            self.page = self._context.new_page()
+            return self
+        except Exception:
+            # launch 단계에서 브라우저 실행 파일 누락 등이 나도 sync_playwright 드라이버를
+            # 반드시 멈춘다. 이 정리가 없으면 같은 워커 스레드의 다음 재시도가
+            # "Sync API inside asyncio loop"라는 엉뚱한 2차 오류로 바뀐다.
+            self.__exit__(None, None, None)
+            raise
 
     def __exit__(self, exc_type, exc, tb) -> None:
         for closer in (self._context, self._browser):
@@ -100,14 +107,26 @@ class TimefolioBrowser:
         self._wait_nav(page)
 
     def _wait_nav(self, page: Page) -> None:
-        """NAV 위젯 렌더 대기 — 너무 이른 scrape 가 부분렌더 페이지에서 엉뚱한 작은 수(관측: 8)를
-        NAV 로 잡아 total_eval 을 8,000,000 으로 오염시키는 글리치 방지. 대회 NAV 는 대개 1000 단위
-        (total_eval = NAV × 1e6)이라 NAV<100 이면 아직 미렌더로 보고 실제 값이 뜰 때까지 기다린다."""
+        """NAV와 보유표가 모두 렌더될 때까지 기다린다.
+
+        NAV가 보유표보다 먼저 뜨는 SPA라 NAV만 보고 곧바로 긁으면 실제 보유 11종목을 빈 목록으로
+        덮어쓴다. 정상적인 빈 보유도 구분할 수 있도록 보유표의 종목행 또는 Totals 행까지 확인한다.
+        """
         try:
             page.wait_for_function(
-                "() => { const m = (document.body.innerText || '').match(/NAV\\s*([0-9,]+(?:\\.[0-9]+)?)/);"
-                " return m && parseFloat(String(m[1]).replace(/,/g, '')) >= 100; }",
-                timeout=8000)
+                r"""() => {
+                    const body = document.body.innerText || '';
+                    const nav = body.match(/NAV\s*([0-9,]+(?:\.[0-9]+)?)/);
+                    if (!nav || parseFloat(String(nav[1]).replace(/,/g, '')) < 100) return false;
+                    const norm = s => String(s || '').replace(/\s+/g, ' ').trim();
+                    const table = [...document.querySelectorAll('table')]
+                        .find(t => /잔고\s*\/\s*비중\s*\/\s*평가액/.test(norm(t.innerText)));
+                    if (!table) return false;
+                    const rows = [...table.querySelectorAll('tr')].map(tr => norm(tr.innerText));
+                    return rows.some(text => /Totals\s*:/.test(text));
+                }""",
+                timeout=12000)
+            page.wait_for_timeout(400)
         except PlaywrightTimeoutError:
             pass
 
@@ -187,7 +206,7 @@ class TimefolioBrowser:
                 if (holdingsTable) {
                   for (const row of holdingsTable.rows) {
                     const code = String(row[0] || '').replace(/^A/, '');
-                    if (!/^\d{6}$/.test(code)) continue;
+                    if (!/^[0-9A-Z]{6}$/.test(code)) continue;
                     positions.push({
                       ticker: code,
                       name: row[1] || code,
@@ -221,7 +240,14 @@ class TimefolioBrowser:
     def detect_and_close_tms_error(self, page: Page | None = None) -> str | None:
         """[TMS] 오류 팝업을 감지해 메시지를 돌려주고 '확인'으로 닫는다. 없으면 None."""
         page = page or self._require_page()
-        m = TMS_ERROR_RE.search(self._body_text(page))
+        visible_text = ""
+        try:
+            dialogs = page.locator('[role="dialog"]:visible')
+            visible_text = "\n".join(dialogs.nth(i).inner_text(timeout=1000)
+                                     for i in range(min(dialogs.count(), 4)))
+        except Exception:
+            pass
+        m = TMS_ERROR_RE.search(visible_text) or TMS_ERROR_RE.search(self._body_text(page))
         if not m:
             return None
         msg = m.group(1).strip()
@@ -411,6 +437,15 @@ class TimefolioBrowser:
         if side == "buy":
             sector = (selected or {}).get("sector")
             room = sector_rooms.get(sector) if sector else None
+            if not sector or room is None:
+                self._close_ticket(page)
+                msg = "섹터 한도를 확인하지 못해 매수 제출을 중단했습니다"
+                return {
+                    "ticker": ticker, "side": side, "qty": qty, "weight_pct": weight_pct,
+                    "accepted": False, "filled": False, "pending": False,
+                    "rejected_reason": "sector_check_unavailable", "result": msg,
+                    "summary": before_summary,
+                }
             if room is not None and room <= MIN_SECTOR_ROOM_PCT:
                 self._close_ticket(page)
                 msg = (f"섹터 편입 여유 부족: {sector} 추가편입가능 {room:.1f}% ≤ {MIN_SECTOR_ROOM_PCT:.0f}% — 매수 스킵")
@@ -581,11 +616,14 @@ class TimefolioBrowser:
         page.wait_for_timeout(900)
         # 후보 li 텍스트(예: "[A007660] 이수페타시스IT")에서 섹터코드를 파싱해둔다 — 매수 섹터 게이트용.
         cand_text = ""
-        candidates = page.locator("li").filter(has_text=re.compile(ticker))
+        # React 포털의 자동완성 목록은 dialog 바깥에 붙지만, 이전 검색의 숨은 li도 DOM에 남는다.
+        # 보이는 후보만 대상으로 하고 정확한 종목코드를 확인해 엉뚱한 종목 선택을 막는다.
+        code_re = re.compile(rf"(?:^|\[)A?{re.escape(ticker)}(?:\]|\s|$)")
+        candidates = page.locator("li:visible").filter(has_text=code_re)
         try:
             for i in range(min(candidates.count(), 6)):
                 t = (candidates.nth(i).inner_text(timeout=800) or "").strip()
-                if ticker in t or f"A{ticker}" in t:
+                if code_re.search(t):
                     cand_text = t
                     break
         except Exception:
@@ -606,21 +644,22 @@ class TimefolioBrowser:
     def _choose_side(self, page: Page, side: str) -> None:
         dialog = page.locator('[role="dialog"]').last
         value = "true" if side == "buy" else "false"
-        label_for = "매수도_true" if side == "buy" else "매수도_false"
+        radio = dialog.locator(f'input[name="매수도"][value="{value}"]').first
         try:
-            dialog.locator(f'label[for="{label_for}"]').first.click(timeout=2500)
+            radio.check(force=True, timeout=2500)
             page.wait_for_timeout(300)
-        except Exception:
-            pass
-        checked = dialog.locator(f'input[name="매수도"][value="{value}"]').first.evaluate("el => !!el.checked")
-        if not checked:
-            dialog.locator(f'input[name="매수도"][value="{value}"]').first.evaluate(
-                "el => { el.checked = true; el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); }"
-            )
-            page.wait_for_timeout(300)
+        except Exception as exc:
+            raise RuntimeError(f"타임폴리오 {'매수' if side == 'buy' else '매도'} 선택 실패: {exc}") from exc
+        checked = radio.evaluate("el => !!el.checked")
+        opposite = dialog.locator(
+            f'input[name="매수도"][value="{"false" if side == "buy" else "true"}"]').first
+        opposite_checked = opposite.evaluate("el => !!el.checked") if opposite.count() else False
+        if not checked or opposite_checked:
+            raise RuntimeError(f"타임폴리오 {'매수' if side == 'buy' else '매도'} 상태 검증 실패 — 제출 중단")
         text = dialog.inner_text(timeout=3000)
-        if side == "sell" and "매도" not in text:
-            raise RuntimeError("타임폴리오 매도 버튼을 찾지 못했습니다.")
+        label = "매수" if side == "buy" else "매도"
+        if label not in text:
+            raise RuntimeError(f"타임폴리오 {label} 버튼을 찾지 못했습니다.")
 
     def _fill_weight(self, page: Page, weight_pct: float) -> None:
         dialog = page.locator('[role="dialog"]').last
@@ -683,7 +722,7 @@ class TimefolioBrowser:
             rows = page.evaluate(r"""() => {
                 const norm = s => String(s || '').replace(/\s+/g, ' ').trim();
                 for (const t of document.querySelectorAll('table')) {
-                    const head = norm((t.querySelector('tr') || {}).innerText || '');
+                    const head = norm([...t.querySelectorAll('tr')].slice(0, 3).map(r => r.innerText).join(' '));
                     if (/섹터코드/.test(head) && /추가\s*편입\s*가능/.test(head)) {
                         return [...t.querySelectorAll('tr')].map(tr =>
                             [...tr.children].map(td => norm(td.innerText || td.textContent)));

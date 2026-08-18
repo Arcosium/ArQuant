@@ -62,6 +62,7 @@ data/arquant_auth.db-shm
 data/.fernet.key
 # data/.active_account — 현재 활성(봇 구동) 계정 id (런타임 상태)
 data/.active_account
+/Auto_folio/data
 # data/.resume_on_boot — 코드 갱신 재시작 자동재개 마커
 data/.resume_on_boot
 # data/news_history.json — 뉴스 영속 캐시 (재시작 후 목록 유지)

@@ -44,7 +44,9 @@ def _key_file() -> Path:
     configured = os.environ.get("AUTOFOLIO_FERNET_KEY_FILE")
     if configured:
         return Path(configured).expanduser()
-    state_path = Path(os.environ.get("AUTOFOLIO_STATE_PATH") or Path(__file__).resolve().parents[1] / "data" / "contest_state.json")
+    private_root = Path(os.environ.get("AUTOFOLIO_PRIVATE_DATA_DIR") or
+                        (Path.home() / "vault" / "QuantInSight" / "Auto_folio"))
+    state_path = Path(os.environ.get("AUTOFOLIO_STATE_PATH") or private_root / "contest_state.json")
     return state_path.parent / ".autofolio_fernet.key"
 
 
