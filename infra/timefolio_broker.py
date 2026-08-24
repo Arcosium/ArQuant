@@ -28,6 +28,19 @@ from Auto_folio.autofolio.timefolio_exec import submit_order, sync_site_account
 _KST = timezone(timedelta(hours=9))
 
 
+async def playwright_thread(fn, *args, **kw):
+    """동기 Playwright 작업을 매번 새 전용 스레드에서 실행한다.
+
+    공용 executor(asyncio.to_thread)를 쓰면 launch 실패(브라우저 바이너리 누락 등)가
+    스레드에 잔재를 남겨, 이후 그 스레드에 배정된 모든 주문이 'Playwright Sync API
+    inside the asyncio loop' 2차 오류로 죽는다 — 2026-08-18~24 실사고: 타임폴리오
+    주문 42건이 조용히 전송 누락(ms-playwright 캐시 교체 공백기가 방아쇠).
+    스레드 생성 ~ms 는 주문 지연(브라우저 로그인 8~12s)에 비해 무시 가능하다."""
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return await asyncio.get_running_loop().run_in_executor(ex, lambda: fn(*args, **kw))
+
+
 def _kr_market_window_now() -> bool:
     """대회 사이트 스크레이프가 의미 있는 시간대(평일 08:30~15:45 KST)인가.
     밤(US 세션)엔 사이트 값이 변하지 않으므로 브라우저 로그인을 아낀다."""
@@ -50,7 +63,7 @@ class TimefolioBroker:
         return None
 
     async def _sync(self) -> dict[str, Any]:
-        return await asyncio.to_thread(sync_site_account, self.uid, headless=True)
+        return await playwright_thread(sync_site_account, self.uid, headless=True)
 
     def _account(self) -> dict[str, Any]:
         return contest_store.get_account(self.uid) or {}
@@ -256,7 +269,7 @@ class TimefolioBroker:
             "limit_price": price,
             "amount": float(qty) * price,
         }
-        res = await asyncio.to_thread(submit_order, self.uid, payload, headless=True)
+        res = await playwright_thread(submit_order, self.uid, payload, headless=True)
         self._last_site_order = res
         if res.get("accepted"):
             # 체결은 로컬 장부에도 즉시 반영한다(다음 사이트 동기화가 최종 정합을 맞춤).

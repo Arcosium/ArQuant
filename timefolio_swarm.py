@@ -819,6 +819,15 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
                                  "ts": ms._now_kst_iso(), "age": 0})
         exec_results.append(rec)
         orch.cycle_log.log("EXECUTION", "시스템", f"{code} {side} x{qty} → {rec['result']}")
+        if not rec["accepted"]:
+            # 실주문 전송 실패는 조용히 누락 금지(절대 규칙) — 8/18~24 Playwright 예외로
+            # 42건이 cycles.db 에만 남고 알림 0건이었던 사고의 방지선.
+            try:
+                from infra.notifier import alert
+                alert("WARN", "타임폴리오 주문 미접수",
+                      f"uid={uid} {code} {side} {qty}주 — {rec['result'][:200]}")
+            except Exception:  # noqa: BLE001
+                pass
         if rec["accepted"]:
             # 주문 접수·집행 알림은 main_swarm 관례와 동일하게 프롭트레이딩팀장 명의(집행 소관).
             await orch._emit({"type": "order_submitted", "agent": "프롭트레이딩팀장",

@@ -876,7 +876,8 @@ async def _timefolio_sync_throttled(uid: int, what: str) -> None:
     _timefolio_last_sync[uid] = _t.time()
     try:
         from Auto_folio.autofolio.timefolio_exec import sync_site_account
-        await asyncio.to_thread(sync_site_account, uid, headless=True)
+        from infra.timefolio_broker import playwright_thread as _pwt
+        await _pwt(sync_site_account, uid, headless=True)
     except Exception as e:  # noqa: BLE001
         logger.info("Timefolio site %s sync skipped uid=%s: %s", what, uid, e)
 
@@ -928,16 +929,20 @@ async def _timefolio_command(uid: int, message: str) -> dict[str, Any]:
     from Auto_folio.autofolio import contest_store
     from Auto_folio.autofolio.naver_cycle import run_cycle, refresh_holdings
     from Auto_folio.autofolio.timefolio_exec import sync_site_account
+    # 동기 Playwright(사이트 로그인)를 이벤트 루프에서 직접 부르면 'Sync API inside the
+    # asyncio loop'로 즉사한다 — 전용 새 스레드로 우회(2026-08-24, 스웜 주문 사고와 동일 계열).
+    from infra.timefolio_broker import playwright_thread as _pwt
     msg = (message or "").strip()
     code_match = re.search(r"(?<!\d)(\d{6})(?!\d)", msg)
     code = code_match.group(1) if code_match else None
     lowered = msg.lower()
     try:
         if any(x in msg for x in ("가격갱신", "갱신", "refresh")):
-            res = sync_site_account(uid, headless=True)
+            res = await _pwt(sync_site_account, uid, headless=True)
             text = "타임폴리오 사이트 보유/수익률 동기화 완료"
         elif any(x in msg for x in ("전량매도", "전체매도", "모두 매도", "청산")):
-            res = run_cycle(uid, force_sell=True, max_buys=0, executor=_timefolio_site_executor(uid))
+            res = await _pwt(run_cycle, uid, force_sell=True, max_buys=0,
+                             executor=_timefolio_site_executor(uid))
             text = f"타임폴리오 전량매도 사이클 완료: 매도 {res.get('sold', 0)}건"
         elif code and "매도" in msg:
             account = _timefolio_public_account(uid)
@@ -951,18 +956,19 @@ async def _timefolio_command(uid: int, message: str) -> dict[str, Any]:
                 if not check.get("ok"):
                     res = {"ok": False, "rule_check": check}
                 else:
-                    site = _timefolio_site_executor(uid)({"ticker": code, "side": "sell", "qty": int(pos.get("qty") or 0), "price": price, "limit_price": price, "meta": meta})
+                    site = await _pwt(_timefolio_site_executor(uid), {"ticker": code, "side": "sell", "qty": int(pos.get("qty") or 0), "price": price, "limit_price": price, "meta": meta})
                     if site.get("accepted") and site.get("filled"):
-                        res = sync_site_account(uid, headless=True)
+                        res = await _pwt(sync_site_account, uid, headless=True)
                         res["site_execution"] = site
                     else:
                         res = {"ok": False, "accepted": False, "filled": False, "site_execution": site}
                 text = f"타임폴리오 {code} 매도 {'완료' if res.get('ok') else '거부'}"
         elif code:
-            res = run_cycle(uid, targets=[code], max_buys=1, force_sell=False, executor=_timefolio_site_executor(uid))
+            res = await _pwt(run_cycle, uid, targets=[code], max_buys=1, force_sell=False,
+                             executor=_timefolio_site_executor(uid))
             text = f"타임폴리오 {code} 네이버 사이클 완료: 매수 {res.get('bought', 0)}건, 매도 {res.get('sold', 0)}건"
         else:
-            res = sync_site_account(uid, headless=True)
+            res = await _pwt(sync_site_account, uid, headless=True)
             text = "타임폴리오 명령을 접수했습니다. 종목코드 6자리, 매수/매도/전량매도/가격갱신 형태로 지시하면 주문 사이클에 반영됩니다."
         await ws_mgr.send_to_uid(uid, {"type": "status", "state": "TIMEFOLIO", "message": text})
         return {"ok": True, "response": text, "result": res}
@@ -1023,11 +1029,12 @@ async def autofolio_order(req: AutoFolioOrderReq, request: Request):
             check = contest_store.check_order(uid, side, req.ticker, req.qty, price, meta=meta)
             if not check.get("ok"):
                 return {"ok": False, "accepted": False, "filled": False, "rule_check": check}
-            site = _timefolio_site_executor(uid)({"ticker": str(req.ticker).zfill(6), "side": side, "qty": req.qty, "price": price, "limit_price": price, "meta": meta})
+            from infra.timefolio_broker import playwright_thread as _pwt
+            site = await _pwt(_timefolio_site_executor(uid), {"ticker": str(req.ticker).zfill(6), "side": side, "qty": req.qty, "price": price, "limit_price": price, "meta": meta})
             if not site.get("accepted"):
                 return {"ok": False, "accepted": False, "filled": False, "pending": False, "rule_check": check, "site_execution": site}
             from Auto_folio.autofolio.timefolio_exec import sync_site_account
-            synced = sync_site_account(uid, headless=True)
+            synced = await _pwt(sync_site_account, uid, headless=True)
             return {"ok": bool(site.get("filled")), "accepted": True, "filled": bool(site.get("filled")),
                     "pending": bool(site.get("pending") or not site.get("filled")), "rule_check": check,
                     "site_execution": site, "account": synced.get("account")}
@@ -1040,9 +1047,11 @@ async def autofolio_order(req: AutoFolioOrderReq, request: Request):
 async def autofolio_cycle(req: AutoFolioCycleReq, request: Request):
     uid = _autofolio_uid(request)
     from Auto_folio.autofolio.naver_cycle import run_cycle
+    from infra.timefolio_broker import playwright_thread as _pwt
     try:
         executor = _timefolio_site_executor(uid) if auth_store.is_timefolio(uid) else None
-        return run_cycle(uid, targets=req.targets, max_buys=req.max_buys, force_sell=req.force_sell, executor=executor)
+        return await _pwt(run_cycle, uid, targets=req.targets, max_buys=req.max_buys,
+                          force_sell=req.force_sell, executor=executor)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -1053,7 +1062,8 @@ async def autofolio_refresh(request: Request):
     try:
         if auth_store.is_timefolio(uid):
             from Auto_folio.autofolio.timefolio_exec import sync_site_account
-            return sync_site_account(uid, headless=True)
+            from infra.timefolio_broker import playwright_thread as _pwt
+            return await _pwt(sync_site_account, uid, headless=True)
         from Auto_folio.autofolio.naver_cycle import refresh_holdings
         return refresh_holdings(uid)
     except ValueError as e:

@@ -23,6 +23,37 @@ RESEARCH_FETCH_K = int(os.getenv("ARQUANT_RESEARCH_FETCH_K", "4"))
 _PER_SOURCE_CHARS = int(os.getenv("ARQUANT_RESEARCH_SRC_CHARS", "2500"))
 
 
+# 검색엔진에 넣을 수 있는 질의 길이 상한 — 이보다 길면 지시문으로 보고 증류한다.
+_QUERY_MAX = 60
+
+
+async def _distill_queries(query: str, model: str, timeout_sec: int) -> list[str]:
+    """지시문형 질의 → 짧은 검색어 2~3개.
+
+    호출부(main_swarm)가 2,600자짜리 분석 지시문을 그대로 넘기는데, 이것이 Bing 질의로
+    URL 인코딩돼 상시 0건이었다(2026-08-24 감사에서 확인 — '리서치 근거가 비었습니다'의
+    정체). 짧은 질의는 그대로 쓰고, 긴 지시문만 LLM 1콜(thinking OFF)로 줄인다."""
+    q = (query or "").strip()
+    if len(q) <= _QUERY_MAX and "\n" not in q:
+        return [q]
+    from infra.local_llm_client import chat_completion, response_text
+    try:
+        r = await chat_completion(
+            api_key="", model=model,
+            messages=[{"role": "system", "content": "너는 검색 질의 설계자다."},
+                      {"role": "user", "content":
+                       "아래 리서치 요청의 핵심을 검색엔진용 한국어 질의 3개로 줄여라. "
+                       "질의는 한 줄에 하나씩, 각 8단어 이내로만 출력하라. 설명 금지.\n\n" + q[:2000]}],
+            max_tokens=200, temperature=0.2, timeout_sec=min(timeout_sec, 60), thinking=False)
+        lines = [ln.strip(" -•*\"'") for ln in (response_text(r) or "").splitlines()]
+        out = [ln for ln in lines if ln and len(ln) <= 80][:3]
+        if out:
+            return out
+    except Exception as exc:
+        logger.warning("질의 증류 실패(첫 줄 폴백): %s", exc)
+    return [q.splitlines()[0][:_QUERY_MAX]]
+
+
 async def _gather(query: str, timeout_sec: int) -> Optional[dict]:
     """Arachne companion 에서 검색+본문추출 근거를 수집한다."""
     url = f"{RESEARCH_URL}/research/gather"
@@ -81,16 +112,25 @@ async def deep_research(
     from infra.admin_config import resolve_model
     from infra.local_llm_client import chat_completion, response_text, split_thinking
 
-    data = await _gather(query, timeout_sec)
-    if not data:
-        return ""  # fail-open(상위에서 빈값 처리)
-    evidence = _format_evidence(data)
+    selected_model = model or resolve_model("macro_researcher", LOCAL_LLM_MODEL)
+    real_model, _ = split_thinking(selected_model)  # 합성은 thinking OFF로 강제
+
+    # 지시문 → 검색어 증류 후 질의별 수집, url 기준 dedup 병합.
+    merged: dict = {"results": [], "extra": []}
+    seen: set[str] = set()
+    for q in await _distill_queries(query, real_model, timeout_sec):
+        data = await _gather(q, timeout_sec)
+        for key in ("results", "extra"):
+            for r in (data or {}).get(key) or []:
+                u = (r.get("url") or "").split("#")[0]
+                if u and u in seen:
+                    continue
+                seen.add(u)
+                merged[key].append(r)
+    evidence = _format_evidence(merged)
     if not evidence.strip():
         logger.warning("리서치 근거가 비었습니다(검색/추출 0건).")
         return ""
-
-    selected_model = model or resolve_model("macro_researcher", LOCAL_LLM_MODEL)
-    real_model, _ = split_thinking(selected_model)  # 합성은 thinking OFF로 강제
 
     system = (
         "당신은 금융시장 리서치 전문가입니다. 아래 [수집 근거]는 방금 웹에서 수집한 "
