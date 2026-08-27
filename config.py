@@ -130,25 +130,13 @@ AGENT_HISTORY_TURNS = 3               # trailing history messages to resend (was
 MACRO_CACHE_TTL_SEC = 30 * 60         # 30 min
 DART_CACHE_TTL_SEC  = 24 * 60 * 60    # 1 day
 # 뉴스 감성 리포트도 매크로와 같은 30분 공유 캐시(사장 지시 2026-07-21). 종전엔 캐시가 없어
-# 연속 사이클마다 마켓센티먼트팀장 LLM 을 새로 호출했다(모의 프로필 하룻밤 575회). 매크로와
+# 과거 연속 사이클에서 마켓센티먼트팀장 LLM 을 새로 호출했다(모의 프로필 하룻밤 575회). 매크로와
 # 동일 정책 — 개장 사이클(market_open)에선 캐시를 무시하고 반드시 새로 분석한다.
 NEWS_CACHE_TTL_SEC  = 30 * 60         # 30 min
 
-# Analysis-cycle trigger tuning.
-# 감시/재료성 뉴스 트리거는 폐지 — 단순히 1시간마다 사이클 1회 + 한국/미국 장 개장 시 누적 뉴스로 1회.
-# (구버전 ANALYSIS_NEWS_THRESHOLD / ANALYSIS_RAW_FALLBACK 트리거 파라미터는 사장 지시 2026-05-21로 완전 제거)
-PERIODIC_CYCLE_SEC      = 1 * 60 * 60 # run a cycle this often while a market is open (1시간마다 1회)
-# 연속 사이클(단타) — 사장 지시 2026-07-20: True 면 장중 사이클이 끝나자마자 다음 사이클을
-# 곧바로 재발화한다(정시 :00 대기 없음). CONTINUOUS_MIN_GAP_SEC 는 사이클 사이 최소 간격(초)
-# — KIS TPS·뉴스 크롤 여유용 하한. 런타임/대시보드 '전략' 탭에서 프로필별 on/off·조정 가능.
-CONTINUOUS_CYCLES       = False
-CONTINUOUS_MIN_GAP_SEC  = 20
-# 연속 사이클 최소 '주기'(사장 지시 2026-07-21) — 시작~시작 간격의 하한. GAP 은 '끝난 뒤 대기'라
-# 사이클 자체가 짧으면 주기를 못 지킨다: US 정규장엔 KR 보유만 있는 프로필의 퀀트 대상이 0개라
-# (main_swarm 의 세션별 시장 필터) 사이클이 20초에 끝나 밤새 575회 공회전했다 — LLM 슬롯과 KIS
-# TPS 를 태우고 정작 US 시세는 rate-limit 으로 빈 응답이 됐다(2026-07-21 라이브). 짧게 끝난
-# 사이클은 이 주기 경계까지 기다렸다 재발화한다(긴 사이클은 종전대로 GAP 만 지키면 즉시).
-CONTINUOUS_MIN_CYCLE_SEC = 3 * 60     # 3 min
+# 전체 리서치·선정·재량 매매 판단은 모든 프로필이 벽시계 정각에 시간당 1회만 수행한다.
+# 그 사이에는 main_swarm 의 고정 60초 안전감시가 손절가·하드 손절만 확인한다.
+PERIODIC_CYCLE_SEC      = 1 * 60 * 60
 HEADLINE_DEDUP_RATIO    = 0.85        # difflib ratio above which two headlines are "the same"
 NEWS_PREFILTER_TRIGGER  = 40          # 누적 헤드라인이 이 수를 넘으면 큐레이터로 사전 선별
 NEWS_PREFILTER_LIMIT    = 40          # 사전 선별 후 마켓센티먼트팀장에게 넘길 최대 헤드라인 수
@@ -199,10 +187,9 @@ TRIM_OVER_RATIO       = True          # if a holding's notional exceeds CONSERVA
 ALLOW_DAY_TRADING     = True
 # 0.5일 미만 회피가 켜졌을 때(ALLOW_DAY_TRADING=False) 적용되는 최소 보유일.
 MIN_HOLDING_DAYS_FOR_SELL = 0.5
-# 사장 지시 2026-06-08: 포트폴리오기획팀장 '거부권'(사후관리실장 매도결정을 '보유'로 강제 오버라이드)은
-# 권한이 과도하여 폐지했다. 이제 thesis 는 사후관리실장 프롬프트에 '강력 권고'로 주입만 하며
-# (agents.specialists.format_thesis_reminder), 최종 매도 권한은 사후관리실장에게 있다.
-# 이에 따라 THESIS_VETO_ENABLED / THESIS_NOISE_BAND_PCT 설정은 제거되었다.
+# 포트폴리오기획팀장은 계획기간 안의 첫 재량 매도에 1회 보류권을 행사한다.
+# 손절·목표 도달·thesis invalidator는 즉시 통과하고, 다음 시간 정기 사이클에서도 매도 판단이
+# 반복되면 보류를 해제한다. 설정 토글 없이 전 프로필 공통 정책으로 적용한다.
 
 # ─── 넥스트레이드(NXT) 시간외 매매 (사장 지시 2026-06-08) ─────────────────────
 # 프리마켓(08:00–08:50)·애프터마켓(15:50–20:00)을 NXT 거래소 경유로 매매. 정규장은 KRX 유지.
@@ -455,8 +442,6 @@ def strategy_param_catalog_text():
 # '전략' 탭에서 값을 직접 편집하면 runtime.py 가 프로필별로 영속·라이브 반영한다.
 # Keys here MUST match module-level constant names above (runtime.get() falls back to those).
 STRATEGY_TUNABLE_KEYS = [
-    # 연속 사이클(단타) — 사장 지시 2026-07-20
-    "CONTINUOUS_CYCLES", "CONTINUOUS_MIN_GAP_SEC", "CONTINUOUS_MIN_CYCLE_SEC",
     "PER_ORDER_BUDGET_RATIO", "PER_ORDER_BUDGET_OVERSHOOT", "MAX_CYCLE_BUDGET_RATIO", "MIN_CASH_BUFFER",
     "MACRO_DEPLOY_FLOOR_ENABLED", "PER_ORDER_BUDGET_FLOOR_RATIO", "MAX_CYCLE_BUDGET_FLOOR_RATIO",
     "ENABLE_DILUTION_GATE", "ENABLE_IC_SIZING",
@@ -526,16 +511,6 @@ OPS_PROTECTED_KEYS = {
 #   int        → 정수 그대로
 #   bool       → true/false 토글
 STRATEGY_KEY_META = {
-    "CONTINUOUS_CYCLES":          {"label": "연속 사이클(단타)", "type": "bool",
-                                   "help": "켜면 장중 사이클이 끝나자마자 다음 사이클을 곧바로 재발화(정시 대기 없음). 단타 운용용.",
-                                   "group": "사이클"},
-    "CONTINUOUS_MIN_GAP_SEC":     {"label": "연속 사이클 최소 간격", "type": "int", "unit": "초",
-                                   "help": "연속 사이클 사이 최소 대기(초). KIS 초당 거래건수·뉴스 크롤 여유용 하한.",
-                                   "min": 5, "max": 600, "step": 5, "group": "사이클"},
-    "CONTINUOUS_MIN_CYCLE_SEC":   {"label": "연속 사이클 최소 주기", "type": "int", "unit": "초",
-                                   "help": "연속 사이클의 시작~시작 최소 주기. 사이클이 이보다 빨리 끝나면 "
-                                           "이 경계까지 기다렸다 재발화(빈 사이클 공회전 방지). 0=제한없음",
-                                   "min": 0, "max": 3600, "step": 30, "group": "사이클"},
     "PER_ORDER_BUDGET_RATIO":     {"label": "1주문 예수금 사용 비율", "type": "pct_ratio", "unit": "%",
                                    "help": "한 번 매수 시 예수금의 최대 X%까지 사용 (예: 10 = 예수금의 10%)",
                                    "min": 1, "max": 100, "step": 1, "group": "사이징"},

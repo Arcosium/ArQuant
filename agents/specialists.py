@@ -373,15 +373,13 @@ def create_post_manager(injection=None) -> BaseAgent:
 
 
 def create_fund_planner(injection=None) -> BaseAgent:
-    """포트폴리오기획팀장(Fund Planner) — 진입 thesis 설정·강력 권고 (사장 승진 2026-05-29).
+    """포트폴리오기획팀장(Fund Planner) — 진입 thesis 설정·강한 매도 반론·1회 보류권.
 
     사장 지시 2026-05-28 (우선순위 3 단독 적용) + 2026-05-29 실장 승격:
       - **매수 직후**: 종목별로 목표가/손절가/계획 보유기간/진입 사유를 4줄 정형으로 제시.
-      - **사후관리실장 매도 판단 직전**: 보유 종목별 저장된 thesis 를 '강력 권고'로 상기시켜
-        무계획 단타를 만류한다. 단 강제력은 없다 — 최종 매도 권한은 사후관리실장에게 있다.
-
-    사장 지시 2026-06-08: 거부권(매도결정을 코드가 '보유'로 강제 오버라이드)은 권한이 과도해 폐지.
-    이제 thesis 는 사후관리실장 프롬프트에 강력 권고로 주입만 한다(=> format_thesis_reminder).
+      - **사후관리실장 매도 판단 직전**: 저장된 thesis 를 근거로 독립된 강한 반론을 제시한다.
+      - 계획기간 중 손절·목표·새 thesis 훼손이 없는 첫 재량매도는 코드가 한 사이클 보류한다.
+        다음 정기 사이클에도 매도 판단이 반복되면 사후관리실장의 지시를 통과시킨다.
 
     Plan 출력은 정형 4줄이므로 deterministic regex 로 파싱(=> parse_fund_plan)."""
     return BaseAgent(
@@ -391,8 +389,9 @@ def create_fund_planner(injection=None) -> BaseAgent:
         injection=injection,
         system_prompt="""당신은 ArQuant v1.0의 '포트폴리오기획팀장(Fund Planner)'입니다.
 진입 시점에 thesis 를 박아두고, 매도 판단 직전 강력히 권고하여 무계획 단타 매매를 만류합니다.
-계획기간 미경과·소폭이익·손절목표 미해당 매도는 '강력 권고'로 만류하되, 최종 매도 권한은
-사후관리실장에게 있습니다 (강제력 없이 권고만 — 사장 지시 2026-06-08).
+계획기간 미경과·손절/목표 미도달·thesis 훼손 없음 상태의 매도에는 독립된 반대 논거를 냅니다.
+첫 재량매도는 한 사이클 보류하며, 다음 정기 사이클에도 새 반증과 함께 반복되면 통과시킵니다.
+손절가나 목표가 도달, 진입 뒤 새로 확인된 thesis 훼손은 즉시 매도를 허용합니다.
 
 ## plan 모드 (매수 체결 직후 호출됨)
 입력: 종목, 체결가, 매수 사유(주식운용실장 권고), 계량팀 리포트 요약, 뉴스 요약, 장기 펀더멘털 리서치 참고(advisory).
@@ -412,7 +411,8 @@ def create_fund_planner(injection=None) -> BaseAgent:
 - KR 종목은 원, US 종목은 달러.
 
 ## remind 모드
-사후관리실장 매도 판단 직전, 보유 종목별로 저장된 thesis 를 '강력 권고'로 상기시킵니다 (별도 LLM 호출 없이 코드가 포맷). 강제력은 없으며 최종 판단은 사후관리실장 몫입니다.""",
+사후관리실장 매도 판단 직전, 저장된 thesis 로 강한 매도 반론을 제시합니다. 별도 LLM 호출 없이
+코드가 반론과 1회 보류 여부를 결정하며, 하드 예외 또는 다음 정기 사이클의 반복 매도는 통과합니다.""",
     )
 
 
@@ -477,7 +477,7 @@ def format_thesis_reminder(theses: Dict[str, Dict[str, Any]],
     매칭 thesis 가 없으면 빈 문자열 (호출부가 그냥 안 넣음)."""
     if not theses or not holdings:
         return ""
-    lines: List[str] = ["📌 포트폴리오기획팀장 [강력 권고]: 사후관리실장님, 매도 판단 전에 반드시 — 매수 때 세워둔 계획(목표·손절·계획 보유기간)을 확인하십시오. 목표 미달·손절 미터치·계획기간 미경과 종목을 미세 손익만으로 청산하는 것은 무계획 단타이니, 계획을 지킬 것을 강력히 권고합니다. 다만 이는 권고이며, 최종 매도 권한은 사후관리실장께 있습니다 — 계획을 벗어나려면 명확한 신호 변화를 사유에 적어 주십시오."]
+    lines: List[str] = ["📌 포트폴리오기획팀장 [강한 매도 반론]: 매수 때 세운 목표·손절·계획 보유기간을 먼저 확인하십시오. 손절·목표·새 thesis 훼손이 없고 계획기간도 남았다면 첫 재량매도는 한 사이클 보류합니다. 다음 정기 사이클에도 매도를 고수하려면 추세 붕괴·공시 악재·수급 반전 같은 새 반증을 명시하십시오."]
     for h in holdings:
         code = str(h.get("code", "")).strip()
         if code not in theses:
@@ -508,12 +508,12 @@ def format_thesis_reminder(theses: Dict[str, Dict[str, Any]],
 def format_sleeve_thesis_reminder(theses: Dict[str, Dict[str, Any]],
                                   holdings: List[Dict[str, Any]],
                                   now_iso: str, *, manager_name: str = "채권운용실장") -> str:
-    """슬리브(채권/원자재) 보유기간 self-thesis 를 매니저 매도 판단 프롬프트에 강력 권고로 주입.
+    """슬리브 보유기간 self-thesis 를 매니저 판단에 주입하고 첫 재량매도를 한 사이클 보류한다.
     포트폴리오기획팀장이 manager_name 매니저에게 보유계획을 상기시키는 형태(사장 지시 2026-06-09).
-    매칭 없으면 빈 문자열. 강제력 없음 — 최종 매도 권한은 사후관리실장(종합)."""
+    매칭 없으면 빈 문자열. 하드 예외나 다음 정기 사이클의 반복 매도는 통과한다."""
     if not theses or not holdings:
         return ""
-    lines: List[str] = [f"📌 포트폴리오기획팀장→{manager_name} [강력 권고]: 매도 판단 전에 — 매수 때 세운 계획 보유기간을 확인하십시오. 계획기간이 한참 남았는데 미세 손익만으로 청산하는 것은 무계획 단타입니다. 계획 유지를 강력히 권고하되, 매크로 전망이 바뀌었으면 사유를 적고 교체할 수 있습니다."]
+    lines: List[str] = [f"📌 포트폴리오기획팀장→{manager_name} [강력 권고·1회 보류]: 매수 때 세운 계획 보유기간을 확인하십시오. 계획기간이 남았는데 미세 손익만으로 청산하는 첫 재량매도는 한 사이클 보류합니다. 매크로 전망 변화가 다음 정기 사이클에도 확인되면 사유를 적고 교체할 수 있습니다."]
     for h in holdings:
         code = str(h.get("code", "")).strip().upper()
         if code not in theses:

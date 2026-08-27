@@ -10,8 +10,8 @@ QuantInSight(:8777)의 세 모듈을 ArQuant 사이클에 이식했다:
                    남긴다(감사 가능성). LLM이 만장일치 '매수'여도 코드가 차단할 수 있다.
 
 원칙:
-  · 심의는 PASS 2(주식운용실장 최종 선정) '이후' 매수 대상에만 열린다 — 매도 트랙은
-    심의로 차단하지 않는다(실주문 누락 금지 원칙).
+  · 매수 심의는 PASS 2 이후 열린다. 매도 심의 뒤에는 포트폴리오기획팀장의 계획 기반
+    1회 보류 정책이 적용되며, 손절·목표·thesis 훼손이나 다음 사이클 반복 매도는 통과한다.
   · 심의/LLM 실패는 사이클을 절대 막지 않는다 — 그 발언만 결정론 폴백, 스테이지 전체는
     fail-open(기록만 생략, 매매 파이프라인 불변).
   · **QuantInSight 파라미터는 고정 상수다** (사장 지시 2026-07-18: QIS 쪽 파라미터는
@@ -484,6 +484,7 @@ async def deliberate_sleeve_buy(code: str, name: str, *, sleeve_label: str,
 def _fmt_sell_brief(code: str, name: str, *, qty: int, pnl_pct: float, hold_days,
                     manager_view: str, thesis: str, quant_excerpt: str,
                     news_excerpt: str, macro_view: str, chief_label: str,
+                    planner_objection: str = "",
                     past_context: str = "") -> str:
     _hd = f"{float(hold_days):.1f}일" if hold_days is not None else "미상"
     past = f"\n[과거 매매 복기 — 같은 실수 반복 금지]\n{past_context}" if past_context else ""
@@ -492,6 +493,8 @@ def _fmt_sell_brief(code: str, name: str, *, qty: int, pnl_pct: float, hold_days
 [{chief_label} 1차 판단·근거]
 {(manager_view or '(없음)')[:1200]}
 [매수 당시 계획(thesis)] {(thesis or '(없음)')[:400]}
+[포트폴리오기획팀장 강한 매도 반론]
+{(planner_objection or '(보류권 적용 요건 없음)')[:1200]}
 [계량분석 발췌] {quant_excerpt or '(없음)'}
 [뉴스 발췌] {news_excerpt or '(없음)'}
 [매크로] {macro_view or '(없음)'}{past}
@@ -504,6 +507,7 @@ async def deliberate_position_sell(code: str, name: str, *, qty: int, pnl_pct: f
                                    news_excerpt: str = "", macro_view: str = "",
                                    chief_label: str = "사후관리실장",
                                    fallback_directive: str = KEEP,
+                                   planner_objection: str = "",
                                    past_context: str = "",
                                    progress: Optional[Callable[[str, str], Awaitable[None]]] = None,
                                    ) -> Tuple[List[dict], dict, bool]:
@@ -518,10 +522,12 @@ async def deliberate_position_sell(code: str, name: str, *, qty: int, pnl_pct: f
                             manager_view=manager_view, thesis=thesis,
                             quant_excerpt=quant_excerpt, news_excerpt=news_excerpt,
                             macro_view=macro_view, chief_label=chief_label,
+                            planner_objection=planner_objection,
                             past_context=past_context)
     _chief_persona = (f"보유 포지션 사후관리를 총괄하는 {chief_label}이다. 유지/매도 찬반토론을 종합해 "
                       "이 포지션을 '유지·절반·전량' 중 어떻게 할지 최종 결정한다 — "
-                      "손절·익절 규율과 투자논거 훼손 여부를 함께 본다.")
+                      "손절·익절 규율과 투자논거 훼손 여부를 함께 본다. 포트폴리오기획팀장의 강한 "
+                      "매도 반론을 독립 근거로 다루고, 계획기간 중 매도를 택하면 새 반증을 명시한다.")
     dialogue: List[dict] = []
     llm_used = False
 
@@ -533,7 +539,7 @@ async def deliberate_position_sell(code: str, name: str, *, qty: int, pnl_pct: f
                 pass
 
     for rnd in range(1, DEBATE_ROUNDS + 1):
-        ask_keep = ("이 포지션을 계속 보유해야 하는 논거를 제시하라."
+        ask_keep = ("포트폴리오기획팀장의 반론을 중심으로 이 포지션을 계속 보유해야 하는 논거를 제시하라."
                     if rnd == 1 else f"매도 심사역의 직전 논거를 반박하라. (라운드 {rnd})")
         ask_sell = ("이 포지션을 지금 매도해야 하는 논거를 제시하라."
                     if rnd == 1 else f"유지 심사역의 직전 논거를 반박하라. (라운드 {rnd})")

@@ -67,6 +67,10 @@ NEWS_CHECK_INTERVAL = 900     # 뉴스 크롤링 주기 15분 (사장 피드백 
 USDKRW_FALLBACK = 1510.0
 # 최저가 KR 종목 1주(현실적 최저가 ~5,000원)도 못 살 예수금이면 분석 비용만 들므로 사이클 스킵.
 MIN_TRADABLE_CASH_KRW = 5000
+# 전체 두뇌 사이클은 정시 1회만 돈다. 아래 안전감시는 LLM·종목선정·재량매매를
+# 호출하지 않고 보유 포지션의 확정 손절 조건만 60초마다 확인한다.
+SAFETY_WATCH_INTERVAL_SEC = 60
+SAFETY_ORDER_COOLDOWN_SEC = 15 * 60
 
 
 def _low_cash_skip_reason(snap) -> Optional[str]:
@@ -87,6 +91,23 @@ def _is_kr_code(code: Any) -> bool:
     통일해 'kr_* 만 부르고 us_* 빠뜨리는' 비대칭 버그의 표면을 좁힌다."""
     s = str(code or "").strip()
     return s.isdigit() and len(s) == 6
+
+
+def _safety_sell_reason(holding: Dict[str, Any], thesis: Optional[Dict[str, Any]],
+                        stop_loss_pct: float) -> Optional[str]:
+    """연속 안전감시가 허용하는 결정론적 전량매도 조건. 재량 신호·익절은 여기서 다루지 않는다."""
+    try:
+        cur = float(holding.get("cur_price") or 0.0)
+        pnl = float(holding.get("pnl_pct") or 0.0)
+        thesis_stop = float((thesis or {}).get("stop_price") or 0.0)
+        strategy_stop = abs(float(stop_loss_pct or 0.0))
+    except (TypeError, ValueError):
+        return None
+    if cur > 0 and thesis_stop > 0 and cur <= thesis_stop:
+        return f"포트폴리오 계획 손절가 도달 ({cur:,.2f} ≤ {thesis_stop:,.2f})"
+    if strategy_stop > 0 and pnl <= -strategy_stop:
+        return f"전략 하드 손절 도달 ({pnl:+.2f}% ≤ -{strategy_stop:.2f}%)"
+    return None
 
 
 # 기업리서치팀장은 '개별 기업'에만 붙는다(사장 지시 2026-07-21) — ETF/ETN/레버리지·인버스·
@@ -3852,10 +3873,8 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
         # 사전 게이트로 스킵한 직전 사유 — 같은 사유 반복 알림을 억제한다(사유가 바뀌거나
         # 사이클이 실제로 돌면 리셋되어, 상태 변화는 놓치지 않는다).
         self._last_gate_reason: Optional[str] = None
-        # 사이클이 '시작(트리거)'된 시각 — 연속 사이클 최소 주기(CONTINUOUS_MIN_CYCLE_SEC) 판정용.
-        # _last_cycle_at 은 **종료** 시각이라 짧은 사이클의 주기를 잴 수 없다. 사전 게이트로 스킵된
-        # 경우도 트리거는 걸린 것이므로 함께 갱신한다(스킵 경로의 KIS 잔고조회도 주기를 지키게).
-        self._last_cycle_started_at: float = 0.0
+        # 안전감시 주문 접수 시각. 정시 사이클과 안전감시가 같은 종목을 중복 매도하지 않게 한다.
+        self._safety_last_order_at: Dict[str, float] = {}
         self._last_session: Optional[str] = None   # previous loop iteration's session (for market-open detection)
         self._last_cycle_hour_key = None   # 사장 지시 2026-06-08: 벽시계 시(hour) 앵커 (정시 정렬)
         self._last_status_state: Optional[str] = None  # last broadcast status state (suppress 1-min OFF_HOURS spam)
@@ -3909,7 +3928,6 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
         • force(=.force_first_cycle 마커) 면 hour 앵커를 None 으로 비워 시작 즉시 1사이클(periodic_due=True)."""
         self._last_cycle_hour_key = None if force else _current_hour_key()
         self._last_cycle_at = 0.0
-        self._last_cycle_started_at = 0.0   # 최소 주기 가드도 부팅 직후엔 비활성(첫 사이클 즉시 발화)
 
     async def _shared_or_compute(self, kind, fingerprint, compute):
         """ADMIN=계산 후 게시 / 비관리자=같은 시각(hour) 게시를 대기-수신, 미게시 시 자체계산 폴백.
@@ -4299,6 +4317,110 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 if self._stop_event.is_set(): break
                 await asyncio.sleep(1)
 
+    async def _submit_safety_sell(self, holding: Dict[str, Any], reason: str,
+                                  baseline_holdings: List[Dict]) -> bool:
+        """안전감시 전용 전량매도. 전체 분석·위원회·신규매수 경로와 분리된 좁은 주문 경로다."""
+        code = str(holding.get("code") or "").strip()
+        try:
+            qty = int(float(holding.get("qty") or 0))
+        except (TypeError, ValueError):
+            qty = 0
+        if not code or qty <= 0:
+            return False
+        is_kr = _is_kr_code(code)
+        if not LIVE_TRADING:
+            self._safety_last_order_at[code] = time.time()
+            await self._emit({"type": "agent_msg", "agent": "리스크관리실장",
+                              "message": f"🛡️ 안전감시 감지(모의 실행) — {code} {reason}"})
+            return True
+        if is_kr:
+            try:
+                sellable = await self.broker.kr_psbl_sell_qty(code)
+                if sellable is not None:
+                    sellable = int(float(sellable or 0))
+                    if sellable <= 0:
+                        self._safety_last_order_at[code] = time.time()
+                        await self._emit({"type": "agent_msg", "agent": "리스크관리실장",
+                                          "message": f"🛡️ {code} 손절 감지, 매도가능수량 0주 — 기존 주문 여부 확인 중"})
+                        return False
+                    qty = min(qty, sellable)
+            except Exception as exc:
+                logger.warning(f"[safety-watch] {code} 매도가능수량 조회 실패, 보유수량으로 진행: {exc}")
+        order = OrderDraft(ticker=code, side="sell", qty=qty, price_type="market",
+                           market=("KR" if is_kr else "US"),
+                           reason=f"연속 안전감시 — {reason}", approved=True)
+        order, nxt_skip = await self._finalize_kr_order_for_session(order, get_current_session())
+        if nxt_skip:
+            await self._emit({"type": "trade_failed", "ticker": code, "side": "sell", "qty": qty,
+                              "filled": False, "message": f"🛡️ 안전매도 보류 — {nxt_skip}"})
+            return False
+        result = ""
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(2.5)
+            try:
+                result = await self.broker.place_order(order)
+            except Exception as exc:
+                result = f"[주문 예외] {exc}"
+            if not any(x in result for x in ("초당", "거래건수", "EGW", "유량", "TPS")):
+                break
+        accepted = all(x not in result for x in
+                       ("실패", "에러", "거부", "예외", "REJECT", "초당", "거래건수"))
+        if accepted:
+            self._safety_last_order_at[code] = time.time()
+            await self._emit({"type": "order_submitted", "ticker": code, "side": "sell", "qty": qty,
+                              "filled": False,
+                              "message": f"🛡️ 안전매도 접수 — {code} {qty}주 | {reason} | {result}"})
+            asyncio.create_task(self._poll_fills_until_confirmed(
+                [{"ticker": code, "side": "sell", "qty": qty}], list(baseline_holdings or [])))
+            metrics.incr("safety_orders_submitted", market=("KR" if is_kr else "US"))
+            return True
+        await self._emit({"type": "trade_failed", "ticker": code, "side": "sell", "qty": qty,
+                          "filled": False, "message": f"⚠️ 안전매도 실패 — {code}: {result}"})
+        metrics.incr("safety_order_failed", market=("KR" if is_kr else "US"))
+        return False
+
+    async def _safety_watchdog(self):
+        """60초마다 확정 손절만 감시한다. 종목선정·LLM·익절·비중조절은 정시 사이클에 남긴다."""
+        while not self._stop_event.is_set():
+            try:
+                session = get_current_session()
+                active = session == "US_TRADING" or is_kr_tradable(session)
+                if active and self.current_state != SwarmState.EXECUTION:
+                    holdings = await self._session_holdings(session)
+                    active_holdings = [h for h in holdings if
+                                       (_is_kr_code(h.get("code")) if session != "US_TRADING"
+                                        else not _is_kr_code(h.get("code")))]
+                    from infra import position_thesis
+                    stop_pct = float(runtime.get("STOP_LOSS_PCT", uid=self.uid) or 0.0)
+                    now = time.time()
+                    self._safety_last_order_at = {
+                        c: ts for c, ts in self._safety_last_order_at.items()
+                        if now - ts < SAFETY_ORDER_COOLDOWN_SEC
+                    }
+                    for holding in active_holdings:
+                        code = str(holding.get("code") or "").strip()
+                        if not code or code in self._safety_last_order_at:
+                            continue
+                        reason = _safety_sell_reason(holding, position_thesis.get(self.uid, code), stop_pct)
+                        if reason:
+                            # await 없는 예약을 먼저 남겨, 정시 실행부가 동시에 같은 매도를 조립해도
+                            # 중복 주문을 걸러낸다. 실행부가 먼저 시작했다면 아래 재검사에서 멈춘다.
+                            if self.current_state == SwarmState.EXECUTION:
+                                break
+                            reserved_at = time.time()
+                            self._safety_last_order_at[code] = reserved_at
+                            accepted = await self._submit_safety_sell(holding, reason, holdings)
+                            if not accepted and self._safety_last_order_at.get(code) == reserved_at:
+                                self._safety_last_order_at.pop(code, None)
+            except Exception as exc:
+                logger.warning(f"[safety-watch] 감시 실패(다음 주기 재시도): {exc}")
+                metrics.incr("safety_watch_error")
+            for _ in range(SAFETY_WATCH_INTERVAL_SEC):
+                if self._stop_event.is_set():
+                    break
+                await asyncio.sleep(1)
+
     async def start_continuous(self, user_directive: Optional[str] = None):
         self._stop_event.clear(); self.news_monitor.is_running = True
         self._last_session = get_current_session()
@@ -4334,6 +4456,9 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
         # Equity poller — keeps the dashboard 수익률 chart populated even outside cycles
         try: asyncio.create_task(self._equity_poller())
         except Exception: pass
+        # 두뇌는 정시 1회만, 확정 손절 안전장치는 60초마다 독립 감시한다.
+        try: asyncio.create_task(self._safety_watchdog())
+        except Exception: pass
         # 사장 지시 2026-05-14: 주간 피드백 스케줄러 — 토요일 KST에 운용지원실장 자동 호출
         try: asyncio.create_task(self._weekly_review_scheduler())
         except Exception: pass
@@ -4341,7 +4466,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             await self._set_status("OFF_HOURS", f"장외 ({_now_kst().strftime('%H:%M')} KST) — 뉴스 수집만, 다음 개장 시 사이클", force=True)
         else:
             await self._set_status("MONITORING",
-                f"연속 감시 시작 — 다음 정시({_current_hour_key_str()[-2:]}:00 다음)부터 사이클, 장 개장 시에도 1회", force=True)
+                "1시간 두뇌 사이클 + 60초 안전감시 시작", force=True)
         while not self._stop_event.is_set():
             try:
                 session = get_current_session()
@@ -4373,22 +4498,10 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                                         f"크롤 {self.news_monitor.last_crawl_time or ''}"),
                             "articles": [{"title": a.get("title", ""), "link": a.get("link", "")} for a in added[:5]]})
 
-                # ── cycle trigger: (a) ▶ 실행 직후 첫 회, (b) a market just opened, or
-                #                  (c) ≥ PERIODIC_CYCLE_SEC since last cycle — 모두 '장중일 때'만 ──
+                # ── 전체 두뇌 사이클: 모든 프로필 공통으로 벽시계 정시에만 1회. ──
+                # market_open 은 정시가 개장과 겹쳤을 때 분석/사이징 문맥에만 쓰며 별도 트리거가 아니다.
                 market_open = (session in self._MARKET_OPEN_SESSIONS) and (self._last_session not in self._LIVE_SESSIONS)
                 periodic_due = self._should_run_periodic()    # 사장 지시 2026-06-08: 벽시계 :00 앵커
-                # 연속 사이클(단타) — 사장 지시 2026-07-20: 장중이면 정시 대기 없이 직전 사이클 종료
-                # 후 CONTINUOUS_MIN_GAP_SEC 만 지나면 곧바로 재발화(끝나자마자 다음 사이클).
-                _continuous = bool(runtime.get("CONTINUOUS_CYCLES", uid=self.uid)) and is_trading_hours()
-                _cont_gap = float(runtime.get("CONTINUOUS_MIN_GAP_SEC", uid=self.uid) or 20)
-                # 최소 '주기'(사장 지시 2026-07-21): GAP 은 사이클이 **끝난 뒤** 대기라, 사이클 자체가
-                # 짧으면(US 세션 + KR 보유만 = 퀀트 대상 0 → 20초 종료) 주기를 못 지키고 공회전한다.
-                # 시작~시작 간격이 이 값을 넘어야 재발화 — 긴 사이클은 이미 넘으므로 종전대로 GAP 만 본다.
-                _cont_period = float(runtime.get("CONTINUOUS_MIN_CYCLE_SEC", uid=self.uid) or 0)
-                _continuous_due = _continuous and (
-                    self._last_cycle_at <= 0 or (time.time() - self._last_cycle_at) >= _cont_gap) and (
-                    self._last_cycle_started_at <= 0
-                    or (time.time() - self._last_cycle_started_at) >= _cont_period)
 
                 # ── 사장 지시 2026-05-14/2026-05-24: 사이클 사전 게이트 ──
                 # (1) 휴장 — 주말은 자명 스킵, 그 외엔 개장 5분 후 KIS 실시세로 '오늘 개장'을 1회 확인
@@ -4396,12 +4509,11 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                 # (2) cash 부족 — 가용 예수금이 최소 매매 단위(현실적 최저가 1주 ~5000원)도 안 되면 스킵
                 # (3) 너무 잦은 사이클 방지 — 직전 사이클이 5분 이내라면 스킵 (트리거 중복 가드)
                 skip_reason = None
-                if market_open or periodic_due or _continuous_due:
+                if periodic_due:
                     _xh_block = self._extended_hours_blocked(session)
                     if _xh_block:
                         skip_reason = _xh_block
-                    elif (not _continuous) and self._recent_cycle_dedup_active():
-                        # 연속 사이클 모드에선 5분 중복가드 대신 CONTINUOUS_MIN_GAP_SEC(_continuous_due)로 간격 제어.
+                    elif self._recent_cycle_dedup_active():
                         skip_reason = f"직전 사이클이 {int((time.time()-self._last_cycle_at)/60)}분 전 — 트리거 중복 스킵"
                     else:
                         _closed, _closed_reason = await self._market_closed_today(session)
@@ -4415,7 +4527,7 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                                 skip_reason = _low_cash_skip_reason(_snap)
                             except Exception:
                                 pass  # 잔고 조회 실패는 진행 (broker가 사이클 안에서 재시도)
-                if skip_reason and (market_open or periodic_due or _continuous_due):
+                if skip_reason and periodic_due:
                     # 같은 사유가 이어지면 첫 회만 알린다(사장 지시 2026-07-21). 모의 계정은
                     # NXT 미지원이라 시간외 내내 같은 문구가 나오는데, 연속 사이클이 3분마다
                     # 재발화하면서 대시보드를 도배했다. force=True 가 _set_status 의 중복
@@ -4425,23 +4537,17 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                                                force=True)
                         self._last_gate_reason = skip_reason
                     self._last_cycle_at = time.time()
-                    self._last_cycle_started_at = time.time()   # 스킵도 트리거 1회 — 최소 주기를 소비
                     self._last_cycle_hour_key = _current_hour_key()  # 이 시각엔 재발화 방지(다음 :00 재시도)
                     self._last_session = session
-                    # 연속 모드면 짧게(간격), 아니면 :00 앵커까지 대기(스킵 후에도 다음 정시에 깨도록).
-                    if _continuous:
-                        _sleep_steps = max(1, int(_cont_gap))
-                    else:
-                        _ns = _now_kst()
-                        _sleep_steps = max(1, min(int(admin_config.news_crawl_interval(NEWS_CHECK_INTERVAL)),
-                                                  3600 - (_ns.minute * 60 + _ns.second) + 2))
+                    _ns = _now_kst()
+                    _sleep_steps = max(1, min(int(admin_config.news_crawl_interval(NEWS_CHECK_INTERVAL)),
+                                              3600 - (_ns.minute * 60 + _ns.second) + 2))
                     for _ in range(_sleep_steps):
                         if self._stop_event.is_set(): break
                         await asyncio.sleep(1)
                     continue
 
-                if (market_open or periodic_due or _continuous_due) and is_trading_hours():
-                    self._last_cycle_started_at = time.time()  # 최소 주기(CONTINUOUS_MIN_CYCLE_SEC) 기준점
+                if periodic_due and is_trading_hours():
                     self._last_gate_reason = None              # 정상 사이클 → 게이트 알림 억제 해제
                     # 사장 지시 2026-06-04: 단일 풀 전체를 사이클에 쓰고 비운다. 풀이 비면 최신 20개(history)로
                     # 폴백 — 뉴스 없이 헛도는 사이클 방지. 시장 구분은 마켓센티먼트팀장·세션 게이트가 담당.
@@ -4452,8 +4558,6 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     if market_open:
                         await self._set_status("MONITORING",
                             f"📈 {session} 개장 — 뉴스 {len(cycle_news)}건 기반 사이클{_fb_note}", force=True)
-                    elif _continuous and not periodic_due:
-                        await self._set_status("MONITORING", f"⚡ 연속 사이클(단타) — 뉴스 {len(cycle_news)}건{_fb_note}", force=True)
                     else:
                         await self._set_status("MONITORING", f"⏱️ 1시간 정기 사이클 — 뉴스 {len(cycle_news)}건{_fb_note}", force=True)
                     with metrics.timer("analysis_cycle", session=str(session),
@@ -4468,10 +4572,6 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                         session = get_current_session()
                         if session == "OFF_HOURS":
                             await self._set_status("OFF_HOURS", f"장외 ({_now_kst().strftime('%H:%M')} KST) — 감시 재개", force=True)
-                        elif _continuous:
-                            # 연속 사이클(단타): 정시 대기 없이 곧바로 다음 사이클을 준비한다.
-                            await self._set_status("MONITORING",
-                                f"⚡ 사이클 완료 — 연속 사이클 대기(약 {int(_cont_gap)}초 후 다음)", force=True)
                         else:
                             # 사장 지시 2026-06-11: '다음 정시'를 실제 시각으로 표시하되, 그 정시가 거래
                             # 세션이 아니면(장 마감 등) 시각 없이 '감시 재개'만.
@@ -4481,17 +4581,10 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                             await self._set_status("MONITORING", _resume_msg, force=True)
 
                 self._last_session = session
-                # 연속 사이클(단타, 2026-07-20): 정시 대기 없이 CONTINUOUS_MIN_GAP_SEC 만 자고 재발화.
-                if _continuous:
-                    _sleep_steps = max(1, int(_cont_gap))
-                else:
-                    # 정기 사이클 :00 앵커(드리프트 방지, 사장 지시 2026-06-11): 평소엔 뉴스 크롤 간격대로
-                    # 자되, 다음 정시(:00)가 그보다 가까우면 정시 직후에 깨도록 그 직전까지만 잔다. 종전엔
-                    # 크롤 간격(기본 900s) 단위로만 깨며 매 틱에 시(hour) 변경을 1회 검사 → 사이클이 :00이
-                    # 아니라 '정시 후 첫 루프 틱'에 발화, 재시작시각+누적작업시간만큼 uid별로 밀렸다(:11 등).
-                    _ns = _now_kst()
-                    _sleep_steps = max(1, min(int(admin_config.news_crawl_interval(NEWS_CHECK_INTERVAL)),
-                                              3600 - (_ns.minute * 60 + _ns.second) + 2))
+                # 정기 사이클 :00 앵커(드리프트 방지): 뉴스 크롤 간격과 다음 정시 중 빠른 쪽에 깬다.
+                _ns = _now_kst()
+                _sleep_steps = max(1, min(int(admin_config.news_crawl_interval(NEWS_CHECK_INTERVAL)),
+                                          3600 - (_ns.minute * 60 + _ns.second) + 2))
                 for _ in range(_sleep_steps):
                     if self._stop_event.is_set(): break
                     await asyncio.sleep(1)
@@ -6246,19 +6339,34 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                     _dialogue, _dec, _llm = [], None, False
                     if _reviewed < _SELL_DEBATE_CAP:
                         try:
-                            from infra import position_thesis as _pth
-                            _th = (_pth.get(self.uid, hc) or {}) if _spec_h is None else {}
+                            from infra import position_thesis as _pth, sleeve_thesis as _sth
+                            _th = ((_sth.get(self.uid, _spec_h.key, hc) or {}) if _spec_h
+                                   else (_pth.get(self.uid, hc) or {}))
                             _hp = cycle_store.get_holding_period(hc, uid=self.uid) or {}
+                            _planner_objection = ""
+                            if _th:
+                                from infra import fundamental_research_store as _frs
+                                from infra import planner_sell_guard as _psg
+                                _fr = (_frs.latest(self.uid, hc) or {}) if _spec_h is None else {}
+                                _inv = ((_fr.get("thesis_invalidators") or [])
+                                        if str(_fr.get("ts") or "") > str(_th.get("entry_ts") or "") else [])
+                                _planner_objection = _psg.assess_objection(
+                                    _th, h, hold_days=_hp.get("days_held"), invalidators=_inv).get("message", "")
+                            _thesis_text = (f"진입사유: {_th.get('entry_reason') or '(없음)'} | "
+                                            f"목표가: {_th.get('target_price') or '?'} | "
+                                            f"손절가: {_th.get('stop_price') or '?'} | "
+                                            f"계획보유: {_th.get('planned_hold_hours') or '?'}h") if _th else ""
                             _dialogue, _dec, _llm = await cmt.deliberate_position_sell(
                                 hc, _nm_h, qty=int(h.get("qty") or 0),
                                 pnl_pct=float(h.get("pnl_pct") or 0.0),
                                 hold_days=_hp.get("days_held"),
                                 manager_view=(_view or f"1차 매도지시: {directive}"),
-                                thesis=str(_th.get("entry_reason") or ""),
+                                thesis=_thesis_text,
                                 quant_excerpt=_quant_ctx_for(getattr(cyc, "quant_report", ""), hc, width=300),
                                 news_excerpt=_extract_code_news(cyc.news_report, hc, _nm_h)[:300],
                                 macro_view=macro_view, chief_label=_chief,
                                 fallback_directive=directive,
+                                planner_objection=_planner_objection,
                                 past_context=_tr_past(hc), progress=_prog)
                             _reviewed += 1
                         except Exception as _se:  # noqa: BLE001
@@ -6293,6 +6401,60 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             except Exception as _ce:
                 logger.warning(f"[위원회] 심의 스테이지 실패 — fail-open(매매 파이프라인 불변): {_ce}")
 
+    async def _apply_planner_sell_deferrals(self, cyc, holdings: List[Dict[str, Any]],
+                                            sell_directives: Dict[str, Any]) -> Dict[str, Any]:
+        """포트폴리오기획팀장의 강한 반론과 1회 보류권을 주문 조립 직전에 적용한다."""
+        from infra import fundamental_research_store, planner_sell_guard, position_thesis, sleeve_thesis
+        guarded = dict(sell_directives or {})
+        records = []
+        try:
+            guard_uid = int(self.uid)
+        except (TypeError, ValueError):
+            # 일부 순수단위 테스트·진단 객체는 문자열 uid를 쓴다. 거래 계정 uid가 아니면 정책 저장을 생략한다.
+            cyc.planner_sell_guard = records
+            return guarded
+        cycle_key = str(getattr(self.cycle_log, "started_at", "") or _current_hour_key_str())
+        for holding in holdings or []:
+            code = str(holding.get("code") or "").strip()
+            key = code if code in guarded else code.upper()
+            if not code or key not in guarded:
+                continue
+            directive = str(guarded.get(key) or "보유").strip()
+            spec = sleeve_for_code(code)
+            thesis = (sleeve_thesis.get(guard_uid, spec.key, code) if spec
+                      else position_thesis.get(guard_uid, code)) or {}
+            period = cycle_store.get_holding_period(code, uid=guard_uid) or {}
+            invalidators = []
+            research = (fundamental_research_store.latest(guard_uid, code) or {}) if not spec else {}
+            # 진입 전에 이미 알고 있던 리스크는 진입 thesis에 반영된 배경이다. 진입 후 새로
+            # 포착된 훼손 신호만 보류권의 하드 예외로 취급한다.
+            if str(research.get("ts") or "") > str(thesis.get("entry_ts") or ""):
+                invalidators = research.get("thesis_invalidators") or []
+            try:
+                objection = planner_sell_guard.assess_objection(
+                    thesis, holding, hold_days=period.get("days_held"), invalidators=invalidators)
+                final, status = planner_sell_guard.apply_one_cycle_deferral(
+                    guard_uid, code, directive, objection, cycle_key=cycle_key)
+            except Exception as exc:
+                logger.warning(f"[planner-sell-guard] {code} 적용 실패, 원지시 유지: {exc}")
+                continue
+            guarded[key] = final
+            records.append({"code": code, "original": directive, "final": final,
+                            "status": status, "objection": objection})
+            if status == "deferred":
+                await self._emit({"type": "agent_msg", "agent": "포트폴리오기획팀장",
+                                  "message": f"🛑 매도 1회 보류 — {objection.get('message', '')}"})
+            elif status == "released":
+                await self._emit({"type": "agent_msg", "agent": "포트폴리오기획팀장",
+                                  "message": f"✅ {code} 다음 정기 사이클에도 매도 근거가 반복돼 "
+                                             f"보류권 해제 — {directive} 지시를 통과시킵니다."})
+            elif objection.get("hard_override") and directive not in _SELL_HOLD_WORDS:
+                await self._emit({"type": "agent_msg", "agent": "포트폴리오기획팀장",
+                                  "message": f"🚨 {objection.get('message', '')}"})
+        cyc.planner_sell_guard = records
+        cyc.sell_directives = guarded
+        return guarded
+
     async def _cyc_stage_build_orders(self, cyc):
             market_open = cyc.market_open
             target_codes = cyc.target_codes
@@ -6307,6 +6469,8 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             if holdings is None:
                 holdings = cyc.holdings
             sell_directives = cyc.sell_directives
+            sell_directives = await self._apply_planner_sell_deferrals(
+                cyc, getattr(cyc, "holdings", None) or holdings, sell_directives)
             _entry_dirs = cyc._entry_dirs
             _sell_prices = cyc._sell_prices
             # [7] ORDER DRAFT — assembled in Python: buys = 2패스 최종종목, sells = 사후관리실장 매도결정.
@@ -6442,6 +6606,19 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                         or bool(runtime.get("ENABLE_COMMODITY_ETF", uid=self.uid)))
                     else set())
                 _exec_list = build_exec_list(approved_orders, _max_trades if _max_trades is not None else 2, _bond_pool_for_cap)
+                # 안전감시에서 직전에 접수한 전량매도를 정시 사이클이 중복 전송하지 않게 한다.
+                _safety_recent = {c for c, ts in self._safety_last_order_at.items()
+                                  if time.time() - ts < SAFETY_ORDER_COOLDOWN_SEC}
+                _safety_dups = [str(r.get("ticker") or "").strip() for r in _exec_list
+                                if (r.get("side") or "buy") == "sell"
+                                and str(r.get("ticker") or "").strip() in _safety_recent]
+                if _safety_dups:
+                    _exec_list = [r for r in _exec_list
+                                  if not ((r.get("side") or "buy") == "sell"
+                                          and str(r.get("ticker") or "").strip() in _safety_recent)]
+                    await self._emit({"type": "agent_msg", "agent": "리스크관리실장",
+                                      "message": "🛡️ 안전감시에서 이미 접수한 매도 중복 제외 — "
+                                                 + ", ".join(sorted(set(_safety_dups)))})
                 # 사장 지시 2026-05-21: US 체결 재확인용 '주문 직전' 해외 보유 스냅샷.
                 # cycle 의 holdings 는 kr_holdings() 라 US 가 없어, 이미 보유 중인 US 종목의
                 # before_qty 가 0으로 잡혀 false-positive(미체결을 체결로 오판)가 날 수 있다.

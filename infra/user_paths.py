@@ -31,6 +31,11 @@ def position_thesis_path(uid: int) -> Path:
     return user_dir(uid) / "position_thesis.json"
 
 
+def planner_sell_deferral_path(uid: int) -> Path:
+    """포트폴리오기획팀장 1회 매도 보류 상태 — per-uid, 재시작 내성."""
+    return user_dir(uid) / "planner_sell_deferrals.json"
+
+
 def trailing_peaks_path(uid: int) -> Path:
     """트레일링 익절용 종목별 고점(peak_price·peak_pnl) 영속 — 사이클 간 유지·재시작 내성."""
     return user_dir(uid) / "trailing_peaks.json"
