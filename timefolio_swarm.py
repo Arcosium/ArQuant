@@ -22,6 +22,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -779,6 +780,18 @@ async def _cycle_body(orch, ms, news_articles, user_directive, session, market_o
         ms._save_trailing_peaks(uid, _peaks, holdings)
     for n in notes:
         orch.cycle_log.log("ORDER_DRAFTING", "시스템", n)
+
+    # 안전감시가 조금 전 접수한 전량매도를 같은 정시 사이클이 다시 제출하지 않게 한다.
+    _safety_recent = {str(c).zfill(6) for c, ts in getattr(orch, "_safety_last_order_at", {}).items()
+                      if time.time() - ts < ms.SAFETY_ORDER_COOLDOWN_SEC}
+    _safety_dups = [str(o.get("code") or "").zfill(6) for o in sell_orders
+                    if str(o.get("code") or "").zfill(6) in _safety_recent]
+    if _safety_dups:
+        sell_orders = [o for o in sell_orders
+                       if str(o.get("code") or "").zfill(6) not in _safety_recent]
+        _msg = "🛡️ 안전감시에서 이미 접수한 매도 중복 제외 — " + ", ".join(sorted(set(_safety_dups)))
+        orch.cycle_log.log("ORDER_DRAFTING", "리스크관리실장", _msg)
+        await orch._emit({"type": "agent_msg", "agent": "리스크관리실장", "message": _msg})
 
     # [7] 집행 — 매도 먼저(현금 확보), 그다음 매수. 주문 1건 실패는 격리.
     orch.current_state = ms.SwarmState.EXECUTION

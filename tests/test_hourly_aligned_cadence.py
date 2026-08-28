@@ -33,6 +33,33 @@ def test_periodic_fires_on_hour_rollover(monkeypatch):
                         lambda: datetime(2026, 6, 8, 11, 0, 1, tzinfo=KST))
     assert o._should_run_periodic() is True
 
+
+def test_missed_hour_is_not_caught_up_at_market_open(monkeypatch):
+    monkeypatch.setattr(main_swarm, "_now_kst",
+                        lambda: datetime(2026, 6, 8, 19, 0, 1, tzinfo=KST))
+    o = _orch()
+    o._last_cycle_hour_key = main_swarm._current_hour_key()
+    # 장외 뒤 미국장 개장(22:30)에 오래된 시간대를 따라잡아 실행하지 않는다.
+    monkeypatch.setattr(main_swarm, "_now_kst",
+                        lambda: datetime(2026, 6, 8, 22, 30, 0, tzinfo=KST))
+    assert o._should_run_periodic() is False
+    assert o._last_cycle_hour_key == datetime(2026, 6, 8, 22, 0, 0, tzinfo=KST)
+    # 앵커가 넘어갔으므로 다음 정각은 정상 발화한다.
+    monkeypatch.setattr(main_swarm, "_now_kst",
+                        lambda: datetime(2026, 6, 8, 23, 0, 1, tzinfo=KST))
+    assert o._should_run_periodic() is True
+
+
+def test_hourly_trigger_window_boundary(monkeypatch):
+    o = _orch()
+    o._last_cycle_hour_key = datetime(2026, 6, 8, 9, 0, 0, tzinfo=KST)
+    monkeypatch.setattr(main_swarm, "_now_kst",
+                        lambda: datetime(2026, 6, 8, 10, 1, 59, tzinfo=KST))
+    assert o._should_run_periodic() is True
+    monkeypatch.setattr(main_swarm, "_now_kst",
+                        lambda: datetime(2026, 6, 8, 10, 2, 0, tzinfo=KST))
+    assert o._should_run_periodic() is False
+
 def test_restart_invariant_first_fire_at_next_hour(monkeypatch):
     monkeypatch.setattr(main_swarm, "_now_kst",
                         lambda: datetime(2026, 6, 8, 8, 37, 0, tzinfo=KST))

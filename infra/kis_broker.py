@@ -135,6 +135,19 @@ def round_to_tick(price: float) -> int:
     return int(round(p / t) * t)
 
 
+def ceil_to_tick(price: float) -> int:
+    """국내주식 지정가를 해당 가격대의 유효 호가로 올림한다.
+
+    LLM·전략이 27,196원처럼 호가단위에 맞지 않는 가격을 제시해도 주문 전송 직전에
+    27,200원으로 보정한다. 0 이하는 시장가 표식이므로 그대로 0을 반환한다.
+    """
+    p = float(price or 0)
+    if p <= 0:
+        return 0
+    tick = kr_tick_size(p)
+    return int(math.ceil(p / tick) * tick)
+
+
 def compute_nxt_limit_price(last_price: float, *, side: str, slippage_pct: float,
                             ref_price: float = None, max_premium_pct: float = None) -> int:
     """시간외 지정가 = NXT시세 ± 슬리피지 밴드, 호가단위 반올림. last_price<=0 이면 0(주문 보류 신호).
@@ -606,6 +619,10 @@ class KISBroker:
 
     # ═══════════════════ 국내주식 주문 ═══════════════════
     async def kr_buy(self, code: str, qty: int, price: int = 0, exchange: str = "KRX") -> str:
+        raw_price = float(price or 0)
+        price = ceil_to_tick(raw_price)
+        if raw_price > 0 and price != raw_price:
+            logger.info("[국내매수] 지정가 호가단위 올림: %s %s → %s원", code, raw_price, price)
         s = await self._s(); c, p = self._acnt()
         # 사장 지시 2026-05-19: 지정가(price>0)면 ORD_DVSN="00"(지정가), 없으면 "01"(시장가).
         # 기존 '"01" if price else "01"'은 지정가 주문도 시장가로 체결시키던 버그.
@@ -686,6 +703,10 @@ class KISBroker:
                 else f"[취소실패] {pdno} {odno} → {_clean_kis_msg(d.get('msg1',''))}")
 
     async def kr_sell(self, code: str, qty: int, price: int = 0, exchange: str = "KRX") -> str:
+        raw_price = float(price or 0)
+        price = ceil_to_tick(raw_price)
+        if raw_price > 0 and price != raw_price:
+            logger.info("[국내매도] 지정가 호가단위 올림: %s %s → %s원", code, raw_price, price)
         # 사장 지시 2026-05-28: 새 매도 판단이 들어오면 같은 종목의 살아있는 펜딩 매도는 폐기하고 신규로 대체.
         # 배경: KIS는 펜딩 주문이 ord_psbl_qty(매도가능수량)를 깎아, 보유 1주에 28,000원 펜딩 매도가 있으면
         # 후속 매도 시도가 모두 "주문 가능한 수량을 초과했습니다"로 거부된다(003490 사례 5/28 14:09·15:20).

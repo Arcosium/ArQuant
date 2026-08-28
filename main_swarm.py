@@ -71,6 +71,10 @@ MIN_TRADABLE_CASH_KRW = 5000
 # 호출하지 않고 보유 포지션의 확정 손절 조건만 60초마다 확인한다.
 SAFETY_WATCH_INTERVAL_SEC = 60
 SAFETY_ORDER_COOLDOWN_SEC = 15 * 60
+SAFETY_FAILURE_BACKOFF_SEC = 5 * 60
+# 뉴스 크롤이 정각을 몇 초 넘길 수 있어 2분까지는 그 시간의 정기 사이클로 인정한다.
+# 이 창 밖에서는 밀린 사이클을 개장 시각에 따라잡지 않고 다음 정각을 기다린다.
+HOURLY_TRIGGER_WINDOW_SEC = 2 * 60
 
 
 def _low_cash_skip_reason(snap) -> Optional[str]:
@@ -108,6 +112,13 @@ def _safety_sell_reason(holding: Dict[str, Any], thesis: Optional[Dict[str, Any]
     if strategy_stop > 0 and pnl <= -strategy_stop:
         return f"전략 하드 손절 도달 ({pnl:+.2f}% ≤ -{strategy_stop:.2f}%)"
     return None
+
+
+def _safety_watch_active(session: str, *, is_timefolio: bool = False) -> bool:
+    """브로커가 실제 주문을 받을 수 있는 세션에서만 안전감시를 연다."""
+    if is_timefolio:
+        return session == "KR_TRADING"
+    return session == "US_TRADING" or is_kr_tradable(session)
 
 
 # 기업리서치팀장은 '개별 기업'에만 붙는다(사장 지시 2026-07-21) — ETF/ETN/레버리지·인버스·
@@ -3875,6 +3886,9 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
         self._last_gate_reason: Optional[str] = None
         # 안전감시 주문 접수 시각. 정시 사이클과 안전감시가 같은 종목을 중복 매도하지 않게 한다.
         self._safety_last_order_at: Dict[str, float] = {}
+        # 실패한 주문은 즉시 예약을 풀되 짧은 재시도 유예를 둔다. UI 장애가 생겨도 60초마다
+        # 같은 주문으로 브라우저를 두드려 정시 사이클까지 방해하지 않게 한다.
+        self._safety_retry_after: Dict[str, float] = {}
         self._last_session: Optional[str] = None   # previous loop iteration's session (for market-open detection)
         self._last_cycle_hour_key = None   # 사장 지시 2026-06-08: 벽시계 시(hour) 앵커 (정시 정렬)
         self._last_status_state: Optional[str] = None  # last broadcast status state (suppress 1-min OFF_HOURS spam)
@@ -3912,8 +3926,23 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             await self._emit(msg)
 
     def _should_run_periodic(self) -> bool:
-        """정기 사이클 트리거 — 벽시계 시(hour)가 직전 발화 시각과 다르면 True(=:00 통과)."""
-        return _current_hour_key() != self._last_cycle_hour_key
+        """정각 2분 창에서만 시간당 1회 발화한다.
+
+        장외 동안 마지막 사이클 시각이 오래돼도 22:30 같은 개장 시각에 밀린 사이클을
+        따라잡지 않는다. 정각 창을 놓친 시간은 앵커만 현재 시로 넘겨 다음 :00을 기다린다.
+        ``None``은 .force_first_cycle 마커가 만든 명시적 즉시 실행 상태다.
+        """
+        if self._last_cycle_hour_key is None:
+            return True
+        now = _now_kst()
+        hour_key = _current_hour_key()
+        if hour_key == self._last_cycle_hour_key:
+            return False
+        elapsed = now.minute * 60 + now.second
+        if elapsed >= HOURLY_TRIGGER_WINDOW_SEC:
+            self._last_cycle_hour_key = hour_key
+            return False
+        return True
 
     def _recent_cycle_dedup_active(self) -> bool:
         """직전 '실제 사이클' 후 5분 이내면 트리거 중복 스킵. 부팅 직후(_last_cycle_at==0.0)는
@@ -4333,7 +4362,8 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
             await self._emit({"type": "agent_msg", "agent": "리스크관리실장",
                               "message": f"🛡️ 안전감시 감지(모의 실행) — {code} {reason}"})
             return True
-        if is_kr:
+        is_timefolio = bool(getattr(self.broker, "is_timefolio", False))
+        if is_kr and not is_timefolio:
             try:
                 sellable = await self.broker.kr_psbl_sell_qty(code)
                 if sellable is not None:
@@ -4355,26 +4385,51 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                               "filled": False, "message": f"🛡️ 안전매도 보류 — {nxt_skip}"})
             return False
         result = ""
-        for attempt in range(3):
-            if attempt:
-                await asyncio.sleep(2.5)
+        structured_result: Dict[str, Any] = {}
+        if is_timefolio:
             try:
-                result = await self.broker.place_order(order)
+                structured_result = await self.broker.place_order_ex(order)
+                result = str(structured_result.get("result") or "")
             except Exception as exc:
                 result = f"[주문 예외] {exc}"
-            if not any(x in result for x in ("초당", "거래건수", "EGW", "유량", "TPS")):
-                break
-        accepted = all(x not in result for x in
-                       ("실패", "에러", "거부", "예외", "REJECT", "초당", "거래건수"))
+            accepted = bool(structured_result.get("accepted"))
+        else:
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(2.5)
+                try:
+                    result = await self.broker.place_order(order)
+                except Exception as exc:
+                    result = f"[주문 예외] {exc}"
+                if not any(x in result for x in ("초당", "거래건수", "EGW", "유량", "TPS")):
+                    break
+            accepted = all(x not in result for x in
+                           ("실패", "에러", "거부", "예외", "REJECT", "초당", "거래건수"))
         if accepted:
             self._safety_last_order_at[code] = time.time()
+            self._safety_retry_after.pop(code, None)
             await self._emit({"type": "order_submitted", "ticker": code, "side": "sell", "qty": qty,
                               "filled": False,
                               "message": f"🛡️ 안전매도 접수 — {code} {qty}주 | {reason} | {result}"})
-            asyncio.create_task(self._poll_fills_until_confirmed(
-                [{"ticker": code, "side": "sell", "qty": qty}], list(baseline_holdings or [])))
+            if is_timefolio:
+                # 대회 사이트의 상대호가 주문은 접수 후 지연 체결될 수 있다. 전용 사이클의
+                # 권위 보유수량 대조 큐에 넣어 재제출과 원장 이중 반영을 함께 막는다.
+                from timefolio_swarm import _load_pending, _save_pending
+                pending = _load_pending(self.uid)
+                key = (code.zfill(6), "sell")
+                if not any((str(p.get("ticker") or "").zfill(6), p.get("side")) == key
+                           for p in pending):
+                    pending.append({"ticker": code.zfill(6), "side": "sell", "qty": qty,
+                                    "price": float(structured_result.get("price") or 0.0),
+                                    "before_qty": int(float(holding.get("qty") or qty)),
+                                    "ts": _now_kst().isoformat(), "age": 0})
+                    _save_pending(self.uid, pending)
+            else:
+                asyncio.create_task(self._poll_fills_until_confirmed(
+                    [{"ticker": code, "side": "sell", "qty": qty}], list(baseline_holdings or [])))
             metrics.incr("safety_orders_submitted", market=("KR" if is_kr else "US"))
             return True
+        self._safety_retry_after[code] = time.time() + SAFETY_FAILURE_BACKOFF_SEC
         await self._emit({"type": "trade_failed", "ticker": code, "side": "sell", "qty": qty,
                           "filled": False, "message": f"⚠️ 안전매도 실패 — {code}: {result}"})
         metrics.incr("safety_order_failed", market=("KR" if is_kr else "US"))
@@ -4385,7 +4440,8 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
         while not self._stop_event.is_set():
             try:
                 session = get_current_session()
-                active = session == "US_TRADING" or is_kr_tradable(session)
+                active = _safety_watch_active(
+                    session, is_timefolio=bool(getattr(self.broker, "is_timefolio", False)))
                 if active and self.current_state != SwarmState.EXECUTION:
                     holdings = await self._session_holdings(session)
                     active_holdings = [h for h in holdings if
@@ -4398,9 +4454,14 @@ class ArquantOrchestrator(_OpsRouterMixin, _MarketCalendarMixin, _ExecutionMixin
                         c: ts for c, ts in self._safety_last_order_at.items()
                         if now - ts < SAFETY_ORDER_COOLDOWN_SEC
                     }
+                    self._safety_retry_after = {
+                        c: retry_at for c, retry_at in self._safety_retry_after.items()
+                        if retry_at > now
+                    }
                     for holding in active_holdings:
                         code = str(holding.get("code") or "").strip()
-                        if not code or code in self._safety_last_order_at:
+                        if (not code or code in self._safety_last_order_at
+                                or self._safety_retry_after.get(code, 0.0) > now):
                             continue
                         reason = _safety_sell_reason(holding, position_thesis.get(self.uid, code), stop_pct)
                         if reason:

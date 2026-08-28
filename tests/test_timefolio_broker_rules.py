@@ -5,6 +5,8 @@ KIS 모의와 동일한 스웜 파이프라인을 타되, 집행 직전 타임�
 로컬 장부에도 즉시 반영된다.
 """
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -64,3 +66,31 @@ def test_valid_order_submits_and_books_ledger(broker):
     pos = {p["ticker"]: p for p in acct["portfolio"]["positions"]}
     assert pos["005930"]["qty"] == 100
     assert acct["portfolio"]["cash"] == 100_000_000 - 100 * 70000
+
+
+def test_site_submissions_are_serialized_per_account(broker, monkeypatch):
+    state = {"active": 0, "max_active": 0}
+    guard = threading.Lock()
+
+    def _slow_submit(uid, payload, headless=True):
+        with guard:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        time.sleep(0.05)
+        with guard:
+            state["active"] -= 1
+        return {"accepted": True, "filled": False, "pending": True}
+
+    monkeypatch.setattr(tb, "submit_order", _slow_submit)
+
+    async def _run_two():
+        return await asyncio.gather(
+            broker.place_order_ex(OrderDraft(ticker="005930", side=OrderSide.BUY,
+                                             qty=1, limit_price=70000)),
+            broker.place_order_ex(OrderDraft(ticker="035420", side=OrderSide.BUY,
+                                             qty=1, limit_price=200000)),
+        )
+
+    results = asyncio.run(_run_two())
+    assert all(r["accepted"] for r in results)
+    assert state["max_active"] == 1

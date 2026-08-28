@@ -646,7 +646,17 @@ class TimefolioBrowser:
         value = "true" if side == "buy" else "false"
         radio = dialog.locator(f'input[name="매수도"][value="{value}"]').first
         try:
-            radio.check(force=True, timeout=2500)
+            # Bootstrap의 btn-check 입력은 숨겨져 있어 input.check(force=True)가 클릭 뒤
+            # 프런트 상태에 의해 원복될 수 있다. 사용자가 누르는 가시 label을 우선 클릭한다.
+            radio_id = radio.get_attribute("id")
+            label = dialog.locator(f'label[for="{radio_id}"]').first if radio_id else None
+            if label is not None and label.count():
+                try:
+                    label.click(timeout=2500)
+                except Exception:
+                    label.click(force=True, timeout=2500)
+            else:
+                radio.check(force=True, timeout=2500)
             page.wait_for_timeout(300)
         except Exception as exc:
             raise RuntimeError(f"타임폴리오 {'매수' if side == 'buy' else '매도'} 선택 실패: {exc}") from exc

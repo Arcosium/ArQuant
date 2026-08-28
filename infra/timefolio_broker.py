@@ -58,12 +58,16 @@ class TimefolioBroker:
         self.uid = int(creds["id"])
         self.creds = creds
         self._last_site_order: dict[str, Any] | None = None
+        # 한 계정의 사이트 세션은 단일 사용자 UI다. 안전감시 조회/주문과 정시 사이클이
+        # 겹쳐도 브라우저 작업은 반드시 한 건씩 실행한다.
+        self._site_lock = asyncio.Lock()
 
     async def close(self):
         return None
 
     async def _sync(self) -> dict[str, Any]:
-        return await playwright_thread(sync_site_account, self.uid, headless=True)
+        async with self._site_lock:
+            return await playwright_thread(sync_site_account, self.uid, headless=True)
 
     def _account(self) -> dict[str, Any]:
         return contest_store.get_account(self.uid) or {}
@@ -269,7 +273,8 @@ class TimefolioBroker:
             "limit_price": price,
             "amount": float(qty) * price,
         }
-        res = await playwright_thread(submit_order, self.uid, payload, headless=True)
+        async with self._site_lock:
+            res = await playwright_thread(submit_order, self.uid, payload, headless=True)
         self._last_site_order = res
         if res.get("accepted"):
             # 체결은 로컬 장부에도 즉시 반영한다(다음 사이트 동기화가 최종 정합을 맞춤).
